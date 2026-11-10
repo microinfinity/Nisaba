@@ -1175,6 +1175,10 @@ void WaylandPlatformBackend::handlePointerLeave(wl_surface* surface) {
     if (pointer_focus_surface_ == surface) {
         pointer_focus_surface_ = nullptr;
     }
+    if (owner_) {
+        owner_->onMouseMove().emit(-10000.0f, -10000.0f);
+        owner_->onTargetedMouseMove().emit((void*)surface, -10000.0f, -10000.0f);
+    }
 }
 
 void WaylandPlatformBackend::handlePointerMotion([[maybe_unused]] uint32_t time, wl_fixed_t sx, wl_fixed_t sy) {

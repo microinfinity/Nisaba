@@ -92,7 +92,10 @@ struct Family {
         SansSerif,
         Monospace,
         Cursive,
-        Fantasy
+        Fantasy,
+        SystemUI,
+        Emoji,
+        Math
     } kind{Kind::SansSerif};
 
     std::string name{};
@@ -106,6 +109,9 @@ struct Family {
     static Family monospace() noexcept { return Family(Kind::Monospace); }
     static Family cursive() noexcept { return Family(Kind::Cursive); }
     static Family fantasy() noexcept { return Family(Kind::Fantasy); }
+    static Family system_ui() noexcept { return Family(Kind::SystemUI); }
+    static Family emoji() noexcept { return Family(Kind::Emoji); }
+    static Family math() noexcept { return Family(Kind::Math); }
 
     bool operator==(const Family& other) const noexcept {
         if (kind != other.kind) return false;

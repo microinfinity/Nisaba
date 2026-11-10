@@ -32,6 +32,46 @@ struct VariationAxis {
     float max_value{0.0f};
 };
 
+/// Lightweight font face metadata extracted from SFNT headers without parsing glyph outlines.
+struct FontFaceHeaderInfo {
+    uint32_t face_index{0};
+    std::string family_name{"Unknown"};
+    std::string style_name{"Regular"};
+    std::string postscript_name{};
+    Weight weight{Weight::Normal};
+    Style style{Style::Normal};
+    Stretch stretch{Stretch::Normal};
+    bool is_monospace{false};
+    bool is_serif{false};
+    bool is_color{false};
+    bool is_variable{false};
+    uint32_t unicode_ranges[4]{0, 0, 0, 0}; /// 128-bit OS/2 ulUnicodeRange1..4 bitmask
+};
+
+/// Zero-copy memory-mapped font file buffer (uses POSIX mmap on Linux/Unix, fallback on others).
+class MappedFontData {
+public:
+    MappedFontData() noexcept = default;
+    ~MappedFontData();
+
+    MappedFontData(const MappedFontData&) = delete;
+    MappedFontData& operator=(const MappedFontData&) = delete;
+    MappedFontData(MappedFontData&& other) noexcept;
+    MappedFontData& operator=(MappedFontData&& other) noexcept;
+
+    static std::shared_ptr<MappedFontData> open_file(std::string_view file_path);
+
+    [[nodiscard]] bool is_valid() const noexcept { return !span_.empty(); }
+    [[nodiscard]] std::span<const uint8_t> span() const noexcept { return span_; }
+    [[nodiscard]] size_t size() const noexcept { return span_.size(); }
+
+private:
+    void* mapped_ptr_{nullptr};
+    size_t mapped_size_{0};
+    std::vector<uint8_t> fallback_buffer_{};
+    std::span<const uint8_t> span_{};
+};
+
 /// Sovereign binary TrueType / OpenType font reader.
 /// Completely independent with zero external dependencies.
 class TtfFont {
@@ -47,16 +87,46 @@ public:
     /// Loads and parses a font from a memory buffer.
     /// If copy_data is true, the font takes an owned copy of the buffer.
     /// If copy_data is false, it borrows the buffer (caller must ensure data outlives the font).
-    static std::unique_ptr<TtfFont> from_bytes(std::span<const uint8_t> data, bool copy_data = false);
-    static std::unique_ptr<TtfFont> from_file(std::string_view file_path);
+    /// Supports both single SFNT (.ttf/.otf) and TrueType Collections (.ttc/.otc) via face_index.
+    static std::unique_ptr<TtfFont> from_bytes(
+        std::span<const uint8_t> data,
+        bool copy_data = false,
+        uint32_t face_index = 0
+    );
+    static std::unique_ptr<TtfFont> from_file(std::string_view file_path, uint32_t face_index = 0);
+    static std::unique_ptr<TtfFont> from_mapped(
+        std::shared_ptr<MappedFontData> mapped,
+        uint32_t face_index = 0
+    );
+
+    /// Returns the number of font faces in a font buffer (1 for .ttf/.otf, N for .ttc/.otc, 0 if invalid).
+    static uint32_t collection_face_count(std::span<const uint8_t> data) noexcept;
+
+    /// Fast header-only probe extracting family, style, weight, stretch, monospace, and OS/2 Unicode ranges
+    /// without parsing glyph outlines or GSUB/GPOS tables.
+    static bool probe_face_header(
+        std::span<const uint8_t> data,
+        uint32_t face_index,
+        FontFaceHeaderInfo& out_info
+    );
 
     bool is_valid() const noexcept { return is_valid_; }
 
     // --- Font Metadata ---
     std::string_view family_name() const noexcept { return family_name_; }
     std::string_view style_name() const noexcept { return style_name_; }
+    std::string_view postscript_name() const noexcept { return postscript_name_; }
     Weight weight() const noexcept { return weight_; }
     Style style() const noexcept { return style_; }
+    Stretch stretch() const noexcept { return stretch_; }
+    bool is_monospace() const noexcept { return is_monospace_; }
+    bool is_serif() const noexcept { return is_serif_; }
+    uint32_t face_index() const noexcept { return face_index_; }
+    std::span<const uint32_t, 4> unicode_ranges() const noexcept { return unicode_ranges_; }
+    bool supports_unicode_range_bit(uint8_t bit) const noexcept {
+        if (bit >= 128) return false;
+        return (unicode_ranges_[bit >> 5] & (1u << (bit & 31))) != 0;
+    }
 
     uint16_t units_per_em() const noexcept { return units_per_em_; }
     int16_t ascent() const noexcept { return ascent_; }
@@ -218,7 +288,7 @@ private:
 
     const TableRecord* find_table(uint32_t tag) const noexcept;
 
-    bool parse_internal(std::span<const uint8_t> data);
+    bool parse_internal(std::span<const uint8_t> data, uint32_t face_index = 0);
     bool parse_head();
     bool parse_maxp();
     bool parse_hhea();
@@ -227,6 +297,7 @@ private:
     bool parse_name();
     bool parse_kern();
     bool parse_os2();
+    bool parse_post();
     bool parse_fvar();
 
     bool extract_simple_glyph(const uint8_t* g_data, Path& path, float scale) const;
@@ -235,8 +306,10 @@ private:
     uint16_t lookup_glyph_raw(char32_t codepoint) const noexcept;
     int16_t compute_kerning_slow(uint16_t left_glyph, uint16_t right_glyph) const noexcept;
 
+    std::shared_ptr<MappedFontData> mapped_data_{nullptr};
     std::vector<uint8_t> owned_data_{};
     std::span<const uint8_t> data_{};
+    uint32_t face_index_{0};
     bool is_valid_{false};
 
     // Flat zero-allocation table directory (up to 48 SFNT tables)
@@ -246,8 +319,13 @@ private:
 
     std::string family_name_{"Unknown"};
     std::string style_name_{"Regular"};
+    std::string postscript_name_{};
     Weight weight_{Weight::Normal};
     Style style_{Style::Normal};
+    Stretch stretch_{Stretch::Normal};
+    bool is_monospace_{false};
+    bool is_serif_{false};
+    uint32_t unicode_ranges_[4]{0, 0, 0, 0};
 
     uint16_t units_per_em_{1000};
     int16_t index_to_loc_format_{0}; // 0 = 16-bit, 1 = 32-bit

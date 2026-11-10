@@ -92,6 +92,13 @@ test_text_exe = executable('test_text',
 )
 test('text_test', test_text_exe)
 
+# Sovereign Linux System Font Discovery & Fontconfig Integration tests
+test_linux_font_system_exe = executable('test_linux_font_system',
+  'test_linux_font_system.cpp',
+  dependencies : nisaba_dep
+)
+test('linux_font_system_test', test_linux_font_system_exe)
+
 # PostScript / CFF & Advanced OpenType (GSUB/GPOS) tests
 test_cff_opentype_exe = executable('test_cff_opentype',
   'test_cff_opentype.cpp',

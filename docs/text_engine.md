@@ -12,8 +12,9 @@
 | `include/nisaba/text/attrs.hpp`<br>`src/text/attrs.cpp` | Typographic attributes (`TextColor`, `Family`, `Weight`, `Style`, `Stretch`, `Metrics`, `Attrs`), inline span ranges (`AttrsSpan`, `AttrsList`), and `Shaping` tiers. |
 | `include/nisaba/text/cff_font.hpp`<br>`src/text/cff_font.cpp` | PostScript `CFF ` (Compact Font Format v1) and `CFF2` parser and Type 2 Charstring stack virtual machine. |
 | `include/nisaba/text/opentype_tables.hpp`<br>`src/text/opentype_tables.cpp` | OpenType layout tables: `OpenTypeGdef` (glyph class definitions & mark attachment), `OpenTypeGsub` (single, multiple, alternate, and ligature substitutions), and `OpenTypeGpos` (pair kerning, mark-to-base, and mark-to-mark positioning). |
-| `include/nisaba/text/ttf_font.hpp`<br>`src/text/ttf_font.cpp` | SFNT container parser (`TTF` / `OTF`), `cmap` Format 4/12/14 character mapping, `hmtx`/`hhea` metrics, `glyf`/`loca` quadratic outlines, `COLR`/`CPAL` layered color glyphs, `fvar` variable axis descriptors, `kern` binary search + direct-mapped kerning cache, and synthetic bold/italic outline transformations. |
-| `include/nisaba/text/font_system.hpp`<br>`src/text/font_system.cpp` | Multi-font registry (`FontSystem`), family/weight/style matching (`match_font`, `match_font_styled`), and per-codepoint multilingual fallback resolution (`find_glyph_or_fallback`). |
+| `include/nisaba/text/ttf_font.hpp`<br>`src/text/ttf_font.cpp` | SFNT container & TTC/OTC collection parser (`TTF` / `OTF` / `TTC`), POSIX `mmap` zero-copy file mapping (`MappedFontData`), fast header-only probing (`probe_face_header`), `cmap` Format 4/12/14 character mapping, `hmtx`/`hhea`/`post`/`OS/2` metrics & 128-bit `ulUnicodeRange` bitmasks, `glyf`/`loca` quadratic outlines, `COLR`/`CPAL` layered color glyphs, `fvar` variable axis descriptors, `kern` binary search + direct-mapped kerning cache, and synthetic bold/italic outline transformations. |
+| `include/nisaba/text/linux_font_config.hpp`<br>`src/text/linux_font_config.cpp` | Sovereign zero-dependency Linux Fontconfig XML & environment parser (`/etc/fonts/fonts.conf`, `conf.d/*.conf`, `local.conf`, XDG font directories, metric-compatible family aliases, and locale-specific `<match>` overrides). |
+| `include/nisaba/text/font_system.hpp`<br>`src/text/font_system.cpp` | System-integrated multi-font registry (`FontSystem`), automatic Linux font discovery (`scan_system_fonts`, `with_system_fonts`), persistent binary index caching (`~/.cache/nisaba/font_index_v1.bin`), lazy `mmap` instantiation, CSS Fonts Level 4 family/weight/style/stretch matching (`match_font`, `match_font_styled`), and OS/2 Unicode range & script-aware multilingual fallback (`find_glyph_or_fallback`). |
 | `include/nisaba/text/bidi.hpp`<br>`src/text/bidi.cpp` | Bidirectional run analysis (`Bidi::segment_runs`), Arabic/Persian/Urdu/Kurdish contextual joining (`Bidi::shape_text`), cluster-preserving RTL reordering, bracket mirroring (`Bidi::mirror_char`), and UAX #29 grapheme cluster / word boundary segmentation. |
 | `include/nisaba/text/layout.hpp`<br>`src/text/layout.cpp` | Layout data structures (`Wrap`, `Align`, `Overflow`, `LayoutGlyph`, `LayoutLine`, `LayoutRun`). |
 | `include/nisaba/text/glyph_cache.hpp`<br>`src/text/glyph_cache.cpp` | Subpixel-aware glyph alpha mask cache (`GlyphCache`) with $O(1)$ LRU eviction. |
@@ -140,11 +141,25 @@ When a requested weight ($\ge 600$) or style (`Style::Italic` / `Style::Oblique`
 
 ---
 
-## 5. Font Management & Multilingual Fallback (`FontSystem`)
+## 5. System Font Integration, Discovery & Multilingual Fallback (`FontSystem` & `LinuxFontConfig`)
 
-- **Font Loading:** `FontSystem::load_font_file` and `FontSystem::load_font_bytes` parse `TtfFont` instances, extract family/style metadata, and assign monotonic 1-based `FontId` handles.
-- **Face Matching (`match_font` / `match_font_styled`):** Scores registered fonts against requested `Family` (`Name`, `SansSerif`, `Serif`, `Monospace`), `Weight` (`100`–`900`), and `Style` (`Normal`, `Italic`, `Oblique`). `match_font_styled` sets `need_synthetic_bold = true` when `attrs.weight >= 600` and the matched face has weight $< 600$, and `need_synthetic_italic = true` when italic/oblique is requested on a roman face.
-- **Multilingual Fallback (`find_glyph_or_fallback`):** Queries the primary `FontId` first; if `glyph_index(codepoint) == 0`, iterates registered fonts in registration order until a font containing a non-zero glyph for `codepoint` is found.
+- **Sovereign Linux Fontconfig Integration (`LinuxFontConfig`):**
+  - Parses `/etc/fonts/fonts.conf`, `/etc/fonts/conf.d/*.conf`, `/etc/fonts/local.conf`, and `$XDG_CONFIG_HOME/fontconfig/fonts.conf` using a zero-dependency streaming XML lexer without linking `libfontconfig` or `libexpat`.
+  - Discovers system and user font directories (`/usr/share/fonts`, `/usr/local/share/fonts`, `~/.local/share/fonts`, `~/.fonts`, `$XDG_DATA_DIRS/fonts`) and respects `<rejectfont><glob>` filters.
+  - Builds a directed alias & substitution graph for generic families (`sans-serif`, `serif`, `monospace`, `system-ui`, `emoji`, `math`), metric-compatible families (`Arial`, `Helvetica`, `Times New Roman`, `Courier New`), and locale-dependent overrides (`$LC_ALL`, `$LC_CTYPE`, `$LANG`).
+- **Zero-Config Automatic System Font Discovery vs. Explicit Custom Fonts:**
+  - By default (`auto_system_fonts_enabled() == true`), if a developer constructs `FontSystem fs;` and does **not** explicitly load custom fonts (`load_font_file`, `load_font_data`, `load_font_collection`, `scan_font_directory`), `FontSystem` automatically invokes `scan_system_fonts(true)` on the first font query or text layout/draw operation (`ensure_default_system_fonts`).
+  - Conversely, if the developer explicitly registers one or more custom fonts (`has_custom_fonts() == true`), `FontSystem` remains strictly isolated to those custom fonts unless `scan_system_fonts()` is explicitly called.
+- **Fast Header Probing, Lazy `mmap` Loading & Persistent Binary Cache (`FontSystem::scan_system_fonts`):**
+  - `TtfFont::probe_face_header` inspects only the SFNT header and lightweight metadata tables (`head`, `name`, `OS/2`, `post`, `fvar`, `COLR`) across single fonts and TrueType Collections (`.ttc` / `.otc` via `face_index`) without allocating or parsing `glyf` / `CFF` / `GSUB` / `GPOS` tables.
+  - Serializes discovered face descriptors and 128-bit `OS/2 ulUnicodeRange` bitmasks to `$XDG_CACHE_HOME/nisaba/font_index_v1.bin` validated by directory `mtime` fingerprints, enabling sub-millisecond startup across hundreds of system fonts.
+  - Full `TtfFont` instances are instantiated lazily on-demand via `MappedFontData` (`POSIX mmap` zero-copy shared pages) only when matched for shaping or rendering.
+- **CSS Fonts Level 4 Matching (`match_font` / `match_font_styled`):**
+  - Resolves ordered family candidates through `LinuxFontConfig::resolve_family_candidates`, then scores faces within the matched family by `Stretch` distance, `Style` precedence (`Italic` $\leftrightarrow$ `Oblique` $\to$ `Normal`), and `Weight` distance (`100`–`900`).
+  - Sets `synthetic_bold = true` when `attrs.weight >= 600` and the matched face has weight $< 600$, and `synthetic_italic = true` when italic/oblique is requested on a roman face.
+- **Unicode Range & Script-Aware Fallback (`find_glyph_or_fallback`):**
+  - Queries the primary `FontId` first, then checks a 256-entry direct-mapped `fallback_page_cache_` (`codepoint >> 8`) for $O(1)$ repeat lookups.
+  - Maps the missing `codepoint` to its OpenType `OS/2 ulUnicodeRange` bit (`0..127` via `codepoint_to_os2_range_bit`), testing candidate fallback families and indexed system faces whose 128-bit coverage mask includes the target script bit before lazily loading the face.
 
 ---
 

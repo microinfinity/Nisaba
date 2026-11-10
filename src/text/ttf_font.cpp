@@ -6,6 +6,14 @@
 #include <cstring>
 #include <algorithm>
 
+#if defined(__linux__) || defined(__unix__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#define NISABA_HAS_POSIX_MMAP 1
+#endif
+
 namespace nisaba::text {
 
 namespace {
@@ -17,6 +25,7 @@ constexpr uint32_t make_tag(char a, char b, char c, char d) noexcept {
             static_cast<uint32_t>(static_cast<uint8_t>(d));
 }
 
+constexpr uint32_t TAG_TTCF = make_tag('t', 't', 'c', 'f');
 constexpr uint32_t TAG_HEAD = make_tag('h', 'e', 'a', 'd');
 constexpr uint32_t TAG_MAXP = make_tag('m', 'a', 'x', 'p');
 constexpr uint32_t TAG_HHEA = make_tag('h', 'h', 'e', 'a');
@@ -27,6 +36,7 @@ constexpr uint32_t TAG_GLYF = make_tag('g', 'l', 'y', 'f');
 constexpr uint32_t TAG_KERN = make_tag('k', 'e', 'r', 'n');
 constexpr uint32_t TAG_NAME = make_tag('n', 'a', 'm', 'e');
 constexpr uint32_t TAG_OS2  = make_tag('O', 'S', '/', '2');
+constexpr uint32_t TAG_POST = make_tag('p', 'o', 's', 't');
 constexpr uint32_t TAG_CFF  = make_tag('C', 'F', 'F', ' ');
 constexpr uint32_t TAG_CFF2 = make_tag('C', 'F', 'F', '2');
 constexpr uint32_t TAG_GDEF = make_tag('G', 'D', 'E', 'F');
@@ -34,6 +44,9 @@ constexpr uint32_t TAG_GSUB = make_tag('G', 'S', 'U', 'B');
 constexpr uint32_t TAG_GPOS = make_tag('G', 'P', 'O', 'S');
 constexpr uint32_t TAG_COLR = make_tag('C', 'O', 'L', 'R');
 constexpr uint32_t TAG_CPAL = make_tag('C', 'P', 'A', 'L');
+constexpr uint32_t TAG_CBDT = make_tag('C', 'B', 'D', 'T');
+constexpr uint32_t TAG_SBIX = make_tag('s', 'b', 'i', 'x');
+constexpr uint32_t TAG_SVG  = make_tag('S', 'V', 'G', ' ');
 constexpr uint32_t TAG_FVAR = make_tag('f', 'v', 'a', 'r');
 
 class ByteReader {
@@ -140,7 +153,177 @@ private:
     size_t pos_;
 };
 
+void append_utf8(std::string& out, uint32_t cp) {
+    if (cp == 0) return;
+    if (cp <= 0x7F) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0x10FFFF) {
+        out.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+}
+
+std::string decode_name_string(std::span<const uint8_t> bytes, uint16_t pid, uint16_t /*eid*/) {
+    std::string res;
+    if (pid == 0 || pid == 3) {
+        res.reserve(bytes.size() / 2);
+        for (size_t k = 0; k + 1 < bytes.size(); k += 2) {
+            uint16_t u16 = static_cast<uint16_t>((bytes[k] << 8) | bytes[k + 1]);
+            if (u16 >= 0xD800 && u16 <= 0xDBFF && k + 3 < bytes.size()) {
+                uint16_t low = static_cast<uint16_t>((bytes[k + 2] << 8) | bytes[k + 3]);
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    uint32_t cp = 0x10000u + (((u16 - 0xD800u) << 10) | (low - 0xDC00u));
+                    append_utf8(res, cp);
+                    k += 2;
+                    continue;
+                }
+            }
+            append_utf8(res, u16);
+        }
+    } else {
+        res.reserve(bytes.size());
+        for (uint8_t b : bytes) {
+            if (b != 0) res.push_back(static_cast<char>(b));
+        }
+    }
+    return res;
+}
+
+Weight quantize_weight(uint16_t w) noexcept {
+    if (w < 150) return Weight::Thin;
+    if (w < 250) return Weight::ExtraLight;
+    if (w < 350) return Weight::Light;
+    if (w < 450) return Weight::Normal;
+    if (w < 550) return Weight::Medium;
+    if (w < 650) return Weight::SemiBold;
+    if (w < 750) return Weight::Bold;
+    if (w < 850) return Weight::ExtraBold;
+    return Weight::Black;
+}
+
+Stretch quantize_stretch(uint16_t s) noexcept {
+    if (s <= 1) return Stretch::UltraCondensed;
+    if (s >= 9) return Stretch::UltraExpanded;
+    return static_cast<Stretch>(s);
+}
+
+bool resolve_sfnt_offset(std::span<const uint8_t> data, uint32_t face_index, size_t& out_offset) noexcept {
+    if (data.size() < 12) return false;
+    ByteReader r(data);
+    uint32_t magic = r.read_u32();
+    if (magic == TAG_TTCF) {
+        /* uint32_t ttc_version = */ r.read_u32();
+        uint32_t num_fonts = r.read_u32();
+        if (face_index >= num_fonts) return false;
+        size_t off_pos = 12 + static_cast<size_t>(face_index) * 4;
+        if (off_pos + 4 > data.size()) return false;
+        r.seek(off_pos);
+        uint32_t table_dir_offset = r.read_u32();
+        if (table_dir_offset + 12 > data.size()) return false;
+        out_offset = table_dir_offset;
+        return true;
+    }
+    if (face_index != 0) return false;
+    out_offset = 0;
+    return true;
+}
+
 } // namespace
+
+// ============================================================================
+// MappedFontData Implementation
+// ============================================================================
+
+MappedFontData::~MappedFontData() {
+#if defined(NISABA_HAS_POSIX_MMAP)
+    if (mapped_ptr_ && mapped_ptr_ != MAP_FAILED && mapped_size_ > 0) {
+        ::munmap(mapped_ptr_, mapped_size_);
+    }
+#endif
+    mapped_ptr_ = nullptr;
+    mapped_size_ = 0;
+}
+
+MappedFontData::MappedFontData(MappedFontData&& other) noexcept
+    : mapped_ptr_(other.mapped_ptr_),
+      mapped_size_(other.mapped_size_),
+      fallback_buffer_(std::move(other.fallback_buffer_)),
+      span_(other.span_) {
+    other.mapped_ptr_ = nullptr;
+    other.mapped_size_ = 0;
+    other.span_ = {};
+}
+
+MappedFontData& MappedFontData::operator=(MappedFontData&& other) noexcept {
+    if (this != &other) {
+#if defined(NISABA_HAS_POSIX_MMAP)
+        if (mapped_ptr_ && mapped_ptr_ != MAP_FAILED && mapped_size_ > 0) {
+            ::munmap(mapped_ptr_, mapped_size_);
+        }
+#endif
+        mapped_ptr_ = other.mapped_ptr_;
+        mapped_size_ = other.mapped_size_;
+        fallback_buffer_ = std::move(other.fallback_buffer_);
+        span_ = other.span_;
+        other.mapped_ptr_ = nullptr;
+        other.mapped_size_ = 0;
+        other.span_ = {};
+    }
+    return *this;
+}
+
+std::shared_ptr<MappedFontData> MappedFontData::open_file(std::string_view file_path) {
+    if (file_path.empty()) return nullptr;
+    std::string path_str(file_path);
+
+#if defined(NISABA_HAS_POSIX_MMAP)
+    int fd = ::open(path_str.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        struct stat st{};
+        if (::fstat(fd, &st) == 0 && st.st_size >= 12) {
+            size_t sz = static_cast<size_t>(st.st_size);
+            void* ptr = ::mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+            ::close(fd);
+            if (ptr != MAP_FAILED && ptr != nullptr) {
+                auto res = std::make_shared<MappedFontData>();
+                res->mapped_ptr_ = ptr;
+                res->mapped_size_ = sz;
+                res->span_ = std::span<const uint8_t>(static_cast<const uint8_t*>(ptr), sz);
+                return res;
+            }
+        } else {
+            ::close(fd);
+        }
+    }
+#endif
+
+    std::ifstream file(path_str, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) return nullptr;
+    std::streamsize size = file.tellg();
+    if (size < 12) return nullptr;
+    file.seekg(0, std::ios::beg);
+
+    auto res = std::make_shared<MappedFontData>();
+    res->fallback_buffer_.resize(static_cast<size_t>(size));
+    if (!file.read(reinterpret_cast<char*>(res->fallback_buffer_.data()), size)) {
+        return nullptr;
+    }
+    res->span_ = res->fallback_buffer_;
+    return res;
+}
+
+// ============================================================================
+// TtfFont Implementation
+// ============================================================================
 
 TtfFont::TtfFont() = default;
 TtfFont::~TtfFont() = default;
@@ -157,53 +340,267 @@ const TtfFont::TableRecord* TtfFont::find_table(uint32_t tag) const noexcept {
     return nullptr;
 }
 
-std::unique_ptr<TtfFont> TtfFont::from_bytes(std::span<const uint8_t> data, bool copy_data) {
+uint32_t TtfFont::collection_face_count(std::span<const uint8_t> data) noexcept {
+    if (data.size() < 12) return 0;
+    ByteReader r(data);
+    uint32_t magic = r.read_u32();
+    if (magic == TAG_TTCF) {
+        /* uint32_t version = */ r.read_u32();
+        uint32_t num_fonts = r.read_u32();
+        if (12 + static_cast<size_t>(num_fonts) * 4 <= data.size()) {
+            return num_fonts;
+        }
+        return 0;
+    }
+    if (magic == 0x00010000 || magic == make_tag('O', 'T', 'T', 'O') || magic == make_tag('t', 'r', 'u', 'e')) {
+        return 1;
+    }
+    return 0;
+}
+
+bool TtfFont::probe_face_header(
+    std::span<const uint8_t> data,
+    uint32_t face_index,
+    FontFaceHeaderInfo& out_info
+) {
+    out_info = FontFaceHeaderInfo{};
+    out_info.face_index = face_index;
+
+    size_t sfnt_offset = 0;
+    if (!resolve_sfnt_offset(data, face_index, sfnt_offset)) {
+        return false;
+    }
+
+    ByteReader reader(data);
+    if (!reader.seek(sfnt_offset) || !reader.can_read(12)) return false;
+
+    uint32_t sfnt_version = reader.read_u32();
+    if (sfnt_version != 0x00010000 && sfnt_version != make_tag('O', 'T', 'T', 'O') &&
+        sfnt_version != make_tag('t', 'r', 'u', 'e')) {
+        return false;
+    }
+
+    uint16_t raw_num_tables = reader.read_u16();
+    reader.skip(6);
+
+    uint32_t head_off = 0, head_len = 0;
+    uint32_t name_off = 0, name_len = 0;
+    uint32_t os2_off = 0, os2_len = 0;
+    uint32_t post_off = 0, post_len = 0;
+    bool has_cmap = false;
+
+    for (uint16_t i = 0; i < raw_num_tables; ++i) {
+        if (!reader.can_read(16)) break;
+        uint32_t tag = reader.read_u32();
+        reader.skip(4); // checksum
+        uint32_t offset = reader.read_u32();
+        uint32_t length = reader.read_u32();
+        if (static_cast<size_t>(offset) + static_cast<size_t>(length) > data.size()) continue;
+
+        if (tag == TAG_HEAD) { head_off = offset; head_len = length; }
+        else if (tag == TAG_NAME) { name_off = offset; name_len = length; }
+        else if (tag == TAG_OS2)  { os2_off = offset; os2_len = length; }
+        else if (tag == TAG_POST) { post_off = offset; post_len = length; }
+        else if (tag == TAG_CMAP) { has_cmap = true; }
+        else if (tag == TAG_COLR || tag == TAG_CBDT || tag == TAG_SBIX || tag == TAG_SVG) {
+            out_info.is_color = true;
+        }
+        else if (tag == TAG_FVAR) {
+            out_info.is_variable = true;
+        }
+    }
+
+    if (!has_cmap || head_off == 0 || head_len < 54) return false;
+
+    // 1. Parse head for macStyle fallback
+    {
+        ByteReader hr(data.subspan(head_off, head_len));
+        hr.skip(44);
+        uint16_t mac_style = hr.read_u16();
+        if (mac_style & 0x0001) out_info.weight = Weight::Bold;
+        if (mac_style & 0x0002) out_info.style = Style::Italic;
+    }
+
+    // 2. Parse OS/2 for weight, stretch, style, PANOSE, and 128-bit ulUnicodeRange
+    if (os2_off != 0 && os2_len >= 6) {
+        ByteReader ordr(data.subspan(os2_off, os2_len));
+        /* uint16_t ver = */ ordr.read_u16();
+        ordr.skip(2); // xAvgCharWidth
+        uint16_t w_class = ordr.read_u16();
+        if (w_class >= 1 && w_class <= 1000) {
+            out_info.weight = quantize_weight(w_class);
+        }
+        if (os2_len >= 8) {
+            uint16_t s_class = ordr.read_u16();
+            if (s_class >= 1 && s_class <= 9) {
+                out_info.stretch = quantize_stretch(s_class);
+            }
+        }
+        if (os2_len >= 42) {
+            ordr.seek(32);
+            uint8_t panose_family = ordr.read_u8();
+            uint8_t panose_serif = ordr.read_u8();
+            ordr.skip(1); // weight
+            uint8_t panose_prop = ordr.read_u8();
+            if (panose_prop == 9) {
+                out_info.is_monospace = true;
+            }
+            if (panose_family == 2 && panose_serif >= 2 && panose_serif <= 10) {
+                out_info.is_serif = true;
+            }
+        }
+        if (os2_len >= 58) {
+            ordr.seek(42);
+            out_info.unicode_ranges[0] = ordr.read_u32();
+            out_info.unicode_ranges[1] = ordr.read_u32();
+            out_info.unicode_ranges[2] = ordr.read_u32();
+            out_info.unicode_ranges[3] = ordr.read_u32();
+        }
+        if (os2_len >= 64) {
+            ordr.seek(62);
+            uint16_t fs_selection = ordr.read_u16();
+            if (fs_selection & 0x0001) {
+                out_info.style = Style::Italic;
+            } else if (fs_selection & 0x0200) {
+                out_info.style = Style::Oblique;
+            }
+        }
+    }
+
+    // 3. Parse post for isFixedPitch
+    if (post_off != 0 && post_len >= 16) {
+        ByteReader pr(data.subspan(post_off, post_len));
+        pr.skip(12); // version (4), italicAngle (4), underlinePosition (2), underlineThickness (2)
+        uint32_t is_fixed_pitch = pr.read_u32();
+        if (is_fixed_pitch != 0) {
+            out_info.is_monospace = true;
+        }
+    }
+
+    // 4. Parse name table (preferring English / Unicode nameID 16/17 Typographic Family, falling back to 1/2)
+    if (name_off != 0 && name_len >= 6) {
+        ByteReader nr(data.subspan(name_off, name_len));
+        /* uint16_t fmt = */ nr.read_u16();
+        uint16_t count = nr.read_u16();
+        uint16_t string_offset = nr.read_u16();
+        uint32_t storage_base = name_off + string_offset;
+
+        std::string fam_1, style_2, fam_16, style_17, ps_6;
+        int best_fam1_score = -1, best_style2_score = -1;
+        int best_fam16_score = -1, best_style17_score = -1;
+
+        for (uint16_t i = 0; i < count; ++i) {
+            if (!nr.can_read(12)) break;
+            uint16_t pid = nr.read_u16();
+            uint16_t eid = nr.read_u16();
+            uint16_t lid = nr.read_u16();
+            uint16_t nid = nr.read_u16();
+            uint16_t length = nr.read_u16();
+            uint16_t offset = nr.read_u16();
+
+            if (nid != 1 && nid != 2 && nid != 6 && nid != 16 && nid != 17) continue;
+
+            uint32_t str_abs = storage_base + offset;
+            if (str_abs + length > data.size() || length == 0) continue;
+
+            // Score language preference: English US (0x0409 on Win, 0 on Mac/Unicode) highest
+            int lang_score = 1;
+            if (pid == 3 && (eid == 1 || eid == 10)) {
+                lang_score = (lid == 0x0409) ? 10 : 5;
+            } else if (pid == 0) {
+                lang_score = 8;
+            } else if (pid == 1 && eid == 0 && lid == 0) {
+                lang_score = 6;
+            }
+
+            std::string decoded = decode_name_string(data.subspan(str_abs, length), pid, eid);
+            if (decoded.empty()) continue;
+
+            if (nid == 1 && lang_score > best_fam1_score) {
+                fam_1 = std::move(decoded);
+                best_fam1_score = lang_score;
+            } else if (nid == 2 && lang_score > best_style2_score) {
+                style_2 = std::move(decoded);
+                best_style2_score = lang_score;
+            } else if (nid == 16 && lang_score > best_fam16_score) {
+                fam_16 = std::move(decoded);
+                best_fam16_score = lang_score;
+            } else if (nid == 17 && lang_score > best_style17_score) {
+                style_17 = std::move(decoded);
+                best_style17_score = lang_score;
+            } else if (nid == 6 && ps_6.empty()) {
+                ps_6 = std::move(decoded);
+            }
+        }
+
+        if (!fam_16.empty()) out_info.family_name = std::move(fam_16);
+        else if (!fam_1.empty()) out_info.family_name = std::move(fam_1);
+
+        if (!style_17.empty()) out_info.style_name = std::move(style_17);
+        else if (!style_2.empty()) out_info.style_name = std::move(style_2);
+
+        out_info.postscript_name = std::move(ps_6);
+    }
+
+    return !out_info.family_name.empty() && out_info.family_name != "Unknown";
+}
+
+std::unique_ptr<TtfFont> TtfFont::from_bytes(
+    std::span<const uint8_t> data,
+    bool copy_data,
+    uint32_t face_index
+) {
     auto font = std::make_unique<TtfFont>();
     if (copy_data) {
         font->owned_data_.assign(data.begin(), data.end());
-        if (!font->parse_internal(font->owned_data_)) {
+        if (!font->parse_internal(font->owned_data_, face_index)) {
             return nullptr;
         }
     } else {
-        if (!font->parse_internal(data)) {
+        if (!font->parse_internal(data, face_index)) {
             return nullptr;
         }
     }
     return font;
 }
 
-std::unique_ptr<TtfFont> TtfFont::from_file(std::string_view file_path) {
-    std::ifstream file(std::string(file_path), std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        return nullptr;
-    }
-    std::streamsize size = file.tellg();
-    if (size <= 0) {
-        return nullptr;
-    }
-    file.seekg(0, std::ios::beg);
-
-    std::vector<uint8_t> buffer(static_cast<size_t>(size));
-    if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
-        return nullptr;
-    }
-
+std::unique_ptr<TtfFont> TtfFont::from_mapped(
+    std::shared_ptr<MappedFontData> mapped,
+    uint32_t face_index
+) {
+    if (!mapped || !mapped->is_valid()) return nullptr;
     auto font = std::make_unique<TtfFont>();
-    font->owned_data_ = std::move(buffer);
-    if (!font->parse_internal(font->owned_data_)) {
+    font->mapped_data_ = std::move(mapped);
+    if (!font->parse_internal(font->mapped_data_->span(), face_index)) {
         return nullptr;
     }
     return font;
 }
 
-bool TtfFont::parse_internal(std::span<const uint8_t> data) {
+std::unique_ptr<TtfFont> TtfFont::from_file(std::string_view file_path, uint32_t face_index) {
+    auto mapped = MappedFontData::open_file(file_path);
+    if (!mapped) return nullptr;
+    return from_mapped(std::move(mapped), face_index);
+}
+
+bool TtfFont::parse_internal(std::span<const uint8_t> data, uint32_t face_index) {
     data_ = data;
+    face_index_ = face_index;
     hmtx_table_ = nullptr;
     if (data_.size() < 12) {
         return false;
     }
 
+    size_t sfnt_offset = 0;
+    if (!resolve_sfnt_offset(data_, face_index, sfnt_offset)) {
+        return false;
+    }
+
     ByteReader reader(data_);
+    if (!reader.seek(sfnt_offset) || !reader.can_read(12)) {
+        return false;
+    }
+
     uint32_t sfnt_version = reader.read_u32();
     // 0x00010000 for TrueType, 'OTTO' for OpenType, 'true' for Apple TrueType
     if (sfnt_version != 0x00010000 && sfnt_version != make_tag('O', 'T', 'T', 'O') &&
@@ -236,6 +633,7 @@ bool TtfFont::parse_internal(std::span<const uint8_t> data) {
     // Optional tables
     parse_name();
     parse_os2();
+    parse_post();
     parse_kern();
     parse_fvar();
 
@@ -444,39 +842,60 @@ bool TtfFont::parse_name() {
     uint16_t string_offset = reader.read_u16();
     uint32_t storage_base = rec->offset + string_offset;
 
+    std::string fam_1, style_2, fam_16, style_17, ps_6;
+    int best_fam1_score = -1, best_style2_score = -1;
+    int best_fam16_score = -1, best_style17_score = -1;
+
     for (uint16_t i = 0; i < count; ++i) {
         if (!reader.can_read(12)) break;
         uint16_t platform_id = reader.read_u16();
         uint16_t encoding_id = reader.read_u16();
-        /* uint16_t language_id = */ reader.read_u16();
+        uint16_t language_id = reader.read_u16();
         uint16_t name_id = reader.read_u16();
         uint16_t length = reader.read_u16();
         uint16_t offset = reader.read_u16();
 
+        if (name_id != 1 && name_id != 2 && name_id != 6 && name_id != 16 && name_id != 17) continue;
+
         uint32_t str_abs = storage_base + offset;
-        if (str_abs + length > data_.size()) continue;
+        if (str_abs + length > data_.size() || length == 0) continue;
 
-        auto str_bytes = data_.subspan(str_abs, length);
+        int lang_score = 1;
+        if (platform_id == 3 && (encoding_id == 1 || encoding_id == 10)) {
+            lang_score = (language_id == 0x0409) ? 10 : 5;
+        } else if (platform_id == 0) {
+            lang_score = 8;
+        } else if (platform_id == 1 && encoding_id == 0 && language_id == 0) {
+            lang_score = 6;
+        }
 
-        auto decode_string = [&](std::span<const uint8_t> bytes, uint16_t pid, uint16_t /*eid*/) -> std::string {
-            std::string res;
-            if (pid == 0 || pid == 3) {
-                for (size_t k = 0; k + 1 < bytes.size(); k += 2) {
-                    char c = static_cast<char>(bytes[k + 1]);
-                    if (bytes[k] == 0 && c != 0) res.push_back(c);
-                }
-            } else {
-                res.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-            }
-            return res;
-        };
+        std::string decoded = decode_name_string(data_.subspan(str_abs, length), platform_id, encoding_id);
+        if (decoded.empty()) continue;
 
-        if (name_id == 1 && family_name_ == "Unknown") {
-            family_name_ = decode_string(str_bytes, platform_id, encoding_id);
-        } else if (name_id == 2 && style_name_ == "Regular") {
-            style_name_ = decode_string(str_bytes, platform_id, encoding_id);
+        if (name_id == 1 && lang_score > best_fam1_score) {
+            fam_1 = std::move(decoded);
+            best_fam1_score = lang_score;
+        } else if (name_id == 2 && lang_score > best_style2_score) {
+            style_2 = std::move(decoded);
+            best_style2_score = lang_score;
+        } else if (name_id == 16 && lang_score > best_fam16_score) {
+            fam_16 = std::move(decoded);
+            best_fam16_score = lang_score;
+        } else if (name_id == 17 && lang_score > best_style17_score) {
+            style_17 = std::move(decoded);
+            best_style17_score = lang_score;
+        } else if (name_id == 6 && ps_6.empty()) {
+            ps_6 = std::move(decoded);
         }
     }
+
+    if (!fam_16.empty()) family_name_ = std::move(fam_16);
+    else if (!fam_1.empty()) family_name_ = std::move(fam_1);
+
+    if (!style_17.empty()) style_name_ = std::move(style_17);
+    else if (!style_2.empty()) style_name_ = std::move(style_2);
+
+    postscript_name_ = std::move(ps_6);
     return true;
 }
 
@@ -488,8 +907,34 @@ bool TtfFont::parse_os2() {
     /* uint16_t version = */ reader.read_u16();
     reader.skip(2); // xAvgCharWidth
     uint16_t us_weight_class = reader.read_u16();
-    if (us_weight_class >= 100 && us_weight_class <= 900) {
-        weight_ = static_cast<Weight>(us_weight_class);
+    if (us_weight_class >= 1 && us_weight_class <= 1000) {
+        weight_ = quantize_weight(us_weight_class);
+    }
+    if (rec->length >= 8) {
+        uint16_t us_width_class = reader.read_u16();
+        if (us_width_class >= 1 && us_width_class <= 9) {
+            stretch_ = quantize_stretch(us_width_class);
+        }
+    }
+    if (rec->length >= 42) {
+        reader.seek(32);
+        uint8_t panose_family = reader.read_u8();
+        uint8_t panose_serif = reader.read_u8();
+        reader.skip(1); // weight
+        uint8_t panose_prop = reader.read_u8();
+        if (panose_prop == 9) {
+            is_monospace_ = true;
+        }
+        if (panose_family == 2 && panose_serif >= 2 && panose_serif <= 10) {
+            is_serif_ = true;
+        }
+    }
+    if (rec->length >= 58) {
+        reader.seek(42);
+        unicode_ranges_[0] = reader.read_u32();
+        unicode_ranges_[1] = reader.read_u32();
+        unicode_ranges_[2] = reader.read_u32();
+        unicode_ranges_[3] = reader.read_u32();
     }
     if (rec->length >= 64) {
         reader.seek(62);
@@ -499,6 +944,18 @@ bool TtfFont::parse_os2() {
         } else if (fs_selection & 0x0200) { // OBLIQUE
             style_ = Style::Oblique;
         }
+    }
+    return true;
+}
+
+bool TtfFont::parse_post() {
+    const auto* rec = find_table(TAG_POST);
+    if (!rec || rec->length < 16) return false;
+    ByteReader reader(data_.subspan(rec->offset, rec->length));
+    reader.skip(12); // version(4), italicAngle(4), underlinePosition(2), underlineThickness(2)
+    uint32_t is_fixed_pitch = reader.read_u32();
+    if (is_fixed_pitch != 0) {
+        is_monospace_ = true;
     }
     return true;
 }

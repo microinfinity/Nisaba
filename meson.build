@@ -40,6 +40,7 @@ nisaba_sources = files(
   'src/text/bidi.cpp',
   'src/text/layout.cpp',
   'src/text/glyph_cache.cpp',
+  'src/text/linux_font_config.cpp',
   'src/text/font_system.cpp',
   'src/text/buffer.cpp',
   'src/text/cursor.cpp',

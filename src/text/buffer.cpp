@@ -143,14 +143,15 @@ void BufferLine::shape_and_layout(
     // ULTRA-FAST PATH: Pure ASCII with Uniform Attributes (Standard Case)
     // -------------------------------------------------------------------------
     if (is_pure_ascii && !has_custom_attrs && !enable_ligatures) {
-        auto [primary_fid, _] = font_system.match_font(def_attrs.family, def_attrs.weight, def_attrs.style);
-        const TtfFont* primary_font = font_system.get_font(primary_fid);
+        auto matched = font_system.match_font_styled(def_attrs.family, def_attrs.weight, def_attrs.style, def_attrs.stretch);
+        uint32_t primary_fid = matched.font_id;
+        const TtfFont* primary_font = matched.font;
         float scale = (primary_font != nullptr) ? primary_font->scale_for_size(font_size) : 0.0f;
         float asc = primary_font ? primary_font->ascent(font_size) : (font_size * 0.8f);
         float desc = primary_font ? -primary_font->descent(font_size) : (font_size * 0.2f);
 
-        bool synth_bold = primary_font && (static_cast<int>(def_attrs.weight) >= 600) && (static_cast<int>(primary_font->weight()) < 600);
-        bool synth_italic = primary_font && (def_attrs.style != Style::Normal) && (primary_font->style() == Style::Normal);
+        bool synth_bold = matched.synthetic_bold;
+        bool synth_italic = matched.synthetic_italic;
 
         std::vector<LayoutGlyph> all_glyphs;
         all_glyphs.resize(text_.size());
@@ -320,13 +321,14 @@ void BufferLine::shape_and_layout(
     }
 
     if (!has_rtl_or_marks && !has_custom_attrs && !enable_ligatures) {
-        auto [primary_fid, _] = font_system.match_font(def_attrs.family, def_attrs.weight, def_attrs.style);
-        const TtfFont* primary_font = font_system.get_font(primary_fid);
+        auto matched = font_system.match_font_styled(def_attrs.family, def_attrs.weight, def_attrs.style, def_attrs.stretch);
+        uint32_t primary_fid = matched.font_id;
+        const TtfFont* primary_font = matched.font;
         float scale = (primary_font != nullptr) ? primary_font->scale_for_size(font_size) : 0.0f;
         float asc = primary_font ? primary_font->ascent(font_size) : (font_size * 0.8f);
         float desc = primary_font ? -primary_font->descent(font_size) : (font_size * 0.2f);
-        bool synth_bold = primary_font && (static_cast<int>(def_attrs.weight) >= 600) && (static_cast<int>(primary_font->weight()) < 600);
-        bool synth_italic = primary_font && (def_attrs.style != Style::Normal) && (primary_font->style() == Style::Normal);
+        bool synth_bold = matched.synthetic_bold;
+        bool synth_italic = matched.synthetic_italic;
 
         std::vector<LayoutGlyph> all_glyphs;
         all_glyphs.resize(decoded.size());
@@ -567,9 +569,9 @@ void BufferLine::shape_and_layout(
         float eff_font_size = attrs.font_size_opt.value_or(font_size);
 
         if (!last_attrs.has_value() || *last_attrs != attrs) {
-            auto [primary_fid, _] = font_system.match_font(attrs.family, attrs.weight, attrs.style);
-            last_primary_fid = primary_fid;
-            last_primary_font = font_system.get_font(primary_fid);
+            auto matched = font_system.match_font_styled(attrs.family, attrs.weight, attrs.style, attrs.stretch);
+            last_primary_fid = matched.font_id;
+            last_primary_font = matched.font;
             last_attrs = attrs;
         }
 

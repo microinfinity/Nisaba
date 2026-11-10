@@ -44,6 +44,7 @@
 #include "nisaba/text/bidi.hpp"
 #include "nisaba/text/layout.hpp"
 #include "nisaba/text/glyph_cache.hpp"
+#include "nisaba/text/linux_font_config.hpp"
 #include "nisaba/text/font_system.hpp"
 #include "nisaba/text/buffer.hpp"
 #include "nisaba/text/cursor.hpp"
