@@ -251,7 +251,7 @@ struct OpenTypeGsub::Impl {
 
     std::vector<uint16_t> get_lookups_for_features(std::span<const uint32_t> requested_tags) const {
         std::vector<uint16_t> lookup_indices;
-        if (feature_list_offset + 2 > data.size()) return lookup_indices;
+        if (feature_list_offset + 2u > data.size()) return lookup_indices;
 
         SpanReader fr(data.subspan(feature_list_offset));
         uint16_t feature_count = fr.read_u16();
@@ -284,7 +284,7 @@ struct OpenTypeGsub::Impl {
     }
 
     uint16_t apply_single_on_glyph(uint16_t lookup_idx, uint16_t glyph_id) const noexcept {
-        if (lookup_list_offset + 2 > data.size()) return glyph_id;
+        if (lookup_list_offset + 2u > data.size()) return glyph_id;
         uint16_t total_lookups = read_u16_be(data.data() + lookup_list_offset);
         if (lookup_idx >= total_lookups) return glyph_id;
         if (lookup_list_offset + 2 + static_cast<size_t>(lookup_idx) * 2 + 2 > data.size()) return glyph_id;
@@ -429,7 +429,7 @@ struct OpenTypeGsub::Impl {
 
                     SpanReader alt_off_r(sub_span.subspan(6 + cov * 2));
                     uint16_t alt_offset = alt_off_r.read_u16();
-                    if (alt_offset + 4 <= sub_span.size()) {
+                    if (alt_offset + 4u <= sub_span.size()) {
                         uint16_t alt_count = read_u16_be(sub_span.data() + alt_offset);
                         if (alt_count > 0) {
                             g = read_u16_be(sub_span.data() + alt_offset + 2);
@@ -622,7 +622,7 @@ struct OpenTypeGpos::Impl {
     }
 
     void collect_feature_lookups(uint32_t target_tag, std::vector<uint16_t>& out_indices) const noexcept {
-        if (feature_list_offset + 2 > data.size()) return;
+        if (feature_list_offset + 2u > data.size()) return;
         const uint8_t* fl_base = data.data() + feature_list_offset;
         size_t fl_max = data.size() - feature_list_offset;
         uint16_t feature_count = read_u16_be(fl_base);
@@ -634,7 +634,7 @@ struct OpenTypeGpos::Impl {
             if (tag != target_tag) continue;
 
             uint16_t feat_offset = read_u16_be(fl_base + rec_off + 4);
-            if (feat_offset + 4 > fl_max) continue;
+            if (feat_offset + 4u > fl_max) continue;
 
             const uint8_t* ft = fl_base + feat_offset;
             uint16_t count = read_u16_be(ft + 2);
@@ -651,7 +651,7 @@ struct OpenTypeGpos::Impl {
     void ensure_kern_indexed() const noexcept {
         if (kern_indexed) return;
         kern_indexed = true;
-        if (lookup_list_offset + 2 > data.size()) return;
+        if (lookup_list_offset + 2u > data.size()) return;
 
         std::vector<uint16_t> lookup_indices;
         lookup_indices.reserve(8);
@@ -717,7 +717,7 @@ struct OpenTypeGpos::Impl {
     void ensure_mark_indexed() const noexcept {
         if (mark_indexed) return;
         mark_indexed = true;
-        if (lookup_list_offset + 2 > data.size()) return;
+        if (lookup_list_offset + 2u > data.size()) return;
 
         std::vector<uint16_t> lookup_indices;
         lookup_indices.reserve(8);
@@ -793,7 +793,7 @@ struct OpenTypeGpos::Impl {
                 size_t ps_off_pos = 10 + static_cast<size_t>(cov) * 2;
                 if (ps_off_pos + 2 > pst.span.size()) continue;
                 uint16_t pair_set_offset = read_u16_be(pst.span.data() + ps_off_pos);
-                if (pair_set_offset + 2 > pst.span.size()) continue;
+                if (pair_set_offset + 2u > pst.span.size()) continue;
 
                 const uint8_t* ps_base = pst.span.data() + pair_set_offset;
                 size_t ps_max = pst.span.size() - pair_set_offset;
@@ -851,7 +851,7 @@ struct OpenTypeGpos::Impl {
             int32_t base_cov = read_coverage_index(mst.span, mst.base_cov_offset, base_glyph);
             if (base_cov < 0) continue;
 
-            if (mst.mark_array_offset + 2 > mst.span.size()) continue;
+            if (mst.mark_array_offset + 2u > mst.span.size()) continue;
             auto mark_array_span = mst.span.subspan(mst.mark_array_offset);
             uint16_t mark_count = read_u16_be(mark_array_span.data());
             if (static_cast<uint16_t>(mark_cov) >= mark_count) continue;
@@ -862,7 +862,7 @@ struct OpenTypeGpos::Impl {
             uint16_t mark_anchor_offset = read_u16_be(mark_array_span.data() + m_rec_off + 2);
             if (mark_class >= mst.mark_class_count) continue;
 
-            if (mst.base_array_offset + 2 > mst.span.size()) continue;
+            if (mst.base_array_offset + 2u > mst.span.size()) continue;
             auto base_array_span = mst.span.subspan(mst.base_array_offset);
             uint16_t base_count = read_u16_be(base_array_span.data());
             if (static_cast<uint16_t>(base_cov) >= base_count) continue;
@@ -874,11 +874,11 @@ struct OpenTypeGpos::Impl {
             uint16_t base_anchor_offset = read_u16_be(base_array_span.data() + b_anch_pos);
             if (base_anchor_offset == 0) continue;
 
-            if (mark_anchor_offset + 6 > mark_array_span.size()) continue;
+            if (mark_anchor_offset + 6u > mark_array_span.size()) continue;
             int16_t mark_x = read_i16_be(mark_array_span.data() + mark_anchor_offset + 2);
             int16_t mark_y = read_i16_be(mark_array_span.data() + mark_anchor_offset + 4);
 
-            if (base_anchor_offset + 6 > base_array_span.size()) continue;
+            if (base_anchor_offset + 6u > base_array_span.size()) continue;
             int16_t base_x = read_i16_be(base_array_span.data() + base_anchor_offset + 2);
             int16_t base_y = read_i16_be(base_array_span.data() + base_anchor_offset + 4);
 

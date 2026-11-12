@@ -39,6 +39,20 @@ public:
         const PointI& parentOffset,
         const Region* damage) const override;
 
+    void enqueueToPass(
+        RenderPass& pass,
+        const PointI& parentOffset,
+        const ImageDescription& outputDesc = ImageDescription::srgbDefault()) const override;
+
+    /**
+     * @brief Enqueues the scene tree into the deferred RenderPass and executes with
+     * front-to-back occlusion culling.
+     */
+    PassExecutionStats renderCulled(
+        RenderPass& pass,
+        const Region& damage,
+        const ImageDescription& outputDesc = ImageDescription::srgbDefault()) const;
+
     SceneNode* nodeAt(const PointI& rootPoint) override;
 
     /**

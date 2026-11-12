@@ -30,9 +30,13 @@ namespace nisaba::compositor {
  */
 struct WindowDecoStyle {
     float cornerRadius{10.0f};
+    float roundingPower{2.0f};
     float titleBarHeight{30.0f};
     float borderWidth{1.0f};
     Color borderColor{0.35f, 0.40f, 0.50f, 0.35f};
+    GradientSpec borderGradient{};
+    float innerGlowRange{0.0f};
+    Color innerGlowColor{1.0f, 1.0f, 1.0f, 0.25f};
     Color titleBarColor{0.14f, 0.15f, 0.18f, 0.95f};
     Color bodyColor{0.10f, 0.11f, 0.13f, 0.92f};
     Color titleTextColor{0.92f, 0.93f, 0.96f, 1.0f};
@@ -43,7 +47,7 @@ struct WindowDecoStyle {
     Color minButtonColor{0.95f, 0.75f, 0.20f, 1.0f};
     Color maxButtonColor{0.25f, 0.80f, 0.35f, 1.0f};
 
-    constexpr WindowDecoStyle() noexcept = default;
+    WindowDecoStyle() noexcept = default;
 };
 
 /**
@@ -110,9 +114,28 @@ public:
         const Texture* maskTexture = nullptr);
 
     /**
-     * @brief Renders a complete scene graph tree.
+     * @brief Applies the active pluggable BlurMaterialProvider (Acrylic, OpticalGlass, WaterRipple, etc.).
+     */
+    void drawBlurMaterial(
+        const Texture& source,
+        const RectI& destBox,
+        const BlurContext& ctx = {},
+        const RectI& srcBox = RectI{0, 0, 0, 0});
+
+    /**
+     * @brief Renders a complete scene graph tree (immediate mode).
      */
     void drawScene(const SceneTree& tree);
+
+    /**
+     * @brief Renders a complete scene graph tree using the Deferred Pass Graph with
+     * front-to-back Occlusion Culling.
+     */
+    PassExecutionStats drawSceneCulled(
+        const SceneTree& tree,
+        const ImageDescription& outputDesc = ImageDescription::srgbDefault());
+
+    [[nodiscard]] RenderPass* currentPass() noexcept { return m_currentPass.get(); }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Fused High-Performance Vector Graphics APIs (nisaba::gpu integration)

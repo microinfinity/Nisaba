@@ -89,6 +89,29 @@ void SceneTree::render(
     }
 }
 
+void SceneTree::enqueueToPass(
+    RenderPass& pass,
+    const PointI& parentOffset,
+    const ImageDescription& outputDesc) const {
+    if (!m_enabled) return;
+
+    const PointI currentOffset{parentOffset.x + m_x, parentOffset.y + m_y};
+
+    for (const auto& child : m_children) {
+        if (child && child->isEnabled()) {
+            child->enqueueToPass(pass, currentOffset, outputDesc);
+        }
+    }
+}
+
+PassExecutionStats SceneTree::renderCulled(
+    RenderPass& pass,
+    const Region& damage,
+    const ImageDescription& outputDesc) const {
+    enqueueToPass(pass, PointI{0, 0}, outputDesc);
+    return pass.optimizeAndExecute(damage);
+}
+
 SceneNode* SceneTree::nodeAt(const PointI& rootPoint) {
     if (!m_enabled) return nullptr;
 
@@ -144,6 +167,9 @@ SceneBuffer* SceneTree::findDirectScanoutCandidate(int targetWidth, int targetHe
             if (item.x == 0 && item.y == 0 &&
                 buf->width() == targetWidth && buf->height() == targetHeight &&
                 buf->alpha() >= 0.999f &&
+                buf->cornerRadius() <= 0.5f &&
+                !buf->transformers().blocksDirectScanout() &&
+                buf->imageDescription().isStandardSrgb() &&
                 buf->transform() == WL_OUTPUT_TRANSFORM_NORMAL &&
                 buf->texture() != nullptr) {
 

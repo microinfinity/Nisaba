@@ -9,7 +9,8 @@ std::shared_ptr<DmaBufTexture> DmaBufTexture::create(
     uint32_t height,
     uint32_t format,
     bool hasAlpha,
-    GLenum target) {
+    GLenum target,
+    uint64_t modifier) {
     if (!image || image->raw() == EGL_NO_IMAGE_KHR) {
         logError("DmaBufTexture::create: Invalid EglImage");
         return nullptr;
@@ -73,7 +74,8 @@ std::shared_ptr<DmaBufTexture> DmaBufTexture::create(
         width,
         height,
         format,
-        hasAlpha);
+        hasAlpha,
+        modifier);
 }
 
 DmaBufTexture::DmaBufTexture(
@@ -83,7 +85,10 @@ DmaBufTexture::DmaBufTexture(
     uint32_t width,
     uint32_t height,
     uint32_t format,
-    bool hasAlpha)
-    : Texture(id, target, width, height, format, hasAlpha), m_image(std::move(image)) {}
+    bool hasAlpha,
+    uint64_t modifier)
+    : Texture(id, target, width, height, format, hasAlpha),
+      m_image(std::move(image)),
+      m_modifier(modifier) {}
 
 } // namespace nisaba::compositor

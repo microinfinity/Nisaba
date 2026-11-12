@@ -56,6 +56,34 @@ Region DamageRing::rotate(uintptr_t bufferId, int width, int height) {
     return fullDamage;
 }
 
+void DamageRing::Transaction::rollback() noexcept {
+    if (!m_ring || m_rolledBack) return;
+    m_ring->add(m_savedCurrent);
+    m_rolledBack = true;
+    m_committed = false;
+}
+
+DamageRing::Transaction DamageRing::beginTransaction(uintptr_t bufferId, int width, int height) {
+    Region saved = m_current;
+    Region rotated = rotate(bufferId, width, height);
+    return Transaction(*this, bufferId, std::move(rotated), std::move(saved));
+}
+
+void DamageRing::expandPending(int radiusPixels) noexcept {
+    if (radiusPixels <= 0 || m_current.isEmpty()) return;
+    const auto rects = m_current.rects();
+    Region expanded;
+    for (const auto& r : rects) {
+        expanded.add(RectI{
+            r.x - radiusPixels,
+            r.y - radiusPixels,
+            r.width + radiusPixels * 2,
+            r.height + radiusPixels * 2
+        });
+    }
+    m_current = std::move(expanded);
+}
+
 void DamageRing::clear() noexcept {
     m_current.clear();
     m_entries.clear();

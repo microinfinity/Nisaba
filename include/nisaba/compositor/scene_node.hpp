@@ -1,9 +1,13 @@
 #pragma once
 
 #include "nisaba/compositor/color.hpp"
+#include "nisaba/compositor/color_management.hpp"
 #include "nisaba/compositor/geometry.hpp"
 #include "nisaba/compositor/render_pass.hpp"
+#include "nisaba/compositor/surface_uv_solver.hpp"
 #include "nisaba/compositor/texture.hpp"
+#include "nisaba/compositor/window_decoration.hpp"
+#include "nisaba/compositor/window_transformer.hpp"
 
 #include <memory>
 #include <string>
@@ -51,12 +55,20 @@ public:
     [[nodiscard]] PointI absolutePosition() const noexcept;
 
     /**
-     * @brief Recursively renders the node into an active RenderPass.
+     * @brief Recursively renders the node into an active IRenderPass.
      */
     virtual void render(
         IRenderPass& pass,
         const PointI& parentOffset,
         const Region* damage) const = 0;
+
+    /**
+     * @brief Enqueues deferred pass elements into a RenderPass for front-to-back occlusion culling.
+     */
+    virtual void enqueueToPass(
+        RenderPass& pass,
+        const PointI& parentOffset,
+        const ImageDescription& outputDesc = ImageDescription::srgbDefault()) const = 0;
 
     /**
      * @brief Hit-tests point in root coordinates, returning topmost matching node.
@@ -91,10 +103,22 @@ public:
     [[nodiscard]] int width() const noexcept { return m_width; }
     [[nodiscard]] int height() const noexcept { return m_height; }
 
+    void setRounding(float cornerRadius, float roundingPower = 2.0f) noexcept {
+        m_cornerRadius = cornerRadius;
+        m_roundingPower = roundingPower;
+    }
+    [[nodiscard]] float cornerRadius() const noexcept { return m_cornerRadius; }
+    [[nodiscard]] float roundingPower() const noexcept { return m_roundingPower; }
+
     void render(
         IRenderPass& pass,
         const PointI& parentOffset,
         const Region* damage) const override;
+
+    void enqueueToPass(
+        RenderPass& pass,
+        const PointI& parentOffset,
+        const ImageDescription& outputDesc = ImageDescription::srgbDefault()) const override;
 
     SceneNode* nodeAt(const PointI& rootPoint) override;
 
@@ -102,10 +126,12 @@ private:
     int m_width{0};
     int m_height{0};
     Color m_color{Color::black()};
+    float m_cornerRadius{0.0f};
+    float m_roundingPower{2.0f};
 };
 
 /**
- * @brief Texture buffer scene node for Wayland surfaces, icons, and wallpapers.
+ * @brief Texture buffer scene node for Wayland surfaces, windows, icons, and wallpapers.
  */
 class SceneBuffer : public SceneNode {
 public:
@@ -129,6 +155,25 @@ public:
     void setTransform(wl_output_transform t) noexcept { m_transform = t; }
     [[nodiscard]] wl_output_transform transform() const noexcept { return m_transform; }
 
+    void setRounding(float cornerRadius, float roundingPower = 2.0f) noexcept {
+        m_cornerRadius = cornerRadius;
+        m_roundingPower = roundingPower;
+    }
+    [[nodiscard]] float cornerRadius() const noexcept { return m_cornerRadius; }
+    [[nodiscard]] float roundingPower() const noexcept { return m_roundingPower; }
+
+    void setImageDescription(const ImageDescription& desc) noexcept { m_imageDesc = desc; }
+    [[nodiscard]] const ImageDescription& imageDescription() const noexcept { return m_imageDesc; }
+
+    void setTearingHint(bool tearing) noexcept { m_tearingHint = tearing; }
+    [[nodiscard]] bool tearingHint() const noexcept { return m_tearingHint; }
+
+    [[nodiscard]] TransformerChain& transformers() noexcept { return m_transformers; }
+    [[nodiscard]] const TransformerChain& transformers() const noexcept { return m_transformers; }
+
+    [[nodiscard]] WindowDecorationStack& decorations() noexcept { return m_decorations; }
+    [[nodiscard]] const WindowDecorationStack& decorations() const noexcept { return m_decorations; }
+
     [[nodiscard]] int width() const noexcept { return m_width; }
     [[nodiscard]] int height() const noexcept { return m_height; }
 
@@ -140,6 +185,11 @@ public:
         const PointI& parentOffset,
         const Region* damage) const override;
 
+    void enqueueToPass(
+        RenderPass& pass,
+        const PointI& parentOffset,
+        const ImageDescription& outputDesc = ImageDescription::srgbDefault()) const override;
+
     SceneNode* nodeAt(const PointI& rootPoint) override;
 
 private:
@@ -148,7 +198,13 @@ private:
     int m_height{0};
     RectF m_srcBox{0.0, 0.0, 1.0, 1.0};
     float m_alpha{1.0f};
+    float m_cornerRadius{0.0f};
+    float m_roundingPower{2.0f};
     wl_output_transform m_transform{WL_OUTPUT_TRANSFORM_NORMAL};
+    ImageDescription m_imageDesc{};
+    bool m_tearingHint{false};
+    TransformerChain m_transformers{};
+    WindowDecorationStack m_decorations{};
     void* m_userData{nullptr};
 };
 

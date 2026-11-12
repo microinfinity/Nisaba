@@ -77,10 +77,34 @@ void CompositorCanvas::drawFrostedGlass(
     }
 }
 
+void CompositorCanvas::drawBlurMaterial(
+    const Texture& source,
+    const RectI& destBox,
+    const BlurContext& ctx,
+    const RectI& srcBox) {
+    if (m_currentPass && m_renderer && m_renderer->blurProvider() && m_renderer->blur()) {
+        m_currentPass->renderBlurMaterial(
+            *m_renderer->blurProvider(), *m_renderer->blur(), source, destBox, srcBox, ctx);
+    }
+}
+
 void CompositorCanvas::drawScene(const SceneTree& tree) {
     if (m_currentPass) {
         tree.render(*m_currentPass, PointI{0, 0}, m_currentDamage);
     }
+}
+
+PassExecutionStats CompositorCanvas::drawSceneCulled(
+    const SceneTree& tree,
+    const ImageDescription& outputDesc) {
+    if (!m_currentPass) return {};
+    Region fullDmg;
+    if (m_currentDamage) {
+        fullDmg = *m_currentDamage;
+    } else if (m_currentTarget) {
+        fullDmg = Region(RectI{0, 0, m_currentTarget->width(), m_currentTarget->height()});
+    }
+    return tree.renderCulled(*m_currentPass, fullDmg, outputDesc);
 }
 
 gpu::GpuCanvas* CompositorCanvas::vg() {
@@ -148,6 +172,8 @@ void CompositorCanvas::drawWindowDecoration(
     const RectI& clientBox,
     const WindowDecoStyle& style,
     std::string_view title) {
+    if (!m_currentPass) return;
+
     RectI fullBox{
         clientBox.x,
         clientBox.y - static_cast<int>(style.titleBarHeight),
@@ -155,93 +181,138 @@ void CompositorCanvas::drawWindowDecoration(
         clientBox.height + static_cast<int>(style.titleBarHeight)
     };
 
-    if (m_currentDamage && !m_currentDamage->intersects(fullBox)) {
+    int shadowPad = static_cast<int>(std::ceil(style.shadow.sigma * 2.5f + std::max(std::abs(style.shadow.dx), std::abs(style.shadow.dy))));
+    RectI expandedBounds{
+        fullBox.x - shadowPad,
+        fullBox.y - shadowPad,
+        fullBox.width + shadowPad * 2,
+        fullBox.height + shadowPad * 2
+    };
+
+    if (m_currentDamage && !m_currentDamage->intersects(expandedBounds)) {
         return; // Early discard via O(1) damage culling
     }
 
-    GlStateGuard guard;
-    auto* canvas = vg();
-    if (!canvas) return;
+    // 1. Native Compositor Analytical Drop Shadow (zero GlStateGuard overhead)
+    Color shadowCol(
+        style.shadow.color.red(),
+        style.shadow.color.green(),
+        style.shadow.color.blue(),
+        style.shadow.color.alpha());
+    if (style.shadow.sigma > 0.5f && shadowCol.a > 0.001f) {
+        RectI shadowFullBox{
+            expandedBounds.x + static_cast<int>(std::round(style.shadow.dx)),
+            expandedBounds.y + static_cast<int>(std::round(style.shadow.dy)),
+            expandedBounds.width,
+            expandedBounds.height
+        };
+        m_currentPass->renderShadow(
+            shadowFullBox,
+            style.cornerRadius,
+            style.roundingPower,
+            style.shadow.sigma,
+            2.2f,
+            GradientSpec(shadowCol),
+            nullptr,
+            0.0f,
+            1.0f,
+            m_currentDamage);
+    }
 
-    auto fullRect = nisaba::Rect::from_xywh(
-        static_cast<float>(fullBox.x),
-        static_cast<float>(fullBox.y),
-        static_cast<float>(fullBox.width),
-        static_cast<float>(fullBox.height)
-    );
-    if (!fullRect) return;
-
-    // 1. Analytical Gaussian Drop Shadow
-    canvas->draw_round_rect_shadow(*fullRect, style.cornerRadius, style.cornerRadius, style.shadow);
-
-    // 2. Window Body fill
-    nisaba::Paint bodyPaint(nisaba::Color::from_rgba_unchecked(
-        style.bodyColor.r, style.bodyColor.g, style.bodyColor.b, style.bodyColor.a
-    ));
-    canvas->fill_round_rect(*fullRect, style.cornerRadius, style.cornerRadius, bodyPaint);
+    // 2. Native Squircle Window Body fill
+    m_currentPass->renderRoundedRect(
+        fullBox,
+        style.bodyColor,
+        style.cornerRadius,
+        style.roundingPower,
+        m_currentDamage);
 
     // 3. Titlebar background
-    auto titleRect = nisaba::Rect::from_xywh(
-        static_cast<float>(fullBox.x),
-        static_cast<float>(fullBox.y),
-        static_cast<float>(fullBox.width),
-        style.titleBarHeight
-    );
-    if (titleRect) {
-        canvas->save();
-        canvas->clip_rect(*titleRect);
-        nisaba::Paint titlePaint(nisaba::Color::from_rgba_unchecked(
-            style.titleBarColor.r, style.titleBarColor.g, style.titleBarColor.b, style.titleBarColor.a
-        ));
-        canvas->fill_round_rect(*nisaba::Rect::from_xywh(
-            static_cast<float>(fullBox.x),
-            static_cast<float>(fullBox.y),
-            static_cast<float>(fullBox.width),
-            style.titleBarHeight + style.cornerRadius
-        ), style.cornerRadius, style.cornerRadius, titlePaint);
-        canvas->restore();
+    if (style.titleBarHeight > 0.5f) {
+        RectI titleClipBox{
+            fullBox.x,
+            fullBox.y,
+            fullBox.width,
+            static_cast<int>(style.titleBarHeight)
+        };
+        Region titleDamage(titleClipBox);
+        if (m_currentDamage) {
+            titleDamage.intersect(*m_currentDamage);
+        }
+        if (!titleDamage.isEmpty()) {
+            RectI titleRoundBox{
+                fullBox.x,
+                fullBox.y,
+                fullBox.width,
+                static_cast<int>(style.titleBarHeight + style.cornerRadius)
+            };
+            m_currentPass->renderRoundedRect(
+                titleRoundBox,
+                style.titleBarColor,
+                style.cornerRadius,
+                style.roundingPower,
+                &titleDamage);
+        }
     }
 
-    // 4. Subtle Specular Border
+    // 4. Native Inner Glow (optional)
+    if (style.innerGlowRange > 0.5f && style.innerGlowColor.a > 0.001f) {
+        m_currentPass->renderInnerGlow(
+            fullBox,
+            style.cornerRadius,
+            style.roundingPower,
+            style.innerGlowRange,
+            2.0f,
+            GradientSpec(style.innerGlowColor),
+            1.0f,
+            m_currentDamage);
+    }
+
+    // 5. Native Oklab / Solid Squircle Border
     if (style.borderWidth > 0.0f) {
-        nisaba::Stroke st;
-        st.width = style.borderWidth;
-        nisaba::Paint borderPaint(nisaba::Color::from_rgba_unchecked(
-            style.borderColor.r, style.borderColor.g, style.borderColor.b, style.borderColor.a
-        ));
-        canvas->stroke_round_rect(*fullRect, style.cornerRadius, style.cornerRadius, borderPaint, st);
+        GradientSpec borderGrad = !style.borderGradient.isEmpty()
+                                      ? style.borderGradient
+                                      : GradientSpec(style.borderColor);
+        m_currentPass->renderBorder(
+            fullBox,
+            borderGrad,
+            nullptr,
+            0.0f,
+            style.cornerRadius,
+            style.cornerRadius + style.borderWidth,
+            style.roundingPower,
+            style.borderWidth,
+            1.0f,
+            m_currentDamage);
     }
 
-    // 5. Title text
-    if (!title.empty()) {
-        float textX = static_cast<float>(fullBox.x) + (style.showButtons ? 72.0f : 16.0f);
-        float textY = static_cast<float>(fullBox.y) + style.titleBarHeight * 0.70f;
-        nisaba::Paint textPaint(nisaba::Color::from_rgba_unchecked(
-            style.titleTextColor.r, style.titleTextColor.g, style.titleTextColor.b, style.titleTextColor.a
-        ));
-        canvas->draw_text(textX, textY, title, textPaint, style.titleFontSize, "sans");
-    }
-
-    // 6. Window control buttons (macOS / Modern Linux style)
+    // 6. Window control buttons & Title text
     if (style.showButtons) {
-        float btnY = static_cast<float>(fullBox.y) + style.titleBarHeight * 0.5f;
-        float btnRadius = 5.5f;
-        float startBtnX = static_cast<float>(fullBox.x) + 16.0f;
+        int btnSize = 11;
+        int btnY = fullBox.y + static_cast<int>((style.titleBarHeight - static_cast<float>(btnSize)) * 0.5f);
+        int startBtnX = fullBox.x + 11;
+        m_currentPass->renderRoundedRect(
+            RectI{startBtnX, btnY, btnSize, btnSize},
+            style.closeButtonColor, 5.5f, 2.0f, m_currentDamage);
+        m_currentPass->renderRoundedRect(
+            RectI{startBtnX + 16, btnY, btnSize, btnSize},
+            style.minButtonColor, 5.5f, 2.0f, m_currentDamage);
+        m_currentPass->renderRoundedRect(
+            RectI{startBtnX + 32, btnY, btnSize, btnSize},
+            style.maxButtonColor, 5.5f, 2.0f, m_currentDamage);
+    }
 
-        // Close button
-        canvas->fill_circle(startBtnX, btnY, btnRadius,
-            nisaba::Paint(nisaba::Color::from_rgba_unchecked(
-                style.closeButtonColor.r, style.closeButtonColor.g, style.closeButtonColor.b, style.closeButtonColor.a)));
-
-        // Minimize button
-        canvas->fill_circle(startBtnX + 16.0f, btnY, btnRadius,
-            nisaba::Paint(nisaba::Color::from_rgba_unchecked(
-                style.minButtonColor.r, style.minButtonColor.g, style.minButtonColor.b, style.minButtonColor.a)));
-
-        // Maximize button
-        canvas->fill_circle(startBtnX + 32.0f, btnY, btnRadius,
-            nisaba::Paint(nisaba::Color::from_rgba_unchecked(
-                style.maxButtonColor.r, style.maxButtonColor.g, style.maxButtonColor.b, style.maxButtonColor.a)));
+    if (!title.empty()) {
+        GlStateGuard guard;
+        auto* canvas = vg();
+        if (canvas) {
+            float textX = static_cast<float>(fullBox.x) + (style.showButtons ? 72.0f : 16.0f);
+            float textY = static_cast<float>(fullBox.y) + style.titleBarHeight * 0.70f;
+            nisaba::Paint textPaint(nisaba::Color::from_rgba_unchecked(
+                style.titleTextColor.r, style.titleTextColor.g, style.titleTextColor.b, style.titleTextColor.a
+            ));
+            canvas->draw_text(textX, textY, title, textPaint, style.titleFontSize, "sans");
+        }
     }
 }
 

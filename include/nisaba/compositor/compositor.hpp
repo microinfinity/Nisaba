@@ -3,10 +3,13 @@
 /// @file compositor.hpp
 /// @brief Master umbrella header for Nisaba Sovereign Wayland Compositor subsystem.
 
+#include "nisaba/compositor/blur_provider.hpp"
 #include "nisaba/compositor/buffer.hpp"
 #include "nisaba/compositor/color.hpp"
+#include "nisaba/compositor/color_management.hpp"
 #include "nisaba/compositor/compositor_canvas.hpp"
 #include "nisaba/compositor/damage_ring.hpp"
+#include "nisaba/compositor/deformable_mesh.hpp"
 #include "nisaba/compositor/dmabuf_texture.hpp"
 #include "nisaba/compositor/drm_formats.hpp"
 #include "nisaba/compositor/dual_kawase.hpp"
@@ -20,6 +23,7 @@
 #include "nisaba/compositor/geometry.hpp"
 #include "nisaba/compositor/log.hpp"
 #include "nisaba/compositor/matrix3.hpp"
+#include "nisaba/compositor/pass_element.hpp"
 #include "nisaba/compositor/render_pass.hpp"
 #include "nisaba/compositor/render_target.hpp"
 #include "nisaba/compositor/renderer.hpp"
@@ -29,6 +33,10 @@
 #include "nisaba/compositor/shader.hpp"
 #include "nisaba/compositor/shm_texture.hpp"
 #include "nisaba/compositor/solid_texture.hpp"
+#include "nisaba/compositor/surface_uv_solver.hpp"
 #include "nisaba/compositor/swapchain.hpp"
+#include "nisaba/compositor/sync_fence.hpp"
 #include "nisaba/compositor/texture.hpp"
 #include "nisaba/compositor/texture_interface.hpp"
+#include "nisaba/compositor/window_decoration.hpp"
+#include "nisaba/compositor/window_transformer.hpp"

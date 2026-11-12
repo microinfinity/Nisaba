@@ -1,10 +1,38 @@
 #include "nisaba/compositor/render_target.hpp"
+#include "nisaba/compositor/drm_formats.hpp"
 #include "nisaba/compositor/log.hpp"
 
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <cstring>
 
 namespace nisaba::compositor {
+
+namespace {
+
+#ifndef GL_RGBA16F_EXT
+#define GL_RGBA16F_EXT 0x881A
+#endif
+
+#ifndef GL_HALF_FLOAT_OES
+#define GL_HALF_FLOAT_OES 0x8D61
+#endif
+
+#ifndef GL_HALF_FLOAT
+#define GL_HALF_FLOAT 0x140B
+#endif
+
+#ifndef GL_COLOR_ATTACHMENT1_EXT
+#define GL_COLOR_ATTACHMENT1_EXT 0x8CE1
+#endif
+
+bool glExtensionSupported(const char* ext) noexcept {
+    const char* exts = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+    if (!exts || !ext) return false;
+    return std::strstr(exts, ext) != nullptr;
+}
+
+} // namespace
 
 std::shared_ptr<RenderTarget> RenderTarget::createDefault(int width, int height) {
     return std::make_shared<RenderTarget>(width, height, 0, 0, false);
@@ -35,7 +63,67 @@ std::shared_ptr<RenderTarget> RenderTarget::fromTexture(std::shared_ptr<Texture>
         return nullptr;
     }
 
-    return std::make_shared<RenderTarget>(texture->width(), texture->height(), fbo, 0, true);
+    bool fp16 = drmFormatIsFp16(texture->format());
+    return std::make_shared<RenderTarget>(
+        static_cast<int>(texture->width()),
+        static_cast<int>(texture->height()),
+        fbo,
+        0,
+        true,
+        nullptr,
+        nullptr,
+        std::move(texture),
+        fp16);
+}
+
+std::shared_ptr<RenderTarget> RenderTarget::createOffscreen(int width, int height, bool preferFp16) {
+    if (width <= 0 || height <= 0) return nullptr;
+
+    GLuint texId = 0;
+    glGenTextures(1, &texId);
+    if (!texId) return nullptr;
+
+    glBindTexture(GL_TEXTURE_2D, texId);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    bool usedFp16 = false;
+    uint32_t drmFmt = DRM_FORMAT_ABGR8888;
+
+    if (preferFp16 && (glExtensionSupported("GL_EXT_color_buffer_half_float") ||
+                       glExtensionSupported("GL_EXT_color_buffer_float"))) {
+        while (glGetError() != GL_NO_ERROR) {}
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F_EXT, width, height, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+        if (glGetError() != GL_NO_ERROR) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_HALF_FLOAT_OES, nullptr);
+        }
+        if (glGetError() == GL_NO_ERROR) {
+            usedFp16 = true;
+            drmFmt = DRM_FORMAT_ABGR16161616F;
+        }
+    }
+
+    if (!usedFp16) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    auto tex = std::make_shared<Texture>(
+        texId,
+        GL_TEXTURE_2D,
+        static_cast<uint32_t>(width),
+        static_cast<uint32_t>(height),
+        drmFmt,
+        true);
+
+    auto rt = fromTexture(std::move(tex));
+    if (!rt && preferFp16 && usedFp16) {
+        // Fallback to 8-bit if driver rejected FP16 attachment
+        return createOffscreen(width, height, false);
+    }
+    return rt;
 }
 
 std::shared_ptr<RenderTarget> RenderTarget::fromGbmBuffer(
@@ -118,14 +206,18 @@ RenderTarget::RenderTarget(
     GLuint rbo,
     bool ownsResources,
     std::shared_ptr<EglImage> image,
-    std::shared_ptr<GbmBuffer> buffer)
+    std::shared_ptr<GbmBuffer> buffer,
+    std::shared_ptr<Texture> texture,
+    bool isFp16)
     : m_width(width),
       m_height(height),
       m_fbo(fbo),
       m_rbo(rbo),
       m_ownsResources(ownsResources),
+      m_isFp16(isFp16),
       m_image(std::move(image)),
-      m_buffer(std::move(buffer)) {}
+      m_buffer(std::move(buffer)),
+      m_texture(std::move(texture)) {}
 
 RenderTarget::~RenderTarget() {
     if (m_ownsResources) {
@@ -138,6 +230,63 @@ RenderTarget::~RenderTarget() {
             m_rbo = 0;
         }
     }
+}
+
+bool RenderTarget::attachMirrorTexture(std::shared_ptr<Texture> mirrorTex) {
+    if (!m_fbo || !mirrorTex || !mirrorTex->id()) return false;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
+    glFramebufferTexture2D(
+        GL_FRAMEBUFFER,
+        GL_COLOR_ATTACHMENT1_EXT,
+        GL_TEXTURE_2D,
+        mirrorTex->id(),
+        0);
+
+    typedef void (*PFNGLDRAWBUFFERSEXTPROC)(GLsizei n, const GLenum* bufs);
+    auto drawBuffers = reinterpret_cast<PFNGLDRAWBUFFERSEXTPROC>(
+        eglGetProcAddress("glDrawBuffersEXT"));
+    if (!drawBuffers) {
+        drawBuffers = reinterpret_cast<PFNGLDRAWBUFFERSEXTPROC>(
+            eglGetProcAddress("glDrawBuffers"));
+    }
+
+    if (drawBuffers) {
+        const GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1_EXT};
+        drawBuffers(2, bufs);
+    }
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        detachMirrorTexture();
+        return false;
+    }
+
+    m_mirrorTexture = std::move(mirrorTex);
+    return true;
+}
+
+void RenderTarget::detachMirrorTexture() noexcept {
+    if (m_fbo && m_mirrorTexture) {
+        glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1_EXT, GL_TEXTURE_2D, 0, 0);
+
+        typedef void (*PFNGLDRAWBUFFERSEXTPROC)(GLsizei n, const GLenum* bufs);
+        auto drawBuffers = reinterpret_cast<PFNGLDRAWBUFFERSEXTPROC>(
+            eglGetProcAddress("glDrawBuffersEXT"));
+        if (!drawBuffers) {
+            drawBuffers = reinterpret_cast<PFNGLDRAWBUFFERSEXTPROC>(
+                eglGetProcAddress("glDrawBuffers"));
+        }
+        if (drawBuffers) {
+            const GLenum bufs[1] = {GL_COLOR_ATTACHMENT0};
+            drawBuffers(1, bufs);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+    m_mirrorTexture.reset();
 }
 
 void RenderTarget::bind() const noexcept {

@@ -12,6 +12,24 @@
 namespace nisaba::compositor {
 
 /**
+ * @brief Output presentation synchronization mode (VSync vs wp_tearing_control_v1 Immediate).
+ */
+enum class PresentationMode : uint8_t {
+    VSync = 0,            ///< Tear-free vertical blanking synchronized pageflip
+    ImmediateTearing = 1  ///< Asynchronous pageflip (DRM_MODE_PAGE_FLIP_ASYNC) for ultra-low latency
+};
+
+/**
+ * @brief Output presentation state for KMS commit coordination (VRR, tearing, direct scanout).
+ */
+struct OutputPresentationConfig {
+    PresentationMode presentationMode{PresentationMode::VSync};
+    bool vrrActive{false};
+    bool allowDirectScanout{true};
+    bool directScanoutActive{false};
+};
+
+/**
  * @brief Sovereign hardware output swapchain managing multi-buffer DRM KMS scanout pools.
  */
 class Swapchain {
@@ -59,6 +77,11 @@ public:
     [[nodiscard]] uint32_t format() const noexcept { return m_format; }
     [[nodiscard]] size_t capacity() const noexcept { return m_capacity; }
 
+    [[nodiscard]] OutputPresentationConfig& presentationConfig() noexcept { return m_presentation; }
+    [[nodiscard]] const OutputPresentationConfig& presentationConfig() const noexcept { return m_presentation; }
+    void setPresentationMode(PresentationMode mode) noexcept { m_presentation.presentationMode = mode; }
+    void setVrrActive(bool vrr) noexcept { m_presentation.vrrActive = vrr; }
+
 private:
     struct Slot {
         std::shared_ptr<GbmBuffer> buffer;
@@ -73,6 +96,7 @@ private:
     uint32_t m_format{DRM_FORMAT_XRGB8888};
     size_t m_capacity{kDefaultCapacity};
     std::vector<Slot> m_slots;
+    OutputPresentationConfig m_presentation{};
 };
 
 } // namespace nisaba::compositor

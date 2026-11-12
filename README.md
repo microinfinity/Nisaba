@@ -684,5 +684,5 @@ High-performance composite of a Full HD 1080p desktop session running at ultra-h
 ---
 ## License & Sovereignty
 
-The **Nisaba** engine is developed exclusively for the **`vaxp`** organization. Engineered to adhere to the highest standards of architectural purity, speed, and reliability, providing an uncompromising sovereign foundation for modern software engineering, robotics, and embedded systems.
+The **Nisaba** engine is developed exclusively for the **`MICRO INFINITY`** organization. Engineered to adhere to the highest standards of architectural purity, speed, and reliability, providing an uncompromising sovereign foundation for modern software engineering, robotics, and embedded systems.
 

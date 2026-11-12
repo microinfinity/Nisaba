@@ -35,6 +35,11 @@ public:
 
     static std::shared_ptr<RenderTarget> fromTexture(std::shared_ptr<Texture> texture);
 
+    /**
+     * @brief Allocates a self-contained offscreen FBO backed by a GPU Texture (8-bit RGBA or 16-bit FP16).
+     */
+    static std::shared_ptr<RenderTarget> createOffscreen(int width, int height, bool preferFp16 = false);
+
     static std::shared_ptr<RenderTarget> fromGbmBuffer(
         std::shared_ptr<EglContext> context,
         std::shared_ptr<GbmBuffer> buffer);
@@ -46,7 +51,9 @@ public:
         GLuint rbo = 0,
         bool ownsResources = true,
         std::shared_ptr<EglImage> image = nullptr,
-        std::shared_ptr<GbmBuffer> buffer = nullptr);
+        std::shared_ptr<GbmBuffer> buffer = nullptr,
+        std::shared_ptr<Texture> texture = nullptr,
+        bool isFp16 = false);
 
     ~RenderTarget() override;
 
@@ -61,9 +68,18 @@ public:
     }
     [[nodiscard]] GLuint fbo() const noexcept { return m_fbo; }
     [[nodiscard]] GLuint rbo() const noexcept { return m_rbo; }
+    [[nodiscard]] bool isFp16() const noexcept { return m_isFp16; }
 
     [[nodiscard]] const std::shared_ptr<GbmBuffer>& buffer() const noexcept { return m_buffer; }
     [[nodiscard]] const std::shared_ptr<EglImage>& image() const noexcept { return m_image; }
+    [[nodiscard]] const std::shared_ptr<Texture>& texture() const noexcept { return m_texture; }
+    [[nodiscard]] const std::shared_ptr<Texture>& mirrorTexture() const noexcept { return m_mirrorTexture; }
+
+    /**
+     * @brief Attaches a secondary texture to COLOR_ATTACHMENT1 for single-pass display mirroring (MRT).
+     */
+    bool attachMirrorTexture(std::shared_ptr<Texture> mirrorTex);
+    void detachMirrorTexture() noexcept;
 
     void bind() const noexcept override;
     static void unbind() noexcept;
@@ -74,8 +90,11 @@ private:
     GLuint m_fbo{0};
     GLuint m_rbo{0};
     bool m_ownsResources{true};
+    bool m_isFp16{false};
     std::shared_ptr<EglImage> m_image;
     std::shared_ptr<GbmBuffer> m_buffer;
+    std::shared_ptr<Texture> m_texture;
+    std::shared_ptr<Texture> m_mirrorTexture;
 };
 
 } // namespace nisaba::compositor

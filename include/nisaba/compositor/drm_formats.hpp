@@ -118,4 +118,70 @@ inline std::string fourccToString(uint32_t format) {
     return DrmFormatSet::formatToString(format);
 }
 
+#ifndef DRM_FORMAT_XRGB16161616F
+#define DRM_FORMAT_XRGB16161616F fourcc_code('X', 'R', '4', 'H')
+#endif
+#ifndef DRM_FORMAT_ARGB16161616F
+#define DRM_FORMAT_ARGB16161616F fourcc_code('A', 'R', '4', 'H')
+#endif
+#ifndef DRM_FORMAT_XBGR16161616F
+#define DRM_FORMAT_XBGR16161616F fourcc_code('X', 'B', '4', 'H')
+#endif
+#ifndef DRM_FORMAT_ABGR16161616F
+#define DRM_FORMAT_ABGR16161616F fourcc_code('A', 'B', '4', 'H')
+#endif
+
+/**
+ * @brief Checks whether a DRM FourCC format carries an active alpha channel.
+ */
+[[nodiscard]] constexpr bool drmFormatHasAlpha(uint32_t format) noexcept {
+    switch (format) {
+        case DRM_FORMAT_ARGB8888:
+        case DRM_FORMAT_ABGR8888:
+        case DRM_FORMAT_RGBA8888:
+        case DRM_FORMAT_BGRA8888:
+        case DRM_FORMAT_ARGB2101010:
+        case DRM_FORMAT_ABGR2101010:
+        case DRM_FORMAT_RGBA1010102:
+        case DRM_FORMAT_BGRA1010102:
+        case DRM_FORMAT_ARGB16161616F:
+        case DRM_FORMAT_ABGR16161616F:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
+ * @brief Checks whether a DRM FourCC format uses 16-bit floating-point channels (FP16).
+ */
+[[nodiscard]] constexpr bool drmFormatIsFp16(uint32_t format) noexcept {
+    switch (format) {
+        case DRM_FORMAT_XRGB16161616F:
+        case DRM_FORMAT_ARGB16161616F:
+        case DRM_FORMAT_XBGR16161616F:
+        case DRM_FORMAT_ABGR16161616F:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
+ * @brief Checks whether a DRM FourCC format uses 10-bit color channels.
+ */
+[[nodiscard]] constexpr bool drmFormatIs10Bit(uint32_t format) noexcept {
+    switch (format) {
+        case DRM_FORMAT_XRGB2101010:
+        case DRM_FORMAT_ARGB2101010:
+        case DRM_FORMAT_XBGR2101010:
+        case DRM_FORMAT_ABGR2101010:
+        case DRM_FORMAT_RGBA1010102:
+        case DRM_FORMAT_BGRA1010102:
+            return true;
+        default:
+            return false;
+    }
+}
+
 } // namespace nisaba::compositor

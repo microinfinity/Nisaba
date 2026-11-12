@@ -1,5 +1,6 @@
 #pragma once
 
+#include "nisaba/compositor/blur_provider.hpp"
 #include "nisaba/compositor/dual_kawase.hpp"
 #include "nisaba/compositor/egl_context.hpp"
 #include "nisaba/compositor/gbm_allocator.hpp"
@@ -7,6 +8,7 @@
 #include "nisaba/compositor/render_target.hpp"
 #include "nisaba/compositor/renderer_interface.hpp"
 #include "nisaba/compositor/shader.hpp"
+#include "nisaba/compositor/sync_fence.hpp"
 
 #include <memory>
 #include <string_view>
@@ -15,7 +17,8 @@ namespace nisaba::compositor {
 
 /**
  * @brief Sovereign GPU-accelerated graphics rendering engine for Compositor.
- * Handles hardware EGL context, shaders, render passes, Dual Kawase blur, and DMA-BUF import.
+ * Handles hardware EGL context, shaders, render passes, Dual Kawase / Pluggable Blur Materials,
+ * Explicit Sync fences, and DMA-BUF import.
  */
 class Renderer : public IRenderer {
 public:
@@ -40,6 +43,22 @@ public:
     [[nodiscard]] const std::shared_ptr<ShaderManager>& shaders() const noexcept { return m_shaders; }
     [[nodiscard]] const std::shared_ptr<DualKawaseBlur>& blur() const noexcept { return m_blur; }
 
+    /**
+     * @brief Selects the active pluggable blur material provider (Kawase, Acrylic, OpticalGlass, etc.).
+     */
+    bool setBlurMaterial(BlurMaterialType type);
+    [[nodiscard]] const std::shared_ptr<IBlurProvider>& blurProvider() const noexcept { return m_blurProvider; }
+
+    /**
+     * @brief Checks whether hardware explicit sync (EGL_ANDROID_native_fence_sync) is supported.
+     */
+    [[nodiscard]] bool explicitSyncSupported() const noexcept;
+
+    /**
+     * @brief Exports a GPU completion fence for the current frame.
+     */
+    [[nodiscard]] std::unique_ptr<SyncFence> exportFrameFence() const;
+
     [[nodiscard]] std::unique_ptr<RenderPass> beginPass(
         std::shared_ptr<RenderTarget> target,
         wl_output_transform outputTransform = WL_OUTPUT_TRANSFORM_FLIPPED_180);
@@ -54,6 +73,7 @@ private:
     std::shared_ptr<EglContext> m_egl;
     std::shared_ptr<ShaderManager> m_shaders;
     std::shared_ptr<DualKawaseBlur> m_blur;
+    std::shared_ptr<IBlurProvider> m_blurProvider;
 };
 
 /**
