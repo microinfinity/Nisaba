@@ -1,6 +1,7 @@
 #include "nisaba/compositor/render_pass.hpp"
 #include "nisaba/compositor/log.hpp"
 
+#include <cstddef>
 #include <vector>
 
 namespace nisaba::compositor {
@@ -55,16 +56,7 @@ PassExecutionStats RenderPass::optimizeAndExecute(const Region& initialDamage) {
         return stats;
     }
 
-    // 1. Identify any active live-blur regions so underlying backdrops are not prematurely occluded
-    for (const auto& entry : m_queue) {
-        if (entry.element && entry.element->needsLiveBlur()) {
-            if (auto bb = entry.element->boundingBox()) {
-                stats.liveBlurRegion.add(*bb);
-            }
-        }
-    }
-
-    // 2. Front-to-Back (reverse) Occlusion Culling pass
+    // 1. Front-to-Back (reverse) Occlusion Culling pass
     Region remainingDamage = initialDamage;
     for (size_t i = m_queue.size(); i-- > 0;) {
         auto& entry = m_queue[i];
@@ -73,7 +65,8 @@ PassExecutionStats RenderPass::optimizeAndExecute(const Region& initialDamage) {
             continue;
         }
 
-        if (remainingDamage.isEmpty() && !entry.element->undiscardable()) {
+        const bool undiscardable = entry.element->undiscardable();
+        if (remainingDamage.isEmpty() && !undiscardable) {
             entry.discarded = true;
             stats.culledElements++;
             continue;
@@ -81,35 +74,40 @@ PassExecutionStats RenderPass::optimizeAndExecute(const Region& initialDamage) {
 
         const auto bbOpt = entry.element->boundingBox();
         if (bbOpt.has_value()) {
-            if (bbOpt->isEmpty()) {
+            if (bbOpt->isEmpty() || (!undiscardable && !remainingDamage.intersects(*bbOpt))) {
                 entry.discarded = true;
                 stats.culledElements++;
                 continue;
             }
-            Region visible = remainingDamage;
-            visible.intersect(Region(*bbOpt));
-            if (visible.isEmpty() && !entry.element->undiscardable()) {
+            entry.visibleDamage = remainingDamage;
+            entry.visibleDamage.intersect(*bbOpt);
+            if (entry.visibleDamage.isEmpty() && !undiscardable) {
                 entry.discarded = true;
                 stats.culledElements++;
                 continue;
             }
-            entry.visibleDamage = std::move(visible);
         } else {
             entry.visibleDamage = remainingDamage;
         }
 
+        if (entry.element->needsLiveBlur() && !entry.visibleDamage.isEmpty()) {
+            stats.liveBlurRegion.unite(entry.visibleDamage);
+        }
+
         Region opaque = entry.element->opaqueRegion();
-        if (!opaque.isEmpty()) {
-            if (!stats.liveBlurRegion.isEmpty()) {
+        if (!opaque.isEmpty() && remainingDamage.intersects(opaque.extents())) {
+            if (!stats.liveBlurRegion.isEmpty() && opaque.intersects(stats.liveBlurRegion)) {
                 opaque.subtract(stats.liveBlurRegion);
             }
-            remainingDamage.subtract(opaque);
+            if (!opaque.isEmpty()) {
+                remainingDamage.subtract(opaque);
+            }
         }
     }
 
     stats.remainingUnoccludedDamage = remainingDamage;
 
-    // 3. Back-to-Front execution of non-occluded elements
+    // 2. Back-to-Front execution of non-occluded elements
     for (auto& entry : m_queue) {
         if (entry.discarded || !entry.element) continue;
         entry.element->draw(*this, entry.visibleDamage);
@@ -498,6 +496,13 @@ void RenderPass::renderMesh(
 
     const GLint posLoc = shader.posAttrib();
     const GLint uvLoc = shader.uvAttrib();
+    const GLsizeiptr byteSize = static_cast<GLsizeiptr>(vertices.size() * sizeof(MeshVertex));
+    const GLuint vbo = m_shaders ? m_shaders->bindMeshStreamingVbo(vertices.data(), byteSize) : 0;
+    const void* posPtr = vbo ? reinterpret_cast<const void*>(offsetof(MeshVertex, x))
+                             : static_cast<const void*>(&vertices[0].x);
+    const void* uvPtr  = vbo ? reinterpret_cast<const void*>(offsetof(MeshVertex, u))
+                             : static_cast<const void*>(&vertices[0].u);
+
     if (posLoc >= 0) {
         glEnableVertexAttribArray(static_cast<GLuint>(posLoc));
         glVertexAttribPointer(
@@ -506,7 +511,7 @@ void RenderPass::renderMesh(
             GL_FLOAT,
             GL_FALSE,
             sizeof(MeshVertex),
-            &vertices[0].x);
+            posPtr);
     }
     if (uvLoc >= 0) {
         glEnableVertexAttribArray(static_cast<GLuint>(uvLoc));
@@ -516,13 +521,14 @@ void RenderPass::renderMesh(
             GL_FLOAT,
             GL_FALSE,
             sizeof(MeshVertex),
-            &vertices[0].u);
+            uvPtr);
     }
 
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size()));
 
     if (uvLoc >= 0) glDisableVertexAttribArray(static_cast<GLuint>(uvLoc));
     if (posLoc >= 0) glDisableVertexAttribArray(static_cast<GLuint>(posLoc));
+    if (vbo) glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindTexture(texture.target(), 0);
 }
 
@@ -552,10 +558,11 @@ void RenderPass::renderQuads(
     const RectI& box,
     const Region* clip,
     GLint posAttrib) const {
-    if (posAttrib < 0) return;
+    if (posAttrib < 0 || box.isEmpty()) return;
 
-    if (!clip) {
-        static constexpr float kUnitQuad[12] = {
+    auto drawUnit = [this, posAttrib]() {
+        const GLuint vbo = m_shaders ? m_shaders->bindUnitQuadVbo() : 0;
+        static constexpr float kFallbackUnitQuad[12] = {
             0.0f, 0.0f,
             1.0f, 0.0f,
             0.0f, 1.0f,
@@ -564,43 +571,97 @@ void RenderPass::renderQuads(
             0.0f, 1.0f,
         };
         glEnableVertexAttribArray(static_cast<GLuint>(posAttrib));
-        glVertexAttribPointer(static_cast<GLuint>(posAttrib), 2, GL_FLOAT, GL_FALSE, 0, kUnitQuad);
+        glVertexAttribPointer(
+            static_cast<GLuint>(posAttrib),
+            2,
+            GL_FLOAT,
+            GL_FALSE,
+            0,
+            vbo ? nullptr : static_cast<const void*>(kFallbackUnitQuad));
         glDrawArrays(GL_TRIANGLES, 0, 6);
         glDisableVertexAttribArray(static_cast<GLuint>(posAttrib));
+        if (vbo) glBindBuffer(GL_ARRAY_BUFFER, 0);
+    };
+
+    if (!clip) {
+        drawUnit();
         return;
     }
 
-    Region boxRegion(box);
-    boxRegion.intersect(*clip);
-    auto rects = boxRegion.rects();
-    if (rects.empty()) return;
-
-    std::vector<float> verts;
-    verts.reserve(rects.size() * 12);
-    const float invW = 1.0f / static_cast<float>(box.width);
-    const float invH = 1.0f / static_cast<float>(box.height);
-
-    for (const auto& r : rects) {
-        float x1 = static_cast<float>(r.x - box.x) * invW;
-        float y1 = static_cast<float>(r.y - box.y) * invH;
-        float x2 = static_cast<float>(r.x + r.width - box.x) * invW;
-        float y2 = static_cast<float>(r.y + r.height - box.y) * invH;
-
-        // Triangle 1
-        verts.push_back(x1); verts.push_back(y1);
-        verts.push_back(x2); verts.push_back(y1);
-        verts.push_back(x1); verts.push_back(y2);
-
-        // Triangle 2
-        verts.push_back(x2); verts.push_back(y1);
-        verts.push_back(x2); verts.push_back(y2);
-        verts.push_back(x1); verts.push_back(y2);
+    if (clip->isEmpty() || !clip->intersects(box)) {
+        return;
     }
 
+    const float invW = 1.0f / static_cast<float>(box.width);
+    const float invH = 1.0f / static_cast<float>(box.height);
+    const auto& clipRects = clip->rects();
+
+    if (clipRects.size() == 1) {
+        const RectI r = box.intersection(clipRects[0]);
+        if (r.isEmpty()) return;
+        if (r == box) {
+            drawUnit();
+            return;
+        }
+        const float x1 = static_cast<float>(r.x - box.x) * invW;
+        const float y1 = static_cast<float>(r.y - box.y) * invH;
+        const float x2 = static_cast<float>(r.x + r.width - box.x) * invW;
+        const float y2 = static_cast<float>(r.y + r.height - box.y) * invH;
+        const float verts[12] = {
+            x1, y1,  x2, y1,  x1, y2,
+            x2, y1,  x2, y2,  x1, y2,
+        };
+        const GLuint vbo = m_shaders ? m_shaders->bindQuadStreamingVbo(verts, sizeof(verts)) : 0;
+        glEnableVertexAttribArray(static_cast<GLuint>(posAttrib));
+        glVertexAttribPointer(
+            static_cast<GLuint>(posAttrib),
+            2,
+            GL_FLOAT,
+            GL_FALSE,
+            0,
+            vbo ? nullptr : static_cast<const void*>(verts));
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glDisableVertexAttribArray(static_cast<GLuint>(posAttrib));
+        if (vbo) glBindBuffer(GL_ARRAY_BUFFER, 0);
+        return;
+    }
+
+    m_quadScratch.clear();
+    m_quadScratch.reserve(clipRects.size() * 12);
+    for (const auto& c : clipRects) {
+        if (!c.intersects(box)) continue;
+        const RectI r = box.intersection(c);
+        const float x1 = static_cast<float>(r.x - box.x) * invW;
+        const float y1 = static_cast<float>(r.y - box.y) * invH;
+        const float x2 = static_cast<float>(r.x + r.width - box.x) * invW;
+        const float y2 = static_cast<float>(r.y + r.height - box.y) * invH;
+
+        m_quadScratch.push_back(x1); m_quadScratch.push_back(y1);
+        m_quadScratch.push_back(x2); m_quadScratch.push_back(y1);
+        m_quadScratch.push_back(x1); m_quadScratch.push_back(y2);
+        m_quadScratch.push_back(x2); m_quadScratch.push_back(y1);
+        m_quadScratch.push_back(x2); m_quadScratch.push_back(y2);
+        m_quadScratch.push_back(x1); m_quadScratch.push_back(y2);
+    }
+
+    if (m_quadScratch.empty()) return;
+
+    const GLuint vbo = m_shaders
+        ? m_shaders->bindQuadStreamingVbo(
+              m_quadScratch.data(),
+              static_cast<GLsizeiptr>(m_quadScratch.size() * sizeof(float)))
+        : 0;
     glEnableVertexAttribArray(static_cast<GLuint>(posAttrib));
-    glVertexAttribPointer(static_cast<GLuint>(posAttrib), 2, GL_FLOAT, GL_FALSE, 0, verts.data());
-    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(rects.size() * 6));
+    glVertexAttribPointer(
+        static_cast<GLuint>(posAttrib),
+        2,
+        GL_FLOAT,
+        GL_FALSE,
+        0,
+        vbo ? nullptr : static_cast<const void*>(m_quadScratch.data()));
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_quadScratch.size() / 2));
     glDisableVertexAttribArray(static_cast<GLuint>(posAttrib));
+    if (vbo) glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 bool RenderPass::submit() {

@@ -99,6 +99,11 @@ public:
     [[nodiscard]] int baseHeight() const noexcept { return m_baseHeight; }
     [[nodiscard]] int allocatedPasses() const noexcept { return static_cast<int>(m_pyramid.size()); }
 
+    /**
+     * @brief Draws the persistent unit quad (0,0)-(1,1) using DualKawaseBlur's static VBO.
+     */
+    void drawUnitQuad(GLint posAttrib) const noexcept;
+
 private:
     struct PyramidLevel {
         int width{0};

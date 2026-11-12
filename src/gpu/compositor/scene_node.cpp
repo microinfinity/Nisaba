@@ -164,6 +164,7 @@ void SceneBuffer::enqueueToPass(
     params.roundingPower = tfState.roundingPower;
     params.motionBlur = tfState.motionBlur;
     params.customMesh = tfState.customMesh;
+    params.opaqueRegion = m_opaqueRegion;
     params.colorTransform = ColorManagement::buildTransform(m_imageDesc, outputDesc);
 
     pass.enqueue(std::make_unique<SurfacePassElement>(std::move(params)));

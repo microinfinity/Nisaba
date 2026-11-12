@@ -168,6 +168,9 @@ public:
     void setTearingHint(bool tearing) noexcept { m_tearingHint = tearing; }
     [[nodiscard]] bool tearingHint() const noexcept { return m_tearingHint; }
 
+    void setOpaqueRegion(const Region& region) { m_opaqueRegion = region; }
+    [[nodiscard]] const Region& opaqueRegion() const noexcept { return m_opaqueRegion; }
+
     [[nodiscard]] TransformerChain& transformers() noexcept { return m_transformers; }
     [[nodiscard]] const TransformerChain& transformers() const noexcept { return m_transformers; }
 
@@ -205,6 +208,7 @@ private:
     bool m_tearingHint{false};
     TransformerChain m_transformers{};
     WindowDecorationStack m_decorations{};
+    Region m_opaqueRegion{};
     void* m_userData{nullptr};
 };
 

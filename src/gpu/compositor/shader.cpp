@@ -1,6 +1,7 @@
 #include "nisaba/compositor/shader.hpp"
 #include "nisaba/compositor/log.hpp"
 
+#include <EGL/egl.h>
 #include <algorithm>
 #include <sstream>
 #include <vector>
@@ -1297,6 +1298,78 @@ const SurfaceVariantProgram* ShaderManager::getSurfaceVariant(
     const auto* rawPtr = prog.get();
     m_variants.emplace(key, std::move(prog));
     return rawPtr;
+}
+
+ShaderManager::~ShaderManager() {
+    if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+        return;
+    }
+    if (m_meshStreamingVbo.id != 0) {
+        glDeleteBuffers(1, &m_meshStreamingVbo.id);
+        m_meshStreamingVbo.id = 0;
+    }
+    if (m_quadStreamingVbo.id != 0) {
+        glDeleteBuffers(1, &m_quadStreamingVbo.id);
+        m_quadStreamingVbo.id = 0;
+    }
+    if (m_unitQuadVbo != 0) {
+        glDeleteBuffers(1, &m_unitQuadVbo);
+        m_unitQuadVbo = 0;
+    }
+}
+
+GLuint ShaderManager::uploadStreamingVbo(
+    StreamingVbo& buf,
+    const void* data,
+    GLsizeiptr byteSize,
+    GLsizeiptr minCapacity) const {
+    if (!data || byteSize <= 0) {
+        return 0;
+    }
+    if (buf.id == 0) {
+        glGenBuffers(1, &buf.id);
+        if (buf.id == 0) {
+            return 0;
+        }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, buf.id);
+    if (byteSize > buf.capacity) {
+        buf.capacity = std::max(minCapacity, std::max(byteSize, buf.capacity * 2));
+    }
+    // Orphan previous backing store to avoid implicit CPU-GPU synchronization stalls
+    glBufferData(GL_ARRAY_BUFFER, buf.capacity, nullptr, GL_STREAM_DRAW);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, byteSize, data);
+    return buf.id;
+}
+
+GLuint ShaderManager::bindMeshStreamingVbo(const void* data, GLsizeiptr byteSize) const {
+    return uploadStreamingVbo(m_meshStreamingVbo, data, byteSize, 16384);
+}
+
+GLuint ShaderManager::bindQuadStreamingVbo(const void* data, GLsizeiptr byteSize) const {
+    return uploadStreamingVbo(m_quadStreamingVbo, data, byteSize, 4096);
+}
+
+GLuint ShaderManager::bindUnitQuadVbo() const {
+    if (m_unitQuadVbo == 0) {
+        static constexpr float kUnitQuad[12] = {
+            0.0f, 0.0f,
+            1.0f, 0.0f,
+            0.0f, 1.0f,
+            1.0f, 0.0f,
+            1.0f, 1.0f,
+            0.0f, 1.0f,
+        };
+        glGenBuffers(1, &m_unitQuadVbo);
+        if (m_unitQuadVbo == 0) {
+            return 0;
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, m_unitQuadVbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(kUnitQuad), kUnitQuad, GL_STATIC_DRAW);
+        return m_unitQuadVbo;
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, m_unitQuadVbo);
+    return m_unitQuadVbo;
 }
 
 } // namespace nisaba::compositor

@@ -96,14 +96,46 @@ std::optional<RectI> SurfacePassElement::boundingBox() const noexcept {
 
 Region SurfacePassElement::opaqueRegion() const noexcept {
     if (!m_params.texture ||
-        m_params.texture->hasAlpha() ||
+        m_params.requiresLiveBlur ||
         m_params.alpha < 0.999f ||
         m_params.alphaMatte != nullptr ||
         m_params.customMesh != nullptr ||
-        m_params.motionBlur.active) {
+        m_params.motionBlur.active ||
+        m_params.destBox.isEmpty()) {
         return Region{};
     }
-    return computeRoundedBoxOpaqueRegion(m_params.destBox, m_params.cornerRadius);
+
+    Region boxOpaque = computeRoundedBoxOpaqueRegion(m_params.destBox, m_params.cornerRadius);
+    if (boxOpaque.isEmpty()) {
+        return Region{};
+    }
+    if (!m_params.texture->hasAlpha()) {
+        return boxOpaque;
+    }
+    if (m_params.opaqueRegion.isEmpty()) {
+        return Region{};
+    }
+
+    const RectI& dest = m_params.destBox;
+    const auto& srcRects = m_params.opaqueRegion.rects();
+    if (srcRects.size() == 1) {
+        const RectI& s = srcRects[0];
+        if (s.x <= 0 && s.y <= 0 && s.x + s.width >= dest.width && s.y + s.height >= dest.height) {
+            return boxOpaque;
+        }
+    }
+
+    Region screenOpaque;
+    for (const auto& s : srcRects) {
+        const RectI clipped = RectI{dest.x + s.x, dest.y + s.y, s.width, s.height}.intersection(dest);
+        if (!clipped.isEmpty()) {
+            screenOpaque.add(clipped);
+        }
+    }
+    if (m_params.cornerRadius > 0.5f) {
+        screenOpaque.intersect(boxOpaque);
+    }
+    return screenOpaque;
 }
 
 void SurfacePassElement::draw(RenderPass& pass, const Region& visibleDamage) {

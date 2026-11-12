@@ -261,22 +261,6 @@ void main() {
 }
 )glsl";
 
-void drawUnitQuad(GLint posAttrib) {
-    if (posAttrib < 0) return;
-    static constexpr float kQuad[12] = {
-        0.0f, 0.0f,
-        1.0f, 0.0f,
-        0.0f, 1.0f,
-        1.0f, 0.0f,
-        1.0f, 1.0f,
-        0.0f, 1.0f
-    };
-    glEnableVertexAttribArray(static_cast<GLuint>(posAttrib));
-    glVertexAttribPointer(static_cast<GLuint>(posAttrib), 2, GL_FLOAT, GL_FALSE, 0, kQuad);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
-    glDisableVertexAttribArray(static_cast<GLuint>(posAttrib));
-}
-
 RectF computeNormalizedUvRect(const Texture& source, const RectI& srcRect, const RectI& destRect) {
     const float texW = static_cast<float>(std::max(source.width(), 1u));
     const float texH = static_cast<float>(std::max(source.height(), 1u));
@@ -390,7 +374,7 @@ bool AcrylicBlurProvider::renderMaterial(
         static_cast<float>(destRect.height));
     glUniform1f(m_program->getUniformLocation("u_power"), ctx.roundingPower);
 
-    drawUnitQuad(m_program->getAttribLocation("pos"));
+    kawase.drawUnitQuad(m_program->getAttribLocation("pos"));
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
@@ -453,7 +437,7 @@ bool OpticalGlassProvider::renderMaterial(
         static_cast<float>(destRect.height));
     glUniform1f(m_program->getUniformLocation("u_power"), ctx.roundingPower);
 
-    drawUnitQuad(m_program->getAttribLocation("pos"));
+    kawase.drawUnitQuad(m_program->getAttribLocation("pos"));
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
@@ -517,7 +501,7 @@ bool WaterRippleProvider::renderMaterial(
     glUniform1f(m_program->getUniformLocation("u_radius"), ctx.cornerRadius);
     glUniform1f(m_program->getUniformLocation("u_power"), ctx.roundingPower);
 
-    drawUnitQuad(m_program->getAttribLocation("pos"));
+    kawase.drawUnitQuad(m_program->getAttribLocation("pos"));
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
@@ -581,7 +565,7 @@ bool FluidFieldProvider::renderMaterial(
     glUniform1f(m_program->getUniformLocation("u_radius"), ctx.cornerRadius);
     glUniform1f(m_program->getUniformLocation("u_power"), ctx.roundingPower);
 
-    drawUnitQuad(m_program->getAttribLocation("pos"));
+    kawase.drawUnitQuad(m_program->getAttribLocation("pos"));
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
@@ -643,7 +627,7 @@ bool AtmosphericBlurProvider::renderMaterial(
         static_cast<float>(destRect.width),
         static_cast<float>(destRect.height));
 
-    drawUnitQuad(m_program->getAttribLocation("pos"));
+    kawase.drawUnitQuad(m_program->getAttribLocation("pos"));
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }

@@ -53,6 +53,9 @@ struct SurfaceRenderParams {
     ColorTransformParams colorTransform{};
     const Lut3DTexture* lut3D{nullptr};
 
+    // Optional surface-local opaque region override (used even on ARGB textures)
+    Region opaqueRegion{};
+
     // Deformable mesh override (e.g. wobbly window)
     const std::vector<MeshVertex>* customMesh{nullptr};
 };

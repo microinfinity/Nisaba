@@ -349,7 +349,7 @@ public:
         std::unique_ptr<InnerGlowProgram> innerGlow,
         std::unique_ptr<DeformableMeshProgram> mesh);
 
-    ~ShaderManager() = default;
+    ~ShaderManager();
 
     [[nodiscard]] const SolidQuadProgram& solidQuad() const noexcept { return *m_solidQuad; }
     [[nodiscard]] const TextureQuadProgram& textureRgba() const noexcept { return *m_textureRgba; }
@@ -371,7 +371,35 @@ public:
 
     [[nodiscard]] size_t cachedVariantCount() const noexcept { return m_variants.size(); }
 
+    /**
+     * @brief Uploads transient deformable-mesh vertices to a persistent GL_STREAM_DRAW VBO
+     *        (with buffer orphaning) and leaves it bound to GL_ARRAY_BUFFER.
+     */
+    [[nodiscard]] GLuint bindMeshStreamingVbo(const void* data, GLsizeiptr byteSize) const;
+
+    /**
+     * @brief Uploads clipped quad vertices to a persistent GL_STREAM_DRAW VBO
+     *        and leaves it bound to GL_ARRAY_BUFFER.
+     */
+    [[nodiscard]] GLuint bindQuadStreamingVbo(const void* data, GLsizeiptr byteSize) const;
+
+    /**
+     * @brief Lazily creates and binds a static [0,1]^2 unit quad VBO to GL_ARRAY_BUFFER.
+     */
+    [[nodiscard]] GLuint bindUnitQuadVbo() const;
+
 private:
+    struct StreamingVbo {
+        GLuint id{0};
+        GLsizeiptr capacity{0};
+    };
+
+    GLuint uploadStreamingVbo(
+        StreamingVbo& buf,
+        const void* data,
+        GLsizeiptr byteSize,
+        GLsizeiptr minCapacity) const;
+
     std::unique_ptr<SolidQuadProgram> m_solidQuad;
     std::unique_ptr<TextureQuadProgram> m_textureRgba;
     std::unique_ptr<TextureQuadProgram> m_textureRgbx;
@@ -383,6 +411,9 @@ private:
     std::unique_ptr<DeformableMeshProgram> m_mesh;
 
     std::unordered_map<uint64_t, std::unique_ptr<SurfaceVariantProgram>> m_variants;
+    mutable StreamingVbo m_meshStreamingVbo;
+    mutable StreamingVbo m_quadStreamingVbo;
+    mutable GLuint m_unitQuadVbo{0};
 };
 
 } // namespace nisaba::compositor

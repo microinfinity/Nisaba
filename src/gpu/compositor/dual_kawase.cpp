@@ -286,6 +286,24 @@ bool DualKawaseBlur::setupVbo() {
     return true;
 }
 
+void DualKawaseBlur::drawUnitQuad(GLint posAttrib) const noexcept {
+    if (posAttrib < 0 || m_vbo == 0) return;
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+    const size_t quadOffset = sizeof(kFullscreenTriangle);
+    glEnableVertexAttribArray(static_cast<GLuint>(posAttrib));
+    glVertexAttribPointer(
+        static_cast<GLuint>(posAttrib),
+        2,
+        GL_FLOAT,
+        GL_FALSE,
+        sizeof(Vertex),
+        reinterpret_cast<const void*>(quadOffset + offsetof(Vertex, x)));
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisableVertexAttribArray(static_cast<GLuint>(posAttrib));
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
 bool DualKawaseBlur::setupShaders() {
     if (m_shaders) return true;
 

@@ -257,6 +257,7 @@ private:
     std::shared_ptr<ShaderManager> m_shaders;
     Matrix3 m_projection;
     std::vector<QueuedEntry> m_queue;
+    mutable std::vector<float> m_quadScratch;
     bool m_submitted{false};
 };
 
