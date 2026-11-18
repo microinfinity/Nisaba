@@ -238,9 +238,29 @@ void ColorMatrix::transform_span(const PremultipliedColorU8* src, PremultipliedC
 void ColorMatrix::apply(PixmapMut& pixmap) const noexcept {
     uint32_t w = pixmap.width();
     uint32_t h = pixmap.height();
-    for (uint32_t y = 0; y < h; ++y) {
-        PremultipliedColorU8* row = pixmap.row(y);
-        transform_span(row, row, w);
+    if (pixmap.format() == PixelFormat::RGBA8888) {
+        for (uint32_t y = 0; y < h; ++y) {
+            PremultipliedColorU8* row = pixmap.row(y);
+            transform_span(row, row, w);
+        }
+    } else if (pixmap.format() == PixelFormat::BGRA8888) {
+        for (uint32_t y = 0; y < h; ++y) {
+            PremultipliedColorU8* row = pixmap.row(y);
+            for (uint32_t x = 0; x < w; ++x) {
+                const auto bgra = row[x];
+                auto rgba = PremultipliedColorU8::from_rgba_unchecked(bgra.b, bgra.g, bgra.r, bgra.a);
+                auto res = transform_pixel(rgba);
+                row[x] = PremultipliedColorU8::from_rgba_unchecked(res.b, res.g, res.r, res.a);
+            }
+        }
+    } else {
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                if (auto px = pixmap.pixel(x, y)) {
+                    pixmap.set_pixel(x, y, transform_pixel(*px));
+                }
+            }
+        }
     }
 }
 

@@ -16,6 +16,8 @@
 
 namespace nisaba::compositor {
 
+class RenderPass;
+
 /**
  * @brief Telemetry and culling statistics returned by deferred RenderPass execution.
  */
@@ -70,6 +72,11 @@ public:
      * @brief Native API handle escape hatch for custom shader nodes and extensions.
      */
     [[nodiscard]] virtual void* nativeHandle() noexcept = 0;
+
+    /**
+     * @brief RTTI-free downcast hook to concrete OpenGL RenderPass when supported.
+     */
+    [[nodiscard]] virtual RenderPass* asRenderPass() noexcept { return nullptr; }
 };
 
 /**
@@ -235,6 +242,10 @@ public:
 
     [[nodiscard]] void* nativeHandle() noexcept override {
         return m_target.get();
+    }
+
+    [[nodiscard]] RenderPass* asRenderPass() noexcept override {
+        return this;
     }
 
     [[nodiscard]] const std::shared_ptr<RenderTarget>& target() const noexcept { return m_target; }

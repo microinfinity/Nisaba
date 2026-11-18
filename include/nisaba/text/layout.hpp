@@ -23,6 +23,7 @@ enum class Align : uint8_t {
     Right,
     Center,
     Justified,
+    Start,
     End
 };
 
@@ -54,6 +55,11 @@ struct LayoutGlyph {
     bool is_mark{false};
     bool underline{false};
     bool strikethrough{false};
+    bool overline{false};
+    DecorationStyle decoration_style{DecorationStyle::Solid};
+    std::optional<TextColor> decoration_color_opt{std::nullopt};
+    float decoration_thickness{1.0f};
+    std::vector<TextShadow> shadows{};
     bool synthetic_bold{false};
     bool synthetic_italic{false};
 };

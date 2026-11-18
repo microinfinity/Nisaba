@@ -3,6 +3,7 @@
 #include "nisaba/pipeline/blitter.hpp"
 #include "nisaba/raster/scan.hpp"
 #include "nisaba/color/color.hpp"
+#include "nisaba/color/blend.hpp"
 #include "nisaba/math/screen_int_rect.hpp"
 #include "nisaba/pipeline/simd.hpp"
 
@@ -1749,7 +1750,7 @@ void stroke_round_rect(
 ) {
     if (stroke.width <= 0.0f || rect.width() <= 0.0f || rect.height() <= 0.0f) return;
 
-    if (!transform.is_identity() || stroke.dash.has_value()) {
+    if (!transform.is_identity() || stroke.dash.has_value() || std::abs(rx - ry) > 1e-4f) {
         auto p = PathBuilder::from_rounded_rect(rect, rx, ry);
         if (p) stroke_path(dst, *p, paint, stroke, transform, mask, clip);
         return;
@@ -1830,7 +1831,19 @@ void draw_pixmap(
     const Mask* mask,
     std::optional<ScreenIntRect> clip
 ) {
-    if (transform.is_identity() && mask == nullptr) {
+    if (paint.tint != Color::WHITE) {
+        auto sr = Rect::from_xywh(0.0f, 0.0f, static_cast<float>(src.width()), static_cast<float>(src.height()));
+        auto dr = Rect::from_xywh(static_cast<float>(x), static_cast<float>(y),
+                                  static_cast<float>(src.width()), static_cast<float>(src.height()));
+        if (sr && dr) {
+            draw_pixmap_rect(dst, src, *sr, *dr, paint, transform, mask, clip);
+        }
+        return;
+    }
+
+    if (transform.is_identity() && mask == nullptr &&
+        src.format() == dst.format() &&
+        (dst.format() == PixelFormat::RGBA8888 || dst.format() == PixelFormat::BGRA8888)) {
         int32_t clip_x0 = 0;
         int32_t clip_y0 = 0;
         int32_t clip_x1 = static_cast<int32_t>(dst.width());
@@ -1858,8 +1871,8 @@ void draw_pixmap(
             if (can_memcpy) {
                 for (int32_t dy = dst_y0; dy < dst_y1; ++dy) {
                     int32_t sy = dy - y;
-                    const PremultipliedColorU8* src_row = src.pixels() + sy * src.width() + src_x0;
-                    PremultipliedColorU8* dst_row = dst.pixels_mut() + dy * dst.width() + dst_x0;
+                    const PremultipliedColorU8* src_row = src.row(static_cast<size_t>(sy)) + src_x0;
+                    PremultipliedColorU8* dst_row = dst.row(static_cast<size_t>(dy)) + dst_x0;
                     std::memcpy(dst_row, src_row, static_cast<size_t>(copy_w) * sizeof(PremultipliedColorU8));
                 }
                 return;
@@ -1869,8 +1882,8 @@ void draw_pixmap(
                 if (paint.opacity >= 0.999f) {
                     for (int32_t dy = dst_y0; dy < dst_y1; ++dy) {
                         int32_t sy = dy - y;
-                        const PremultipliedColorU8* src_row = src.pixels() + sy * src.width() + src_x0;
-                        PremultipliedColorU8* dst_row = dst.pixels_mut() + dy * dst.width() + dst_x0;
+                        const PremultipliedColorU8* src_row = src.row(static_cast<size_t>(sy)) + src_x0;
+                        PremultipliedColorU8* dst_row = dst.row(static_cast<size_t>(dy)) + dst_x0;
                         simd::blend_source_over_span(dst_row, src_row, static_cast<size_t>(copy_w));
                     }
                     return;
@@ -1878,8 +1891,8 @@ void draw_pixmap(
                     uint8_t op_u8 = static_cast<uint8_t>(paint.opacity * 255.0f + 0.5f);
                     for (int32_t dy = dst_y0; dy < dst_y1; ++dy) {
                         int32_t sy = dy - y;
-                        const PremultipliedColorU8* src_row = src.pixels() + sy * src.width() + src_x0;
-                        PremultipliedColorU8* dst_row = dst.pixels_mut() + dy * dst.width() + dst_x0;
+                        const PremultipliedColorU8* src_row = src.row(static_cast<size_t>(sy)) + src_x0;
+                        PremultipliedColorU8* dst_row = dst.row(static_cast<size_t>(dy)) + dst_x0;
                         simd::blend_source_over_span_coverage(dst_row, src_row, op_u8, static_cast<size_t>(copy_w));
                     }
                     return;
@@ -1895,6 +1908,7 @@ void draw_pixmap(
         transform.sx > 0.0f && transform.sy > 0.0f &&
         (paint.blend_mode == BlendMode::Source || (paint.blend_mode == BlendMode::SourceOver && src.is_opaque())) &&
         paint.opacity >= 0.999f &&
+        src.format() == dst.format() &&
         (dst.format() == PixelFormat::RGBA8888 || dst.format() == PixelFormat::BGRA8888)) {
 
         float dst_fx0 = static_cast<float>(x) * transform.sx + transform.tx;
@@ -2008,9 +2022,9 @@ void draw_pixmap(
 
                     int32_t y0 = std::clamp(isy, 0, sh - 1);
                     int32_t y1 = std::clamp(isy + 1, 0, sh - 1);
-                    const PremultipliedColorU8* src_row0 = src.pixels() + y0 * sw;
-                    const PremultipliedColorU8* src_row1 = src.pixels() + y1 * sw;
-                    PremultipliedColorU8* dst_row = dst.pixels_mut() + dy * dst.width() + out_x0;
+                    const PremultipliedColorU8* src_row0 = src.row(static_cast<size_t>(y0));
+                    const PremultipliedColorU8* src_row1 = src.row(static_cast<size_t>(y1));
+                    PremultipliedColorU8* dst_row = dst.row(static_cast<size_t>(dy)) + out_x0;
 
 #if defined(NISABA_HAS_AVX2)
                     __m256i v_ifv256 = _mm256_set1_epi16(static_cast<int16_t>(ifv));
@@ -2137,8 +2151,8 @@ void draw_pixmap(
             } else {
                 for (int32_t dy = out_y0; dy < out_y1; ++dy) {
                     int32_t sy = std::clamp(static_cast<int32_t>((static_cast<float>(dy) + 0.5f - dst_fy0) * inv_sy), 0, sh - 1);
-                    const PremultipliedColorU8* src_row = src.pixels() + sy * sw;
-                    PremultipliedColorU8* dst_row = dst.pixels_mut() + dy * dst.width();
+                    const PremultipliedColorU8* src_row = src.row(static_cast<size_t>(sy));
+                    PremultipliedColorU8* dst_row = dst.row(static_cast<size_t>(dy));
 
                     for (int32_t dx = out_x0; dx < out_x1; ++dx) {
                         int32_t sx = std::clamp(static_cast<int32_t>((static_cast<float>(dx) + 0.5f - dst_fx0) * inv_sx), 0, sw - 1);
@@ -2167,6 +2181,158 @@ void draw_pixmap(
     p.anti_alias = (paint.quality != FilterQuality::Nearest);
 
     fill_rect(dst, *rect, p, transform, mask, clip);
+}
+
+void draw_pixmap_rect(
+    PixmapMut& dst,
+    const PixmapRef& src,
+    const Rect& src_rect,
+    const Rect& dst_rect,
+    const PixmapPaint& paint,
+    Transform transform,
+    const Mask* mask,
+    std::optional<ScreenIntRect> clip
+) {
+    if (src.is_empty() || !src.data() || src_rect.is_empty() || dst_rect.is_empty() ||
+        dst.width() == 0 || dst.height() == 0) {
+        return;
+    }
+
+    auto inv_opt = transform.invert();
+    if (!inv_opt) return;
+    const Transform inv = *inv_opt;
+
+    int32_t clip_x0 = 0;
+    int32_t clip_y0 = 0;
+    int32_t clip_x1 = static_cast<int32_t>(dst.width());
+    int32_t clip_y1 = static_cast<int32_t>(dst.height());
+    if (clip) {
+        clip_x0 = std::max(clip_x0, static_cast<int32_t>(clip->left()));
+        clip_y0 = std::max(clip_y0, static_cast<int32_t>(clip->top()));
+        clip_x1 = std::min(clip_x1, static_cast<int32_t>(clip->right()));
+        clip_y1 = std::min(clip_y1, static_cast<int32_t>(clip->bottom()));
+    }
+    if (clip_x0 >= clip_x1 || clip_y0 >= clip_y1) return;
+
+    Point corners[4] = {
+        {dst_rect.left(), dst_rect.top()},
+        {dst_rect.right(), dst_rect.top()},
+        {dst_rect.right(), dst_rect.bottom()},
+        {dst_rect.left(), dst_rect.bottom()}
+    };
+    transform.map_points(corners, 4);
+    float min_fx = corners[0].x, max_fx = corners[0].x;
+    float min_fy = corners[0].y, max_fy = corners[0].y;
+    for (int i = 1; i < 4; ++i) {
+        min_fx = std::min(min_fx, corners[i].x);
+        max_fx = std::max(max_fx, corners[i].x);
+        min_fy = std::min(min_fy, corners[i].y);
+        max_fy = std::max(max_fy, corners[i].y);
+    }
+
+    int32_t out_x0 = std::max(clip_x0, static_cast<int32_t>(std::floor(min_fx)));
+    int32_t out_y0 = std::max(clip_y0, static_cast<int32_t>(std::floor(min_fy)));
+    int32_t out_x1 = std::min(clip_x1, static_cast<int32_t>(std::ceil(max_fx)));
+    int32_t out_y1 = std::min(clip_y1, static_cast<int32_t>(std::ceil(max_fy)));
+    if (out_x0 >= out_x1 || out_y0 >= out_y1) return;
+
+    int32_t sw = static_cast<int32_t>(src.width());
+    int32_t sh = static_cast<int32_t>(src.height());
+    int32_t min_sx = std::clamp(static_cast<int32_t>(std::floor(src_rect.left())), 0, sw - 1);
+    int32_t max_sx = std::clamp(static_cast<int32_t>(std::ceil(src_rect.right())) - 1, min_sx, sw - 1);
+    int32_t min_sy = std::clamp(static_cast<int32_t>(std::floor(src_rect.top())), 0, sh - 1);
+    int32_t max_sy = std::clamp(static_cast<int32_t>(std::ceil(src_rect.bottom())) - 1, min_sy, sh - 1);
+
+    float inv_dw = 1.0f / dst_rect.width();
+    float inv_dh = 1.0f / dst_rect.height();
+    float src_l = src_rect.left();
+    float src_t = src_rect.top();
+    float src_w = src_rect.width();
+    float src_h = src_rect.height();
+
+    float op = std::clamp(paint.opacity, 0.0f, 1.0f);
+    float ta = paint.tint.alpha() * op;
+    float tr = paint.tint.red() * ta;
+    float tg = paint.tint.green() * ta;
+    float tb = paint.tint.blue() * ta;
+    bool has_tint_or_op = (std::abs(tr - 1.0f) > 1e-4f || std::abs(tg - 1.0f) > 1e-4f ||
+                           std::abs(tb - 1.0f) > 1e-4f || std::abs(ta - 1.0f) > 1e-4f);
+    bool bilinear = (paint.quality != FilterQuality::Nearest);
+
+    for (int32_t dy = out_y0; dy < out_y1; ++dy) {
+        float py = static_cast<float>(dy) + 0.5f;
+        for (int32_t dx = out_x0; dx < out_x1; ++dx) {
+            uint8_t mask_a = 255;
+            if (mask) {
+                if (static_cast<uint32_t>(dx) >= mask->width() || static_cast<uint32_t>(dy) >= mask->height()) {
+                    continue;
+                }
+                mask_a = mask->data()[static_cast<size_t>(dy) * mask->width() + static_cast<size_t>(dx)];
+                if (mask_a == 0) continue;
+            }
+
+            Point lp = {static_cast<float>(dx) + 0.5f, py};
+            inv.map_point(lp);
+            if (lp.x < dst_rect.left() || lp.x >= dst_rect.right() ||
+                lp.y < dst_rect.top() || lp.y >= dst_rect.bottom()) {
+                continue;
+            }
+
+            float u = (lp.x - dst_rect.left()) * inv_dw;
+            float v = (lp.y - dst_rect.top()) * inv_dh;
+            float sx_f = src_l + u * src_w;
+            float sy_f = src_t + v * src_h;
+
+            PremultipliedColorU8 sampled;
+            if (!bilinear) {
+                int32_t ix = std::clamp(static_cast<int32_t>(std::floor(sx_f)), min_sx, max_sx);
+                int32_t iy = std::clamp(static_cast<int32_t>(std::floor(sy_f)), min_sy, max_sy);
+                sampled = *src.pixel(static_cast<uint32_t>(ix), static_cast<uint32_t>(iy));
+            } else {
+                float fx_s = sx_f - 0.5f;
+                float fy_s = sy_f - 0.5f;
+                int32_t fx0 = static_cast<int32_t>(std::floor(fx_s));
+                int32_t fy0 = static_cast<int32_t>(std::floor(fy_s));
+                float wx = fx_s - static_cast<float>(fx0);
+                float wy = fy_s - static_cast<float>(fy0);
+                int32_t x0 = std::clamp(fx0, min_sx, max_sx);
+                int32_t x1 = std::clamp(fx0 + 1, min_sx, max_sx);
+                int32_t y0 = std::clamp(fy0, min_sy, max_sy);
+                int32_t y1 = std::clamp(fy0 + 1, min_sy, max_sy);
+
+                auto p00 = *src.pixel(static_cast<uint32_t>(x0), static_cast<uint32_t>(y0));
+                auto p10 = *src.pixel(static_cast<uint32_t>(x1), static_cast<uint32_t>(y0));
+                auto p01 = *src.pixel(static_cast<uint32_t>(x0), static_cast<uint32_t>(y1));
+                auto p11 = *src.pixel(static_cast<uint32_t>(x1), static_cast<uint32_t>(y1));
+
+                float w00 = (1.0f - wx) * (1.0f - wy);
+                float w10 = wx * (1.0f - wy);
+                float w01 = (1.0f - wx) * wy;
+                float w11 = wx * wy;
+
+                sampled = PremultipliedColorU8::from_rgba_unchecked(
+                    static_cast<uint8_t>(std::clamp(p00.red() * w00 + p10.red() * w10 + p01.red() * w01 + p11.red() * w11 + 0.5f, 0.0f, 255.0f)),
+                    static_cast<uint8_t>(std::clamp(p00.green() * w00 + p10.green() * w10 + p01.green() * w01 + p11.green() * w11 + 0.5f, 0.0f, 255.0f)),
+                    static_cast<uint8_t>(std::clamp(p00.blue() * w00 + p10.blue() * w10 + p01.blue() * w01 + p11.blue() * w11 + 0.5f, 0.0f, 255.0f)),
+                    static_cast<uint8_t>(std::clamp(p00.alpha() * w00 + p10.alpha() * w10 + p01.alpha() * w01 + p11.alpha() * w11 + 0.5f, 0.0f, 255.0f))
+                );
+            }
+
+            if (has_tint_or_op || mask_a < 255) {
+                float mf = (mask_a == 255) ? 1.0f : (static_cast<float>(mask_a) / 255.0f);
+                sampled = PremultipliedColorU8::from_rgba_unchecked(
+                    static_cast<uint8_t>(std::clamp(static_cast<float>(sampled.red()) * tr * mf + 0.5f, 0.0f, 255.0f)),
+                    static_cast<uint8_t>(std::clamp(static_cast<float>(sampled.green()) * tg * mf + 0.5f, 0.0f, 255.0f)),
+                    static_cast<uint8_t>(std::clamp(static_cast<float>(sampled.blue()) * tb * mf + 0.5f, 0.0f, 255.0f)),
+                    static_cast<uint8_t>(std::clamp(static_cast<float>(sampled.alpha()) * ta * mf + 0.5f, 0.0f, 255.0f))
+                );
+            }
+
+            auto dst_px = *dst.pixel(static_cast<uint32_t>(dx), static_cast<uint32_t>(dy));
+            dst.set_pixel(static_cast<uint32_t>(dx), static_cast<uint32_t>(dy),
+                          blend_pixels(sampled, dst_px, paint.blend_mode));
+        }
+    }
 }
 
 void apply_mask(

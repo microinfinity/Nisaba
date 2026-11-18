@@ -2746,7 +2746,41 @@ Rect SvgDocument::compute_element_local_bounds(const SvgElement& elem, int depth
     return Rect();
 }
 
-void SvgDocument::render_markers(Canvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth) const {
+void SvgDocument::apply_clip_path_to_canvas(ICanvas& canvas, const SvgElement& elem) const {
+    if (elem.style.clip_path_url.empty()) return;
+    auto rit = rich_clip_paths_.find(elem.style.clip_path_url);
+    if (rit != rich_clip_paths_.end()) {
+        const SvgClipPath& cp = rit->second;
+        Path cp_path = cp.combined_path;
+        if (cp.units == SvgUnits::ObjectBoundingBox) {
+            Rect b = compute_element_local_bounds(elem);
+            if (b.width() > 0.0f && b.height() > 0.0f) {
+                Transform bbox_ts = Transform::from_row(b.width(), 0.0f, 0.0f, b.height(), b.left(), b.top());
+                cp_path.apply_transform(bbox_ts);
+            }
+        }
+        canvas.clip_path(cp_path, cp.clip_rule);
+    } else {
+        auto it = clip_paths_.find(elem.style.clip_path_url);
+        if (it != clip_paths_.end()) {
+            canvas.clip_path(it->second);
+        }
+    }
+}
+
+void SvgDocument::render_element_dispatch(ICanvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth, bool is_gpu) const {
+#if defined(NISABA_HAS_GPU) || defined(NISABA_GLEW)
+    if (is_gpu) {
+        render_element_gpu(static_cast<gpu::GpuCanvas&>(canvas), elem, theme, use_depth);
+        return;
+    }
+#else
+    (void)is_gpu;
+#endif
+    render_element(static_cast<Canvas&>(canvas), elem, theme, use_depth);
+}
+
+void SvgDocument::render_markers(ICanvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth, bool is_gpu) const {
     if (elem.path.is_empty() || use_depth > 16) return;
     if (elem.style.marker_start_url.empty() && elem.style.marker_mid_url.empty() && elem.style.marker_end_url.empty()) {
         return;
@@ -2871,7 +2905,7 @@ void SvgDocument::render_markers(Canvas& canvas, const SvgElement& elem, const S
             marker_theme.current_color = elem.style.current_color;
         }
         for (const auto& m_el : mk.elements) {
-            render_element(canvas, m_el, marker_theme, use_depth + 1);
+            render_element_dispatch(canvas, m_el, marker_theme, use_depth + 1, is_gpu);
         }
         canvas.restore();
     };
@@ -2885,7 +2919,7 @@ void SvgDocument::render_markers(Canvas& canvas, const SvgElement& elem, const S
     }
 }
 
-void SvgDocument::render_element_raw(Canvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth) const {
+void SvgDocument::render_element_raw(ICanvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth, bool is_gpu) const {
     if (elem.style.display_none || use_depth > 16) return;
 
     if (elem.type == SvgElementType::Group) {
@@ -2899,7 +2933,7 @@ void SvgDocument::render_element_raw(Canvas& canvas, const SvgElement& elem, con
             }
         }
         for (const auto& child : elem.children) {
-            render_element(canvas, child, theme, use_depth);
+            render_element_dispatch(canvas, child, theme, use_depth, is_gpu);
         }
         canvas.restore();
         return;
@@ -2929,7 +2963,7 @@ void SvgDocument::render_element_raw(Canvas& canvas, const SvgElement& elem, con
             if (!use_theme.current_color.has_value()) {
                 use_theme.current_color = elem.style.current_color;
             }
-            render_element(canvas, clone, use_theme, use_depth + 1);
+            render_element_dispatch(canvas, clone, use_theme, use_depth + 1, is_gpu);
             canvas.restore();
         }
         return;
@@ -2961,7 +2995,15 @@ void SvgDocument::render_element_raw(Canvas& canvas, const SvgElement& elem, con
                 canvas.restore();
             }
         } else if (elem.nested_svg) {
-            elem.nested_svg->render(canvas, &elem.image_bounds, theme);
+#if defined(NISABA_HAS_GPU) || defined(NISABA_GLEW)
+            if (is_gpu) {
+                elem.nested_svg->render_gpu(static_cast<gpu::GpuCanvas&>(canvas), &elem.image_bounds, theme);
+            } else {
+                elem.nested_svg->render(static_cast<Canvas&>(canvas), &elem.image_bounds, theme);
+            }
+#else
+            elem.nested_svg->render(static_cast<Canvas&>(canvas), &elem.image_bounds, theme);
+#endif
         }
         return;
     }
@@ -3056,7 +3098,7 @@ void SvgDocument::render_element_raw(Canvas& canvas, const SvgElement& elem, con
         if (elem.style.stroke_width <= 0.0f) return;
         float sw = elem.style.stroke_width;
         if (elem.style.non_scaling_stroke) {
-            const auto& ct = canvas.transform();
+            const auto ct = canvas.current_transform();
             float scale_factor = std::sqrt(std::abs(ct.sx * ct.sy - ct.kx * ct.ky));
             if (scale_factor > 1e-6f) sw /= scale_factor;
         }
@@ -3101,7 +3143,7 @@ void SvgDocument::render_element_raw(Canvas& canvas, const SvgElement& elem, con
     for (SvgPaintPhase phase : elem.style.paint_order) {
         if (phase == SvgPaintPhase::Fill) do_fill();
         else if (phase == SvgPaintPhase::Stroke) do_stroke();
-        else if (phase == SvgPaintPhase::Markers) render_markers(canvas, elem, theme, use_depth);
+        else if (phase == SvgPaintPhase::Markers) render_markers(canvas, elem, theme, use_depth, is_gpu);
     }
 }
 
@@ -3114,26 +3156,7 @@ void SvgDocument::render_element(Canvas& canvas, const SvgElement& elem, const S
     }
 
     // 1. Vector ClipPath (supports clipPathUnits="objectBoundingBox" and clip-rule)
-    if (!elem.style.clip_path_url.empty()) {
-        auto rit = rich_clip_paths_.find(elem.style.clip_path_url);
-        if (rit != rich_clip_paths_.end()) {
-            const SvgClipPath& cp = rit->second;
-            Path cp_path = cp.combined_path;
-            if (cp.units == SvgUnits::ObjectBoundingBox) {
-                Rect b = compute_element_local_bounds(elem);
-                if (b.width() > 0.0f && b.height() > 0.0f) {
-                    Transform bbox_ts = Transform::from_row(b.width(), 0.0f, 0.0f, b.height(), b.left(), b.top());
-                    cp_path.apply_transform(bbox_ts);
-                }
-            }
-            canvas.clip_path(cp_path, cp.clip_rule);
-        } else {
-            auto it = clip_paths_.find(elem.style.clip_path_url);
-            if (it != clip_paths_.end()) {
-                canvas.clip_path(it->second);
-            }
-        }
-    }
+    apply_clip_path_to_canvas(canvas, elem);
 
     // 2. Alpha / Luminance Mask (preserving current Canvas transform!)
     if (!elem.style.mask_url.empty()) {
@@ -3208,7 +3231,7 @@ void SvgDocument::render_element(Canvas& canvas, const SvgElement& elem, const S
         return;
     }
 
-    render_element_raw(canvas, elem, theme, use_depth);
+    render_element_raw(canvas, elem, theme, use_depth, false);
     canvas.restore();
 }
 
@@ -3236,20 +3259,19 @@ void SvgDocument::render(Canvas& canvas, const Rect* target_bounds, const SvgThe
 }
 
 #if defined(NISABA_HAS_GPU) || defined(NISABA_GLEW)
-namespace {
-
-void render_svg_element_gpu(
-    const SvgDocument& doc,
-    gpu::GpuCanvas& canvas,
-    const SvgElement& elem,
-    const SvgTheme& theme,
-    int use_depth
-) {
+void SvgDocument::render_element_gpu(gpu::GpuCanvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth) const {
     if (elem.style.display_none || use_depth > 16) return;
 
-    // Fallback to CPU offscreen layer and blit to GPU if element uses complex SVG filter or luminance mask
-    if (!elem.style.filter_url.empty() || !elem.style.mask_url.empty() ||
-        (elem.type == SvgElementType::Group && elem.style.opacity < 0.999f)) {
+    canvas.save();
+    if (!elem.transform.is_identity()) {
+        canvas.concat(elem.transform);
+    }
+
+    apply_clip_path_to_canvas(canvas, elem);
+
+    bool has_filter = !elem.style.filter_url.empty() && filters_.count(elem.style.filter_url) > 0;
+    bool has_mask = !elem.style.mask_url.empty() && masks_.count(elem.style.mask_url) > 0;
+    if (has_filter || has_mask) {
         uint32_t cw = canvas.width();
         uint32_t ch = canvas.height();
         if (cw > 0 && ch > 0) {
@@ -3257,200 +3279,44 @@ void render_svg_element_gpu(
                 pm->fill(Color::TRANSPARENT);
                 Canvas cpu_c(*pm);
                 cpu_c.set_transform(canvas.transform());
-                // Render just this subtree via temporary document wrapper
-                SvgDocument tmp_doc = doc;
-                SvgElement sub = elem;
-                cpu_c.save();
-                // Invoke CPU renderer directly on tmp_doc
-                if (auto full_vb = Rect::from_xywh(0.0f, 0.0f, static_cast<float>(cw), static_cast<float>(ch))) {
-                    (void)full_vb;
-                }
-                // Let's use a single-element doc copy
-                SvgDocument one_doc;
-                one_doc.set_view_box(doc.view_box());
-                for (const auto& [k, v] : doc.gradients()) one_doc.add_gradient(v);
-                for (const auto& [k, v] : doc.rich_clip_paths()) one_doc.add_rich_clip_path(v);
-                for (const auto& [k, v] : doc.masks()) one_doc.add_mask(v);
-                for (const auto& [k, v] : doc.patterns()) one_doc.add_pattern(v);
-                for (const auto& [k, v] : doc.markers()) one_doc.add_marker(v);
-                for (const auto& [k, v] : doc.filters()) one_doc.add_filter(v);
-                for (const auto& [k, v] : doc.defined_elements()) one_doc.add_defined_element(k, v);
-                one_doc.add_element(sub);
-                one_doc.render(cpu_c, nullptr, theme);
-                cpu_c.restore();
+
+                SvgElement isolated_elem = elem;
+                isolated_elem.transform = Transform::identity();
+                isolated_elem.style.opacity = 1.0f;
+                isolated_elem.style.blend_mode = BlendMode::SourceOver;
+                isolated_elem.style.clip_path_url.clear();
+                render_element(cpu_c, isolated_elem, theme, use_depth);
 
                 canvas.save();
                 canvas.reset_transform();
-                canvas.draw_pixmap(0, 0, pm->as_ref());
+                PixmapPaint pp;
+                pp.opacity = elem.style.opacity;
+                pp.blend_mode = elem.style.blend_mode;
+                canvas.draw_pixmap(0, 0, pm->as_ref(), pp);
                 canvas.restore();
-                return;
             }
-        }
-    }
-
-    canvas.save();
-    if (!elem.transform.is_identity()) {
-        canvas.concat(elem.transform);
-    }
-
-    // 1. Hardware Stencil ClipPath
-    if (!elem.style.clip_path_url.empty()) {
-        auto rit = doc.rich_clip_paths().find(elem.style.clip_path_url);
-        if (rit != doc.rich_clip_paths().end()) {
-            canvas.clip_path(rit->second.combined_path, rit->second.clip_rule);
-        } else {
-            auto it = doc.clip_paths().find(elem.style.clip_path_url);
-            if (it != doc.clip_paths().end()) {
-                canvas.clip_path(it->second);
-            }
-        }
-    }
-
-    if (elem.type == SvgElementType::Group) {
-        if (elem.group_viewport.has_value()) {
-            canvas.translate(elem.group_viewport->left(), elem.group_viewport->top());
-            if (elem.group_view_box.has_value()) {
-                if (auto vp0 = Rect::from_xywh(0.0f, 0.0f, elem.group_viewport->width(), elem.group_viewport->height())) {
-                    canvas.concat(elem.preserve_aspect_ratio.compute_transform(*elem.group_view_box, *vp0));
-                }
-            }
-        }
-        for (const auto& ch : elem.children) {
-            render_svg_element_gpu(doc, canvas, ch, theme, use_depth);
         }
         canvas.restore();
         return;
     }
 
-    if (elem.type == SvgElementType::Use) {
-        auto it = doc.defined_elements().find(elem.use_href);
-        if (it != doc.defined_elements().end()) {
-            canvas.translate(elem.use_x, elem.use_y);
-            SvgElement clone = it->second;
-            if (!clone.style.fill.has_value() && clone.style.fill_url.empty() && elem.style.fill.has_value()) {
-                clone.style.fill = elem.style.fill;
-                clone.style.fill_is_current_color = elem.style.fill_is_current_color;
-            }
-            if (!clone.style.stroke.has_value() && clone.style.stroke_url.empty() && elem.style.stroke.has_value()) {
-                clone.style.stroke = elem.style.stroke;
-                clone.style.stroke_width = elem.style.stroke_width;
-                clone.style.stroke_is_current_color = elem.style.stroke_is_current_color;
-            }
-            SvgTheme use_theme = theme;
-            if (!use_theme.current_color.has_value()) use_theme.current_color = elem.style.current_color;
-            render_svg_element_gpu(doc, canvas, clone, use_theme, use_depth + 1);
-        }
+    bool needs_group_isolation = (elem.type == SvgElementType::Group &&
+                                  (elem.style.opacity < 0.999f || elem.style.blend_mode != BlendMode::SourceOver));
+    if (needs_group_isolation) {
+        Color layer_col = Color::WHITE;
+        layer_col.apply_opacity(elem.style.opacity);
+        Paint layer_paint(layer_col);
+        layer_paint.blend_mode = elem.style.blend_mode;
+        canvas.save_layer(layer_paint);
+        render_element_raw(canvas, elem, theme, use_depth, true);
+        canvas.restore();
         canvas.restore();
         return;
     }
 
-    if (elem.style.visibility_hidden) {
-        canvas.restore();
-        return;
-    }
-
-    if (elem.type == SvgElementType::Image) {
-        if (elem.image) {
-            PixmapPaint pp;
-            pp.opacity = elem.style.opacity;
-            float iw = static_cast<float>(elem.image->width());
-            float ih = static_cast<float>(elem.image->height());
-            if (iw > 0.0f && ih > 0.0f && elem.image_bounds.width() > 0.0f && elem.image_bounds.height() > 0.0f) {
-                if (auto img_vb = Rect::from_xywh(0.0f, 0.0f, iw, ih)) {
-                    canvas.concat(elem.preserve_aspect_ratio.compute_transform(*img_vb, elem.image_bounds));
-                    canvas.draw_pixmap(0, 0, elem.image->as_ref(), pp);
-                }
-            }
-        } else if (elem.nested_svg) {
-            elem.nested_svg->render_gpu(canvas, &elem.image_bounds, theme);
-        }
-        canvas.restore();
-        return;
-    }
-
-    // Path or Text
-    const Path* target_path = &elem.path;
-    Path temp_text_path;
-    if (elem.type == SvgElementType::Text) {
-        // Render text outline by rasterizing a small single-element doc or building text path
-        // Since build_text_path is private, SvgDocument::render_gpu calls this helper or we expose it via friend/member
-    }
-
-    Rect geom_bounds = target_path->bounds();
-
-    // Fill pass
-    float fill_alpha = elem.style.opacity * elem.style.fill_opacity;
-    if (!elem.style.fill_url.empty()) {
-        auto git = doc.gradients().find(elem.style.fill_url);
-        if (git != doc.gradients().end()) {
-            Shader sh = create_shader_from_gradient(git->second, geom_bounds, fill_alpha, theme);
-            Paint fill_paint(std::move(sh));
-            canvas.fill_path(*target_path, fill_paint, elem.style.fill_rule);
-        }
-    } else if (elem.style.fill.has_value() || elem.style.fill_is_current_color || !elem.style.fill_css_var.empty() || elem.style.fill_fallback.has_value()) {
-        Color fill_c = resolve_effective_color(
-            elem.style.fill.has_value() ? elem.style.fill : elem.style.fill_fallback,
-            elem.style.fill_is_current_color,
-            elem.style.fill_css_var,
-            elem.style.fill_fallback,
-            elem.style.current_color,
-            elem.id,
-            theme,
-            doc.root_css_variables()
-        );
-        fill_c.apply_opacity(fill_alpha);
-        canvas.fill_path(*target_path, Paint(fill_c), elem.style.fill_rule);
-    }
-
-    // Stroke pass
-    if (elem.style.stroke_width > 0.0f) {
-        float sw = elem.style.stroke_width;
-        if (elem.style.non_scaling_stroke) {
-            const auto& ct = canvas.transform();
-            float sf = std::sqrt(std::abs(ct.sx * ct.sy - ct.kx * ct.ky));
-            if (sf > 1e-6f) sw /= sf;
-        }
-        Stroke st(sw);
-        st.line_cap = elem.style.line_cap;
-        st.line_join = elem.style.line_join;
-        st.miter_limit = elem.style.miter_limit;
-
-        const Path* stroke_target = target_path;
-        std::optional<Path> dashed_path;
-        if (!elem.style.dash_array.empty()) {
-            if (auto sd = StrokeDash::create(elem.style.dash_array, elem.style.dash_offset)) {
-                dashed_path = dash_path(*target_path, *sd, 1.0f);
-                if (dashed_path) stroke_target = &(*dashed_path);
-            }
-        }
-
-        float stroke_alpha = elem.style.opacity * elem.style.stroke_opacity;
-        if (!elem.style.stroke_url.empty()) {
-            auto git = doc.gradients().find(elem.style.stroke_url);
-            if (git != doc.gradients().end()) {
-                Shader sh = create_shader_from_gradient(git->second, geom_bounds, stroke_alpha, theme);
-                canvas.stroke_path(*stroke_target, Paint(std::move(sh)), st);
-            }
-        } else if (elem.style.stroke.has_value() || elem.style.stroke_is_current_color || !elem.style.stroke_css_var.empty() || elem.style.stroke_fallback.has_value()) {
-            Color stroke_c = resolve_effective_color(
-                elem.style.stroke.has_value() ? elem.style.stroke : elem.style.stroke_fallback,
-                elem.style.stroke_is_current_color,
-                elem.style.stroke_css_var,
-                elem.style.stroke_fallback,
-                elem.style.current_color,
-                elem.id,
-                theme,
-                doc.root_css_variables()
-            );
-            stroke_c.apply_opacity(stroke_alpha);
-            canvas.stroke_path(*stroke_target, Paint(stroke_c), st);
-        }
-    }
-
+    render_element_raw(canvas, elem, theme, use_depth, true);
     canvas.restore();
 }
-
-} // namespace
 
 void SvgDocument::render_gpu(gpu::GpuCanvas& canvas, const Rect* target_bounds, std::optional<Color> tint) const {
     SvgTheme theme;
@@ -3469,14 +3335,7 @@ void SvgDocument::render_gpu(gpu::GpuCanvas& canvas, const Rect* target_bounds, 
     }
 
     for (const auto& elem : elements_) {
-        if (elem.type == SvgElementType::Text) {
-            SvgElement as_path = elem;
-            as_path.type = SvgElementType::Path;
-            as_path.path = build_text_path(elem);
-            render_svg_element_gpu(*this, canvas, as_path, theme, 0);
-        } else {
-            render_svg_element_gpu(*this, canvas, elem, theme, 0);
-        }
+        render_element_gpu(canvas, elem, theme, 0);
     }
 
     canvas.restore();

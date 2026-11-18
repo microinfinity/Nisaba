@@ -1,6 +1,5 @@
 #include "nisaba/gpu/gpu_blur.hpp"
-#include <GL/glew.h>
-#include <GL/gl.h>
+#include "gl_headers.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -154,14 +153,7 @@ void main() {
 )glsl";
 
 static GLuint compileShader(GLenum type, const char* src) {
-#ifdef NISABA_GLEW
-    static bool s_glew_inited = false;
-    if (!s_glew_inited) {
-        glewExperimental = GL_TRUE;
-        glewInit();
-        s_glew_inited = true;
-    }
-#endif
+    detail::ensure_gl_functions_loaded();
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &src, nullptr);
     glCompileShader(shader);
@@ -199,6 +191,85 @@ static GLuint linkProgram(const char* vsSrc, const char* fsSrc) {
     glDeleteShader(fs);
     return prog;
 }
+
+struct ScopedBlurGLState {
+    GLint drawFbo{0};
+    GLint readFbo{0};
+    GLint viewport[4]{};
+    GLint prog{0};
+    GLint vao{0};
+    GLint activeTex{GL_TEXTURE0};
+    GLint tex2D{0};
+    GLint sampler{0};
+    GLboolean colorMask[4]{GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
+    GLboolean blend{GL_FALSE};
+    GLboolean depth{GL_FALSE};
+    GLboolean scissor{GL_FALSE};
+    GLboolean stencil{GL_FALSE};
+    GLboolean cull{GL_FALSE};
+
+    ScopedBlurGLState() noexcept {
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
+        glGetIntegerv(GL_VIEWPORT, viewport);
+        glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTex);
+        glActiveTexture(GL_TEXTURE0);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex2D);
+#if defined(NISABA_TARGET_GLES)
+        glGetIntegerv(GL_SAMPLER_BINDING, &sampler);
+#else
+        if (glBindSampler) {
+            glGetIntegerv(GL_SAMPLER_BINDING, &sampler);
+        }
+#endif
+        glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+        blend = glIsEnabled(GL_BLEND);
+        depth = glIsEnabled(GL_DEPTH_TEST);
+        scissor = glIsEnabled(GL_SCISSOR_TEST);
+        stencil = glIsEnabled(GL_STENCIL_TEST);
+        cull = glIsEnabled(GL_CULL_FACE);
+
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_CULL_FACE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+#if defined(NISABA_TARGET_GLES)
+        glBindSampler(0, 0);
+#else
+        if (glBindSampler) {
+            glBindSampler(0, 0);
+        }
+#endif
+    }
+
+    ~ScopedBlurGLState() noexcept {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(readFbo));
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(drawFbo));
+        glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+        glBindVertexArray(static_cast<GLuint>(vao));
+        glUseProgram(static_cast<GLuint>(prog));
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(tex2D));
+#if defined(NISABA_TARGET_GLES)
+        glBindSampler(0, static_cast<GLuint>(sampler));
+#else
+        if (glBindSampler) {
+            glBindSampler(0, static_cast<GLuint>(sampler));
+        }
+#endif
+        glActiveTexture(static_cast<GLenum>(activeTex));
+        glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+        if (blend) glEnable(GL_BLEND);
+        if (depth) glEnable(GL_DEPTH_TEST);
+        if (scissor) glEnable(GL_SCISSOR_TEST);
+        if (stencil) glEnable(GL_STENCIL_TEST);
+        if (cull) glEnable(GL_CULL_FACE);
+    }
+};
 
 } // namespace
 
@@ -255,6 +326,10 @@ void DualKawaseBlur::cleanup() {
     }
     pyramid_.clear();
 
+    if (capture_fbo_) {
+        glDeleteFramebuffers(1, &capture_fbo_);
+        capture_fbo_ = 0;
+    }
     if (capture_tex_) {
         glDeleteTextures(1, &capture_tex_);
         capture_tex_ = 0;
@@ -300,8 +375,7 @@ bool DualKawaseBlur::setup_vbo() {
 bool DualKawaseBlur::setup_shaders() {
     if (shaders_) return true;
 
-    const char* ver = reinterpret_cast<const char*>(glGetString(GL_VERSION));
-    bool is_gles = (ver != nullptr && std::strstr(ver, "OpenGL ES") != nullptr);
+    const bool is_gles = detail::is_gles_or_webgl();
 
     const char* vertSrc = is_gles ? kDualKawaseVertGLES : kDualKawaseVertGL;
     const char* downFragSrc = is_gles ? kDualKawaseDownFragGLES : kDualKawaseDownFragGL;
@@ -355,22 +429,37 @@ bool DualKawaseBlur::init(int baseWidth, int baseHeight, int maxPasses) {
     }
     pyramid_.clear();
 
+    if (capture_fbo_) {
+        glDeleteFramebuffers(1, &capture_fbo_);
+        capture_fbo_ = 0;
+    }
     if (capture_tex_) {
         glDeleteTextures(1, &capture_tex_);
         capture_tex_ = 0;
     }
 
+    ScopedBlurGLState savedState;
+
     base_width_ = baseWidth;
     base_height_ = baseHeight;
 
-    // Allocate capture texture (GL_RGB8 supports both RGB and RGBA framebuffers without 1282 error)
+    // Allocate RGBA8 capture texture + single-sample capture FBO (preserves alpha & supports MSAA resolve blit)
     glGenTextures(1, &capture_tex_);
     glBindTexture(GL_TEXTURE_2D, capture_tex_);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, baseWidth, baseHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, baseWidth, baseHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glGenFramebuffers(1, &capture_fbo_);
+    glBindFramebuffer(GL_FRAMEBUFFER, capture_fbo_);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, capture_tex_, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "[-] DualKawase capture FBO incomplete" << std::endl;
+        cleanup();
+        return false;
+    }
 
     // Allocate pyramid levels
     int curW = baseWidth;
@@ -399,7 +488,6 @@ bool DualKawaseBlur::init(int baseWidth, int baseHeight, int maxPasses) {
         GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         if (status != GL_FRAMEBUFFER_COMPLETE) {
             std::cerr << "[-] DualKawase pyramid FBO incomplete: " << status << std::endl;
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
             cleanup();
             return false;
         }
@@ -407,8 +495,6 @@ bool DualKawaseBlur::init(int baseWidth, int baseHeight, int maxPasses) {
         pyramid_.push_back(std::move(lvl));
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
 
@@ -423,36 +509,27 @@ uint32_t DualKawaseBlur::blur_framebuffer(
     int passes = std::clamp(config.passes, 1, 6);
     if (!init(width, height, passes)) return 0;
 
-    // Save previous OpenGL states
-    GLint prevFbo = 0;
-    GLint prevViewport[4];
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-    glGetIntegerv(GL_VIEWPORT, prevViewport);
-    GLboolean prevBlend = glIsEnabled(GL_BLEND);
-    GLboolean prevDepth = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean prevScissor = glIsEnabled(GL_SCISSOR_TEST);
+    ScopedBlurGLState savedState;
 
-    glDisable(GL_BLEND);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_SCISSOR_TEST);
+    // 1. Capture active framebuffer into RGBA8 single-sample capture_fbo_ / capture_tex_
+#if defined(NISABA_TARGET_GLES)
+    constexpr bool has_blit = true;
+#else
+    const bool has_blit = (glBlitFramebuffer != nullptr);
+#endif
+    if (has_blit && capture_fbo_ != 0) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fboId);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, capture_fbo_);
+        glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    } else {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fboId);
+        glBindTexture(GL_TEXTURE_2D, capture_tex_);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
 
-    // 1. Capture active framebuffer to capture_tex_ via glCopyTexSubImage2D
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, fboId);
-    glBindTexture(GL_TEXTURE_2D, capture_tex_);
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    // 2. Execute blur pyramid
-    uint32_t blurredTex = blur_texture(capture_tex_, width, height, config);
-
-    // Restore previous OpenGL states
-    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
-    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
-    if (prevBlend) glEnable(GL_BLEND);
-    if (prevDepth) glEnable(GL_DEPTH_TEST);
-    if (prevScissor) glEnable(GL_SCISSOR_TEST);
-
-    return blurredTex;
+    // 2. Execute blur pyramid (already guarded by ScopedBlurGLState above)
+    return blur_texture_impl(capture_tex_, width, height, config);
 }
 
 uint32_t DualKawaseBlur::blur_texture(
@@ -462,11 +539,20 @@ uint32_t DualKawaseBlur::blur_texture(
     const DualKawaseConfig& config
 ) {
     if (srcTexId == 0 || width <= 0 || height <= 0 || pyramid_.empty()) return 0;
+    ScopedBlurGLState savedState;
+    return blur_texture_impl(srcTexId, width, height, config);
+}
+
+uint32_t DualKawaseBlur::blur_texture_impl(
+    uint32_t srcTexId,
+    int width,
+    int height,
+    const DualKawaseConfig& config
+) {
+    if (srcTexId == 0 || width <= 0 || height <= 0 || pyramid_.empty()) return 0;
 
     int passes = std::min(static_cast<int>(pyramid_.size()), std::clamp(config.passes, 1, 6));
 
-    GLint prevVao = 0;
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
     glBindVertexArray(vao_);
 
     // ==========================================
@@ -519,10 +605,7 @@ uint32_t DualKawaseBlur::blur_texture(
         glDrawArrays(GL_TRIANGLES, 0, 3);
     }
 
-    glBindVertexArray(prevVao);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    // Return blurred level 0 texture
+    // Return blurred level 0 texture (ScopedBlurGLState restores VAO/program/FBO/viewport/texture)
     return pyramid_[0].texture;
 }
 

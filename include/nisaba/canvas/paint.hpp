@@ -7,6 +7,8 @@
 #include "nisaba/shaders/shader.hpp"
 #include "nisaba/canvas/mask.hpp"
 #include "nisaba/effects/color_matrix.hpp"
+#include "nisaba/effects/color_filter.hpp"
+#include "nisaba/effects/image_filter.hpp"
 
 namespace nisaba {
 
@@ -17,9 +19,22 @@ namespace gpu {
 struct PixmapPaint {
     float opacity{1.0f};
     BlendMode blend_mode{BlendMode::SourceOver};
-    FilterQuality quality{FilterQuality::Nearest};
+    FilterQuality quality{FilterQuality::Bilinear};
+    Color tint{Color::WHITE};
 
     constexpr PixmapPaint() noexcept = default;
+};
+
+enum class PaintStyle : uint8_t {
+    Fill,
+    Stroke,
+    StrokeAndFill,
+};
+
+enum class PointMode : uint8_t {
+    Points,
+    Lines,
+    Polygon,
 };
 
 class Paint {
@@ -30,6 +45,9 @@ public:
     ColorSpace colorspace{ColorSpace::SimpleSRGB};
     bool force_hq_pipeline{false};
     std::optional<effects::ColorMatrix> color_filter{std::nullopt};
+    std::optional<effects::ColorEffect> color_effect{std::nullopt};
+    std::optional<effects::ImageFilter> image_filter{std::nullopt};
+    PaintStyle style{PaintStyle::Fill};
 
     std::shared_ptr<gpu::Shader> custom_shader{nullptr};
 
@@ -68,14 +86,43 @@ public:
 
     void set_color_filter(const effects::ColorMatrix& filter) noexcept {
         color_filter = filter;
+        color_effect = std::nullopt;
+    }
+
+    void set_color_filter(const effects::ColorEffect& filter) noexcept {
+        color_filter = std::nullopt;
+        color_effect = filter;
     }
 
     void clear_color_filter() noexcept {
         color_filter = std::nullopt;
+        color_effect = std::nullopt;
     }
 
     [[nodiscard]] bool has_color_filter() const noexcept {
-        return color_filter.has_value();
+        return color_filter.has_value() || (color_effect.has_value() && color_effect->is_active());
+    }
+
+    [[nodiscard]] std::optional<effects::ColorEffect> effective_color_effect() const noexcept {
+        if (color_effect.has_value() && color_effect->is_active()) {
+            return color_effect;
+        }
+        if (color_filter.has_value()) {
+            return effects::ColorEffect::from_matrix(*color_filter);
+        }
+        return std::nullopt;
+    }
+
+    void set_image_filter(const effects::ImageFilter& filter) noexcept {
+        image_filter = filter;
+    }
+
+    void clear_image_filter() noexcept {
+        image_filter = std::nullopt;
+    }
+
+    [[nodiscard]] bool has_image_filter() const noexcept {
+        return image_filter.has_value() && image_filter->is_active();
     }
 
     void set_linear_blending(bool enable) noexcept {
@@ -84,6 +131,14 @@ public:
 
     [[nodiscard]] bool is_linear_blending() const noexcept {
         return colorspace == ColorSpace::Linear || colorspace == ColorSpace::FullSRGBGamma;
+    }
+
+    void set_style(PaintStyle s) noexcept {
+        style = s;
+    }
+
+    [[nodiscard]] PaintStyle paint_style() const noexcept {
+        return style;
     }
 };
 

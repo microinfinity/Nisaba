@@ -1,8 +1,7 @@
 #include "nisaba/gpu/gpu_surface.hpp"
 #include "nisaba/gpu/context.hpp"
 #include "nisaba/gpu/vulkan_surface.hpp"
-#include <GL/glew.h>
-#include <GL/gl.h>
+#include "gl_headers.hpp"
 #include <iostream>
 #include <cstring>
 #include <algorithm>
@@ -39,9 +38,17 @@ GpuSurface::GpuSurface(
 
 GpuSurface::~GpuSurface() {
     if (device_ && owns_fbo_) {
+        if (msaa_ds_rb_ != 0) {
+            device_->delete_renderbuffer(msaa_ds_rb_);
+            msaa_ds_rb_ = 0;
+        }
         if (msaa_rb_id_ != 0) {
             device_->delete_renderbuffer(msaa_rb_id_);
             msaa_rb_id_ = 0;
+        }
+        if (resolve_ds_rb_ != 0) {
+            device_->delete_renderbuffer(resolve_ds_rb_);
+            resolve_ds_rb_ = 0;
         }
         if (fbo_id_ != 0 && fbo_id_ != resolve_fbo_) {
             device_->delete_framebuffer(fbo_id_);
@@ -84,18 +91,20 @@ std::shared_ptr<GpuSurface> GpuSurface::create(
     device->attach_renderbuffer_to_framebuffer(GL_DEPTH_STENCIL_ATTACHMENT, resolve_ds_rb);
 
     if (!device->check_framebuffer_complete()) {
+        if (resolve_ds_rb != 0) device->delete_renderbuffer(resolve_ds_rb);
         device->delete_framebuffer(resolve_fbo);
         return nullptr;
     }
 
     uint32_t active_fbo = resolve_fbo;
     uint32_t msaa_rb = 0;
+    uint32_t msaa_ds_rb = 0;
     uint32_t actual_samples = 1;
 
     if (samples > 1 && device->has_msaa_support()) {
         uint32_t msaa_fbo = device->create_framebuffer();
         msaa_rb = device->create_renderbuffer();
-        uint32_t msaa_ds_rb = device->create_renderbuffer();
+        msaa_ds_rb = device->create_renderbuffer();
 
         if (msaa_fbo != 0 && msaa_rb != 0 && msaa_ds_rb != 0) {
             device->bind_renderbuffer(msaa_rb);
@@ -116,16 +125,24 @@ std::shared_ptr<GpuSurface> GpuSurface::create(
                 device->delete_renderbuffer(msaa_rb);
                 device->delete_renderbuffer(msaa_ds_rb);
                 msaa_rb = 0;
+                msaa_ds_rb = 0;
             }
+        } else {
+            if (msaa_fbo != 0) device->delete_framebuffer(msaa_fbo);
+            if (msaa_rb != 0) { device->delete_renderbuffer(msaa_rb); msaa_rb = 0; }
+            if (msaa_ds_rb != 0) { device->delete_renderbuffer(msaa_ds_rb); msaa_ds_rb = 0; }
         }
     }
 
     device->bind_framebuffer(active_fbo);
     device->set_viewport(0, 0, width, height);
 
-    return std::shared_ptr<GpuSurface>(new GpuSurface(
+    auto surface = std::shared_ptr<GpuSurface>(new GpuSurface(
         device, active_fbo, resolve_fbo, msaa_rb, actual_samples, width, height, tex
     ));
+    surface->resolve_ds_rb_ = resolve_ds_rb;
+    surface->msaa_ds_rb_ = msaa_ds_rb;
+    return surface;
 }
 
 std::shared_ptr<GpuSurface> GpuSurface::from_screen(
@@ -156,25 +173,40 @@ void GpuSurface::resolve() {
     if (!device_ || samples_ <= 1 || !needs_resolve_) return;
     device_->make_current();
     device_->blit_framebuffer(fbo_id_, resolve_fbo_, width_, height_);
+    device_->bind_framebuffer(fbo_id_);
     needs_resolve_ = false;
+}
+
+void GpuSurface::resolve_rect_internal(const ScreenIntRect& damage_rect) {
+    int32_t w = static_cast<int32_t>(width_);
+    int32_t h = static_cast<int32_t>(height_);
+    int32_t x0 = std::clamp(static_cast<int32_t>(damage_rect.x()), 0, w);
+    int32_t y_top = std::clamp(static_cast<int32_t>(damage_rect.y()), 0, h);
+    int32_t x1 = std::clamp(static_cast<int32_t>(damage_rect.x() + damage_rect.width()), 0, w);
+    int32_t y_bot = std::clamp(static_cast<int32_t>(damage_rect.y() + damage_rect.height()), 0, h);
+    if (x1 <= x0 || y_bot <= y_top) return;
+
+    // Convert top-down screen Y to OpenGL bottom-left Y
+    int32_t gl_y0 = h - y_bot;
+    int32_t gl_y1 = h - y_top;
+    device_->blit_framebuffer(fbo_id_, resolve_fbo_, x0, gl_y0, x1, gl_y1, x0, gl_y0, x1, gl_y1);
 }
 
 void GpuSurface::resolve(const ScreenIntRect& damage_rect) {
     if (!device_ || samples_ <= 1 || !needs_resolve_) return;
     device_->make_current();
-    int32_t x0 = static_cast<int32_t>(damage_rect.x());
-    int32_t y0 = static_cast<int32_t>(damage_rect.y());
-    int32_t x1 = static_cast<int32_t>(damage_rect.x() + damage_rect.width());
-    int32_t y1 = static_cast<int32_t>(damage_rect.y() + damage_rect.height());
-    device_->blit_framebuffer(fbo_id_, resolve_fbo_, x0, y0, x1, y1, x0, y0, x1, y1);
+    resolve_rect_internal(damage_rect);
+    device_->bind_framebuffer(fbo_id_);
+    needs_resolve_ = false;
 }
 
 void GpuSurface::resolve(const std::vector<ScreenIntRect>& damage_rects) {
     if (!device_ || samples_ <= 1 || !needs_resolve_) return;
     device_->make_current();
     for (const auto& r : damage_rects) {
-        resolve(r);
+        resolve_rect_internal(r);
     }
+    device_->bind_framebuffer(fbo_id_);
     needs_resolve_ = false;
 }
 

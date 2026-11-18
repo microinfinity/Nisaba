@@ -90,6 +90,8 @@ void apply_line_alignment(
         offset = spare;
     } else if (align == Align::Center) {
         offset = spare * 0.5f;
+    } else if (align == Align::Start) {
+        offset = (base_dir == Direction::RightToLeft) ? spare : 0.0f;
     } else if (align == Align::End) {
         offset = (base_dir == Direction::RightToLeft) ? 0.0f : spare;
     }
@@ -659,6 +661,11 @@ void BufferLine::shape_and_layout(
         g.is_mark = is_mark_glyph;
         g.underline = attrs.underline;
         g.strikethrough = attrs.strikethrough;
+        g.overline = attrs.overline;
+        g.decoration_style = attrs.decoration_style;
+        g.decoration_color_opt = attrs.decoration_color_opt;
+        g.decoration_thickness = attrs.decoration_thickness;
+        g.shadows = attrs.shadows;
         g.synthetic_bold = synth_bold;
         g.synthetic_italic = synth_italic;
 
@@ -1114,6 +1121,359 @@ float Buffer::max_line_width() const {
     return max_w;
 }
 
+float Buffer::max_intrinsic_width(FontSystem& font_system) const {
+    if (!width_.has_value() || wrap_ == Wrap::None) {
+        bool all_shaped = true;
+        for (const auto& line : lines_) {
+            if (!line.is_shaped()) {
+                all_shaped = false;
+                break;
+            }
+        }
+        if (all_shaped) {
+            return max_line_width();
+        }
+    }
+    float max_w = 0.0f;
+    for (const auto& line : lines_) {
+        BufferLine probe = line;
+        probe.shape_and_layout(
+            font_system,
+            metrics_.font_size,
+            metrics_.line_height,
+            std::nullopt,
+            Wrap::None,
+            Align::Left,
+            shaping_,
+            enable_kerning_,
+            enable_ligatures_
+        );
+        for (const auto& ll : probe.layout()) {
+            max_w = std::max(max_w, ll.w);
+        }
+    }
+    return max_w;
+}
+
+std::vector<Rect> Buffer::range_rects(
+    size_t start,
+    size_t end,
+    float origin_x,
+    float origin_y,
+    RectHeightStyle height_style
+) const {
+    std::vector<Rect> rects;
+    if (start >= end || lines_.empty()) {
+        return rects;
+    }
+
+    std::vector<size_t> line_offsets(lines_.size(), 0);
+    for (size_t i = 1; i < lines_.size(); ++i) {
+        line_offsets[i] = line_offsets[i - 1] + lines_[i - 1].text().size() + 1;
+    }
+
+    auto push_rect = [&](float x, float y, float w, float h) {
+        if (auto r = Rect::from_xywh(x, y, std::max(0.5f, w), std::max(0.5f, h))) {
+            rects.push_back(*r);
+        }
+    };
+
+    for (const auto& run : layout_runs()) {
+        if (run.line_i >= lines_.size()) continue;
+        const size_t base = line_offsets[run.line_i];
+        const size_t line_end_global = base + lines_[run.line_i].text().size();
+        if (end <= base || start > line_end_global) continue;
+
+        const size_t local_start = (start > base) ? (start - base) : 0;
+        const size_t local_end = (end > base) ? (end - base) : 0;
+
+        float box_y = origin_y + run.line_top;
+        float box_h = run.line_height;
+        if (height_style == RectHeightStyle::Tight) {
+            const float asc = (run.max_ascent > 0.0f) ? run.max_ascent : metrics_.font_size * 0.8f;
+            const float desc = (run.max_descent > 0.0f) ? run.max_descent : metrics_.font_size * 0.2f;
+            box_h = asc + desc;
+        }
+
+        if (run.glyphs.empty()) {
+            if (start <= line_end_global && end > line_end_global) {
+                push_rect(origin_x, box_y, 4.0f, box_h);
+            }
+            continue;
+        }
+
+        bool in_span = false;
+        float span_x0 = 0.0f;
+        float span_x1 = 0.0f;
+        for (const auto& g : run.glyphs) {
+            if (g.is_mark) continue;
+            if (g.end > local_start && g.start < local_end) {
+                const float gx0 = g.x;
+                const float gx1 = g.x + g.w;
+                if (!in_span) {
+                    in_span = true;
+                    span_x0 = gx0;
+                    span_x1 = gx1;
+                } else if (gx0 <= span_x1 + 1.5f && gx1 >= span_x0 - 1.5f) {
+                    span_x0 = std::min(span_x0, gx0);
+                    span_x1 = std::max(span_x1, gx1);
+                } else {
+                    push_rect(origin_x + span_x0, box_y, span_x1 - span_x0, box_h);
+                    span_x0 = gx0;
+                    span_x1 = gx1;
+                }
+            } else if (in_span) {
+                push_rect(origin_x + span_x0, box_y, span_x1 - span_x0, box_h);
+                in_span = false;
+            }
+        }
+        if (in_span) {
+            push_rect(origin_x + span_x0, box_y, span_x1 - span_x0, box_h);
+        }
+    }
+    return rects;
+}
+
+GlyphPosition Buffer::glyph_position_at(
+    float x,
+    float y,
+    float origin_x,
+    float origin_y
+) const {
+    if (lines_.empty()) return {};
+    const auto runs = layout_runs();
+    if (runs.empty()) return {};
+
+    std::vector<size_t> line_offsets(lines_.size(), 0);
+    for (size_t i = 1; i < lines_.size(); ++i) {
+        line_offsets[i] = line_offsets[i - 1] + lines_[i - 1].text().size() + 1;
+    }
+
+    const float local_x = x - origin_x;
+    const float local_y = y - origin_y;
+
+    const LayoutRun* best_run = &runs[0];
+    for (const auto& run : runs) {
+        if (local_y >= run.line_top && local_y < run.line_top + run.line_height) {
+            best_run = &run;
+            break;
+        }
+        if (local_y >= run.line_top) {
+            best_run = &run;
+        }
+    }
+
+    const size_t base = (best_run->line_i < line_offsets.size()) ? line_offsets[best_run->line_i] : 0;
+    if (best_run->glyphs.empty()) {
+        return GlyphPosition{base, false};
+    }
+
+    const auto& first_g = best_run->glyphs.front();
+    const auto& last_g = best_run->glyphs.back();
+    if (local_x <= first_g.x) {
+        const bool rtl = (first_g.level & 1) != 0;
+        return GlyphPosition{base + (rtl ? first_g.end : first_g.start), rtl};
+    }
+    if (local_x >= last_g.x + last_g.w) {
+        const bool rtl = (last_g.level & 1) != 0;
+        return GlyphPosition{base + (rtl ? last_g.start : last_g.end), true};
+    }
+
+    for (const auto& g : best_run->glyphs) {
+        if (g.is_mark) continue;
+        if (local_x >= g.x && local_x <= g.x + g.w) {
+            const bool rtl = (g.level & 1) != 0;
+            const bool left_half = (local_x < g.x + g.w * 0.5f);
+            if (!rtl) {
+                return left_half ? GlyphPosition{base + g.start, false}
+                                 : GlyphPosition{base + g.end, true};
+            }
+            return left_half ? GlyphPosition{base + g.end, true}
+                             : GlyphPosition{base + g.start, false};
+        }
+    }
+    return GlyphPosition{base + last_g.end, true};
+}
+
+TextRange Buffer::word_range_at(size_t byte_pos) const {
+    if (lines_.empty()) return {};
+
+    size_t line_base = 0;
+    size_t target_line = lines_.size() - 1;
+    for (size_t i = 0; i < lines_.size(); ++i) {
+        const size_t line_end = line_base + lines_[i].text().size();
+        if (byte_pos <= line_end || i + 1 == lines_.size()) {
+            target_line = i;
+            break;
+        }
+        line_base = line_end + 1;
+    }
+
+    const std::string_view text = lines_[target_line].text();
+    if (text.empty()) {
+        return TextRange{line_base, line_base};
+    }
+
+    const size_t local_pos = std::min(byte_pos - line_base, text.size());
+    size_t w_end = 0;
+    size_t w_start = 0;
+    if (local_pos >= text.size()) {
+        w_start = Bidi::prev_word_boundary(text, text.size());
+        w_end = Bidi::next_word_boundary(text, w_start);
+    } else {
+        w_end = Bidi::next_word_boundary(text, local_pos);
+        w_start = Bidi::prev_word_boundary(text, w_end);
+    }
+    if (w_start > w_end) std::swap(w_start, w_end);
+    return TextRange{line_base + w_start, line_base + w_end};
+}
+
+DecorationGeometry build_run_decorations(
+    const LayoutRun& run,
+    float origin_x,
+    float origin_y,
+    float default_font_size,
+    Color default_color
+) {
+    DecorationGeometry geom;
+    if (run.glyphs.empty()) return geom;
+
+    const float baseline_offset = (run.max_ascent > 0.0f) ? run.max_ascent : default_font_size;
+    const float line_baseline = origin_y + run.line_top + baseline_offset;
+
+    enum class DecKind { Underline, Strikethrough, Overline };
+
+    auto emit_span = [&](DecKind kind, float x0, float x1, const LayoutGlyph& proto) {
+        if (x1 <= x0) return;
+        const Color color = proto.decoration_color_opt.has_value()
+            ? proto.decoration_color_opt->to_color()
+            : (proto.color_opt.has_value() ? proto.color_opt->to_color() : default_color);
+        const float thickness = std::max(1.0f, proto.font_size * 0.07f) * std::max(0.1f, proto.decoration_thickness);
+
+        float y_pos = line_baseline + proto.y;
+        if (kind == DecKind::Underline) {
+            y_pos += proto.font_size * 0.12f;
+        } else if (kind == DecKind::Strikethrough) {
+            y_pos -= proto.font_size * 0.30f;
+        } else {
+            y_pos -= proto.font_size * 0.85f;
+        }
+
+        const float span_w = x1 - x0;
+        switch (proto.decoration_style) {
+            case DecorationStyle::Solid: {
+                geom.rects.push_back(DecorationGeometry::RectSpan{x0, y_pos, span_w, thickness, color});
+                break;
+            }
+            case DecorationStyle::Double: {
+                const float bar_h = std::max(1.0f, thickness * 0.7f);
+                const float gap = std::max(1.5f, thickness * 1.1f);
+                geom.rects.push_back(DecorationGeometry::RectSpan{x0, y_pos, span_w, bar_h, color});
+                geom.rects.push_back(DecorationGeometry::RectSpan{x0, y_pos + bar_h + gap, span_w, bar_h, color});
+                break;
+            }
+            case DecorationStyle::Dotted: {
+                const float dot_s = std::max(1.5f, thickness * 1.1f);
+                const float step = dot_s * 2.1f;
+                for (float px = x0; px < x1; px += step) {
+                    geom.rects.push_back(DecorationGeometry::RectSpan{
+                        px, y_pos, std::min(dot_s, x1 - px), dot_s, color
+                    });
+                }
+                break;
+            }
+            case DecorationStyle::Dashed: {
+                const float dash_w = std::max(3.5f, thickness * 3.0f);
+                const float gap_w = std::max(2.0f, thickness * 1.8f);
+                const float step = dash_w + gap_w;
+                for (float px = x0; px < x1; px += step) {
+                    geom.rects.push_back(DecorationGeometry::RectSpan{
+                        px, y_pos, std::min(dash_w, x1 - px), thickness, color
+                    });
+                }
+                break;
+            }
+            case DecorationStyle::Wavy: {
+                const float amp = std::max(1.2f, thickness * 1.05f);
+                const float period = std::max(6.0f, thickness * 5.0f);
+                const float seg = std::max(1.5f, period * 0.125f);
+                const float cy = y_pos + thickness * 0.5f;
+                constexpr float two_pi = 6.28318530718f;
+                DecorationGeometry::WaveStroke wave;
+                wave.stroke_width = thickness;
+                wave.color = color;
+                for (float px = x0; px < x1; px += seg) {
+                    float py = cy + amp * std::sin(two_pi * (px - x0) / period);
+                    wave.points.push_back(Point::from_xy(px, py));
+                }
+                wave.points.push_back(Point::from_xy(
+                    x1, cy + amp * std::sin(two_pi * span_w / period)
+                ));
+                if (wave.points.size() >= 2) {
+                    geom.waves.push_back(std::move(wave));
+                }
+                break;
+            }
+        }
+    };
+
+    auto collect_kind = [&](DecKind kind) {
+        auto has_kind = [&](const LayoutGlyph& g) {
+            if (kind == DecKind::Underline) return g.underline;
+            if (kind == DecKind::Strikethrough) return g.strikethrough;
+            return g.overline;
+        };
+
+        bool active = false;
+        float span_x0 = 0.0f;
+        float span_x1 = 0.0f;
+        const LayoutGlyph* proto = nullptr;
+
+        auto same_style = [&](const LayoutGlyph& a, const LayoutGlyph& b) {
+            return a.decoration_style == b.decoration_style &&
+                   a.decoration_color_opt == b.decoration_color_opt &&
+                   a.decoration_thickness == b.decoration_thickness &&
+                   a.font_size == b.font_size &&
+                   a.y == b.y &&
+                   a.color_opt == b.color_opt;
+        };
+
+        for (const auto& g : run.glyphs) {
+            if (g.is_mark && g.w <= 0.0f) continue;
+            if (has_kind(g) && g.w > 0.0f) {
+                const float gx0 = origin_x + g.x;
+                const float gx1 = origin_x + g.x + g.w;
+                if (!active) {
+                    active = true;
+                    span_x0 = gx0;
+                    span_x1 = gx1;
+                    proto = &g;
+                } else if (gx0 <= span_x1 + 1.5f && gx1 >= span_x0 - 1.5f && same_style(*proto, g)) {
+                    span_x0 = std::min(span_x0, gx0);
+                    span_x1 = std::max(span_x1, gx1);
+                } else {
+                    emit_span(kind, span_x0, span_x1, *proto);
+                    span_x0 = gx0;
+                    span_x1 = gx1;
+                    proto = &g;
+                }
+            } else if (active) {
+                emit_span(kind, span_x0, span_x1, *proto);
+                active = false;
+                proto = nullptr;
+            }
+        }
+        if (active && proto != nullptr) {
+            emit_span(kind, span_x0, span_x1, *proto);
+        }
+    };
+
+    collect_kind(DecKind::Underline);
+    collect_kind(DecKind::Strikethrough);
+    collect_kind(DecKind::Overline);
+    return geom;
+}
+
 void Buffer::draw(
     Canvas& canvas,
     GlyphCache& cache,
@@ -1127,10 +1487,64 @@ void Buffer::draw(
 
     std::vector<ColorGlyphLayer> color_layers;
 
-    for (const auto& run : runs) {
-        float line_baseline = origin_y + run.line_top + metrics_.font_size;
+    auto render_glyph = [&](const LayoutGlyph& glyph, const TtfFont* font, float gx, float gy,
+                            Color fg_color, bool force_solid_color) {
+        if (font->has_color_glyphs() && font->get_color_glyph_layers(glyph.glyph_id, color_layers)) {
+            for (const auto& layer : color_layers) {
+                const CachedGlyph* layer_cached = cache.get_or_render(
+                    *font, glyph.font_id, layer.glyph_id, glyph.font_size,
+                    gx, gy, glyph.synthetic_bold, glyph.synthetic_italic
+                );
+                if (!layer_cached || layer_cached->data.empty()) continue;
+                Point dst_pos = Point::from_xy(
+                    gx + static_cast<float>(layer_cached->offset_x),
+                    gy + static_cast<float>(layer_cached->offset_y)
+                );
+                Paint layer_paint;
+                layer_paint.set_color((force_solid_color || layer.use_foreground) ? fg_color : layer.color.to_color());
+                canvas.draw_glyph(dst_pos, layer_cached->as_mask_ref(), layer_paint);
+            }
+            return;
+        }
 
-        // 1. Pass 1: Draw span background highlights
+        const CachedGlyph* cached = cache.get_or_render(
+            *font, glyph.font_id, glyph.glyph_id, glyph.font_size,
+            gx, gy, glyph.synthetic_bold, glyph.synthetic_italic
+        );
+        if (!cached || cached->data.empty()) return;
+        Point dst_pos = Point::from_xy(
+            gx + static_cast<float>(cached->offset_x),
+            gy + static_cast<float>(cached->offset_y)
+        );
+        Paint paint;
+        paint.set_color(fg_color);
+        canvas.draw_glyph(dst_pos, cached->as_mask_ref(), paint);
+    };
+
+    // Collect distinct blurred shadow sigmas once across the buffer
+    std::vector<float> blur_sigmas;
+    bool has_sharp_shadows = false;
+    for (const auto& run : runs) {
+        for (const auto& glyph : run.glyphs) {
+            for (const auto& sh : glyph.shadows) {
+                if (sh.blur_sigma > 0.1f) {
+                    if (std::find_if(blur_sigmas.begin(), blur_sigmas.end(), [&](float s) {
+                            return std::abs(s - sh.blur_sigma) < 0.05f;
+                        }) == blur_sigmas.end()) {
+                        blur_sigmas.push_back(sh.blur_sigma);
+                    }
+                } else {
+                    has_sharp_shadows = true;
+                }
+            }
+        }
+    }
+
+    for (const auto& run : runs) {
+        const float baseline_offset = (run.max_ascent > 0.0f) ? run.max_ascent : metrics_.font_size;
+        const float line_baseline = origin_y + run.line_top + baseline_offset;
+
+        // Pass 1: Span background highlights
         for (const auto& glyph : run.glyphs) {
             if (glyph.background_color_opt.has_value() && glyph.w > 0.0f) {
                 auto bg_rect = Rect::from_xywh(
@@ -1147,86 +1561,92 @@ void Buffer::draw(
             }
         }
 
-        // 2. Pass 2: Draw glyphs (including COLR/CPAL color layers, mark offsets, and synthetic styles)
-        for (const auto& glyph : run.glyphs) {
-            if (glyph.glyph_id == 0) continue;
-
-            const TtfFont* font = font_system.get_font(glyph.font_id);
-            if (!font) continue;
-
-            float glyph_x = origin_x + glyph.x + glyph.x_offset;
-            float glyph_y = line_baseline + glyph.y + glyph.y_offset;
-
-            Color fg_color = glyph.color_opt.has_value() ? glyph.color_opt->to_color() : default_color;
-
-            if (font->has_color_glyphs() && font->get_color_glyph_layers(glyph.glyph_id, color_layers)) {
-                for (const auto& layer : color_layers) {
-                    const CachedGlyph* layer_cached = cache.get_or_render(
-                        *font,
-                        glyph.font_id,
-                        layer.glyph_id,
-                        glyph.font_size,
-                        glyph_x,
-                        glyph_y,
-                        glyph.synthetic_bold,
-                        glyph.synthetic_italic
-                    );
-                    if (!layer_cached || layer_cached->data.empty()) continue;
-
-                    Point dst_pos = Point::from_xy(
-                        glyph_x + static_cast<float>(layer_cached->offset_x),
-                        glyph_y + static_cast<float>(layer_cached->offset_y)
-                    );
-                    Paint layer_paint;
-                    layer_paint.set_color(layer.use_foreground ? fg_color : layer.color.to_color());
-                    canvas.draw_glyph(dst_pos, layer_cached->as_mask_ref(), layer_paint);
+        // Pass 1.5a: Sharp text shadows
+        if (has_sharp_shadows) {
+            for (const auto& glyph : run.glyphs) {
+                if (glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
+                const TtfFont* font = font_system.get_font(glyph.font_id);
+                if (!font) continue;
+                const float gx = origin_x + glyph.x + glyph.x_offset;
+                const float gy = line_baseline + glyph.y + glyph.y_offset;
+                for (const auto& sh : glyph.shadows) {
+                    if (sh.blur_sigma <= 0.1f) {
+                        render_glyph(glyph, font, gx + sh.offset_x, gy + sh.offset_y, sh.color.to_color(), true);
+                    }
                 }
-                continue;
             }
-
-            const CachedGlyph* cached = cache.get_or_render(
-                *font,
-                glyph.font_id,
-                glyph.glyph_id,
-                glyph.font_size,
-                glyph_x,
-                glyph_y,
-                glyph.synthetic_bold,
-                glyph.synthetic_italic
-            );
-
-            if (!cached || cached->data.empty()) continue;
-
-            Point dst_pos = Point::from_xy(
-                glyph_x + static_cast<float>(cached->offset_x),
-                glyph_y + static_cast<float>(cached->offset_y)
-            );
-
-            Paint paint;
-            paint.set_color(fg_color);
-            canvas.draw_glyph(dst_pos, cached->as_mask_ref(), paint);
         }
 
-        // 3. Pass 3: Draw underline and strikethrough decorations
-        for (const auto& glyph : run.glyphs) {
-            if ((!glyph.underline && !glyph.strikethrough) || glyph.w <= 0.0f) continue;
-
-            Color dec_color = glyph.color_opt.has_value() ? glyph.color_opt->to_color() : default_color;
-            Paint dec_paint;
-            dec_paint.set_color(dec_color);
-            float thickness = std::max(1.0f, glyph.font_size * 0.07f);
-
-            if (glyph.underline) {
-                float uy = line_baseline + glyph.y + glyph.font_size * 0.12f;
-                if (auto urect = Rect::from_xywh(origin_x + glyph.x, uy, glyph.w, thickness)) {
-                    canvas.fill_rect(*urect, dec_paint);
+        // Pass 1.5b: Blurred text shadows via save_layer_bounds + ImageFilter::blur
+        for (float sigma : blur_sigmas) {
+            float min_x = 1e9f, min_y = 1e9f, max_x = -1e9f, max_y = -1e9f;
+            bool any_for_sigma = false;
+            for (const auto& glyph : run.glyphs) {
+                if (glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
+                const float gx = origin_x + glyph.x + glyph.x_offset;
+                for (const auto& sh : glyph.shadows) {
+                    if (sh.blur_sigma > 0.1f && std::abs(sh.blur_sigma - sigma) < 0.05f) {
+                        any_for_sigma = true;
+                        min_x = std::min(min_x, gx + sh.offset_x - glyph.font_size * 0.5f);
+                        max_x = std::max(max_x, gx + sh.offset_x + std::max(glyph.w, glyph.font_size) + glyph.font_size * 0.5f);
+                        min_y = std::min(min_y, origin_y + run.line_top + sh.offset_y - glyph.font_size * 0.5f);
+                        max_y = std::max(max_y, origin_y + run.line_top + run.line_height + sh.offset_y + glyph.font_size * 0.5f);
+                    }
                 }
             }
-            if (glyph.strikethrough) {
-                float sy = line_baseline + glyph.y - glyph.font_size * 0.30f;
-                if (auto srect = Rect::from_xywh(origin_x + glyph.x, sy, glyph.w, thickness)) {
-                    canvas.fill_rect(*srect, dec_paint);
+            if (!any_for_sigma) continue;
+
+            const float pad = std::ceil(sigma * 3.0f) + 2.0f;
+            if (auto bnds = Rect::from_ltrb(min_x - pad, min_y - pad, max_x + pad, max_y + pad)) {
+                Paint layer_paint;
+                layer_paint.set_image_filter(effects::ImageFilter::blur(sigma));
+                canvas.save_layer_bounds(*bnds, layer_paint);
+                for (const auto& glyph : run.glyphs) {
+                    if (glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
+                    const TtfFont* font = font_system.get_font(glyph.font_id);
+                    if (!font) continue;
+                    const float gx = origin_x + glyph.x + glyph.x_offset;
+                    const float gy = line_baseline + glyph.y + glyph.y_offset;
+                    for (const auto& sh : glyph.shadows) {
+                        if (sh.blur_sigma > 0.1f && std::abs(sh.blur_sigma - sigma) < 0.05f) {
+                            render_glyph(glyph, font, gx + sh.offset_x, gy + sh.offset_y, sh.color.to_color(), true);
+                        }
+                    }
                 }
+                canvas.restore();
+            }
+        }
+
+        // Pass 2: Glyphs
+        for (const auto& glyph : run.glyphs) {
+            if (glyph.glyph_id == 0) continue;
+            const TtfFont* font = font_system.get_font(glyph.font_id);
+            if (!font) continue;
+            const float gx = origin_x + glyph.x + glyph.x_offset;
+            const float gy = line_baseline + glyph.y + glyph.y_offset;
+            const Color fg_color = glyph.color_opt.has_value() ? glyph.color_opt->to_color() : default_color;
+            render_glyph(glyph, font, gx, gy, fg_color, false);
+        }
+
+        // Pass 3: Decorations (underline, strikethrough, overline + all 5 styles)
+        const auto dec = build_run_decorations(run, origin_x, origin_y, metrics_.font_size, default_color);
+        for (const auto& r : dec.rects) {
+            if (auto rect = Rect::from_xywh(r.x, r.y, r.w, r.h)) {
+                Paint dp;
+                dp.set_color(r.color);
+                canvas.fill_rect(*rect, dp);
+            }
+        }
+        for (const auto& wv : dec.waves) {
+            PathBuilder pb;
+            pb.move_to(wv.points[0]);
+            for (size_t i = 1; i < wv.points.size(); ++i) {
+                pb.line_to(wv.points[i]);
+            }
+            if (auto path = pb.finish()) {
+                Paint dp;
+                dp.set_color(wv.color);
+                canvas.stroke_path(*path, dp, Stroke(wv.stroke_width));
             }
         }
     }

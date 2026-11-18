@@ -45,6 +45,51 @@ inline PremultipliedColor premul(Color c) noexcept {
     return c.premultiply();
 }
 
+inline std::optional<float> solve_conical_t(
+    float px, float py,
+    float start_radius, [[maybe_unused]] float end_radius,
+    float dx, float dy, float dr, float A,
+    bool is_concentric
+) noexcept {
+    if (is_concentric) {
+        float dist = std::hypot(px, py);
+        if (std::abs(dr) > 1e-6f) {
+            return (dist - start_radius) / dr;
+        }
+        return 0.0f;
+    }
+
+    float B = -2.0f * (px * dx + py * dy + start_radius * dr);
+    float C = px * px + py * py - start_radius * start_radius;
+
+    if (std::abs(A) < 1e-7f) {
+        if (std::abs(B) < 1e-7f) return std::nullopt;
+        float t = -C / B;
+        if (start_radius + t * dr < 0.0f) return std::nullopt;
+        return t;
+    }
+
+    float disc = B * B - 4.0f * A * C;
+    if (disc < 0.0f) return std::nullopt;
+
+    float sqrt_disc = std::sqrt(disc);
+    float t1 = (-B - sqrt_disc) / (2.0f * A);
+    float t2 = (-B + sqrt_disc) / (2.0f * A);
+
+    float r1 = start_radius + t1 * dr;
+    float r2 = start_radius + t2 * dr;
+
+    bool v1 = (r1 >= -1e-4f);
+    bool v2 = (r2 >= -1e-4f);
+
+    if (v1 && !v2) return t1;
+    if (v2 && !v1) return t2;
+    if (v1 && v2) {
+        return (dr >= 0.0f) ? t1 : t2;
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 // =========================================================================
@@ -76,20 +121,7 @@ Gradient::Gradient(
         stops_.push_back(GradientStop::create(1.0f, stops.back().color));
     }
 
-    colors_are_opaque_ = true;
-    has_uniform_alpha_ = true;
-    uint8_t first_a = stops_.empty() ? 255 : static_cast<uint8_t>(stops_[0].color.alpha() * 255.0f + 0.5f);
-    uniform_alpha_ = first_a;
-
-    for (const auto& s : stops_) {
-        uint8_t a = static_cast<uint8_t>(s.color.alpha() * 255.0f + 0.5f);
-        if (a != first_a) {
-            has_uniform_alpha_ = false;
-        }
-        if (!s.color.is_opaque()) {
-            colors_are_opaque_ = false;
-        }
-    }
+    update_alpha_flags();
 
     // Ensure monotonicity
     size_t start_index = dummy_first ? 0 : 1;
@@ -188,17 +220,28 @@ void Gradient::post_concat(const Transform& ts) noexcept {
     update_inv();
 }
 
+void Gradient::update_alpha_flags() noexcept {
+    colors_are_opaque_ = true;
+    has_uniform_alpha_ = true;
+    uint8_t first_a = stops_.empty() ? 255 : static_cast<uint8_t>(stops_[0].color.alpha() * 255.0f + 0.5f);
+    uniform_alpha_ = first_a;
+
+    for (const auto& s : stops_) {
+        uint8_t a = static_cast<uint8_t>(s.color.alpha() * 255.0f + 0.5f);
+        if (a != first_a) {
+            has_uniform_alpha_ = false;
+        }
+        if (!s.color.is_opaque()) {
+            colors_are_opaque_ = false;
+        }
+    }
+}
+
 void Gradient::apply_opacity(float opacity) noexcept {
     for (auto& s : stops_) {
         s.color.apply_opacity(opacity);
     }
-    colors_are_opaque_ = true;
-    for (const auto& s : stops_) {
-        if (!s.color.is_opaque()) {
-            colors_are_opaque_ = false;
-            break;
-        }
-    }
+    update_alpha_flags();
     bake_ramp();
 }
 
@@ -565,7 +608,7 @@ std::optional<RadialGradient> RadialGradient::create_2point(
     g.radius_ = std::max(start_radius, end_radius);
     g.inv_radius_ = (g.radius_ > 0.0f) ? (1.0f / g.radius_) : 1.0f;
 
-    Transform unit_ts = Transform::from_translate(-start.x, -start.y).post_scale(g.inv_radius_, g.inv_radius_);
+    Transform unit_ts = Transform();
     g.points_to_unit_ = unit_ts;
 
     static_cast<Gradient&>(g) = Gradient(g.stops_, mode, transform, unit_ts);
@@ -582,6 +625,18 @@ Color RadialGradient::sample(float x, float y) const noexcept {
     if (!inv_combined_) return Color::TRANSPARENT;
     Point p = Point::from_xy(x, y);
     inv_combined_->map_point(p);
+    if (is_2point_) {
+        float px = p.x - start_.x;
+        float py = p.y - start_.y;
+        float dx = end_.x - start_.x;
+        float dy = end_.y - start_.y;
+        float dr = end_radius_ - start_radius_;
+        float A = dx * dx + dy * dy - dr * dr;
+        bool is_concentric = (std::abs(dx) < 1e-6f && std::abs(dy) < 1e-6f);
+        auto t = solve_conical_t(px, py, start_radius_, end_radius_, dx, dy, dr, A, is_concentric);
+        if (!t) return Color::TRANSPARENT;
+        return eval(*t);
+    }
     float d = std::sqrt(p.x * p.x + p.y * p.y);
     return eval(d);
 }
@@ -602,7 +657,7 @@ void RadialGradient::shade_span(float x, float y, uint32_t count, PremultipliedC
     float dpx = inv.sx;
     float dpy = inv.ky;
 
-    if (tile_mode_ == SpreadMode::Pad) {
+    if (tile_mode_ == SpreadMode::Pad && !is_2point_) {
         // Zero-Sqrt Quadratic DDA Algorithm (Pure C++, 100% portable, MCU-ready)
         double A = static_cast<double>(dpx * dpx + dpy * dpy);
         double B = 2.0 * static_cast<double>(px0 * dpx + py0 * dpy);
@@ -646,6 +701,23 @@ void RadialGradient::shade_span(float x, float y, uint32_t count, PremultipliedC
     }
 
     // Fallback for Repeat / Reflect / 2-point
+    if (is_2point_) {
+        float dx = end_.x - start_.x;
+        float dy = end_.y - start_.y;
+        float dr = end_radius_ - start_radius_;
+        float A = dx * dx + dy * dy - dr * dr;
+        bool is_concentric = (std::abs(dx) < 1e-6f && std::abs(dy) < 1e-6f);
+        float px = px0 - start_.x;
+        float py = py0 - start_.y;
+        for (uint32_t i = 0; i < count; ++i) {
+            auto t = solve_conical_t(px, py, start_radius_, end_radius_, dx, dy, dr, A, is_concentric);
+            dst[i] = t ? lookup_ramp(*t) : PremultipliedColorU8::TRANSPARENT;
+            px += dpx;
+            py += dpy;
+        }
+        return;
+    }
+
     float px = px0;
     float py = py0;
     for (size_t i = 0; i < count; ++i) {
@@ -728,6 +800,10 @@ Pattern::Pattern(
       transform_(transform)
 {
     update_inv();
+    if (pixmap_.format() != PixelFormat::RGBA8888 &&
+        pixmap_.width() > 0 && pixmap_.height() > 0 && pixmap_.data() != nullptr) {
+        rgba_storage_ = std::make_shared<Pixmap>(pixmap_.to_rgba8888());
+    }
     is_opaque_ = (opacity_ >= 0.999f && pixmap_.is_opaque());
 }
 
@@ -750,104 +826,10 @@ void Pattern::apply_opacity(float opacity) noexcept {
     if (opacity_ < 0.999f) is_opaque_ = false;
 }
 
-float Pattern::map_coord(float v, uint32_t length) const noexcept {
-    if (length <= 1) return 0.0f;
-    float flen = static_cast<float>(length);
-
-    switch (mode_) {
-        case SpreadMode::Pad:
-            return std::clamp(v, 0.0f, flen - 1.0f);
-
-        case SpreadMode::Repeat: {
-            float m = std::fmod(v, flen);
-            return (m < 0.0f) ? m + flen : m;
-        }
-
-        case SpreadMode::Reflect: {
-            float f = std::fmod(v, 2.0f * flen);
-            if (f < 0.0f) f += 2.0f * flen;
-            return (f < flen) ? f : (2.0f * flen - f - 1e-4f);
-        }
-    }
-    return std::clamp(v, 0.0f, flen - 1.0f);
-}
-
-Color Pattern::sample(float x, float y) const noexcept {
-    if (!inv_ts_ || pixmap_.width() == 0 || pixmap_.height() == 0) {
-        return Color::TRANSPARENT;
-    }
-
-    Point pt = Point::from_xy(x, y);
-    inv_ts_->map_point(pt);
-    uint32_t w = pixmap_.width();
-    uint32_t h = pixmap_.height();
-
-    if (quality_ == FilterQuality::Nearest) {
-        float u = map_coord(pt.x, w);
-        float v = map_coord(pt.y, h);
-        uint32_t ix = std::clamp(static_cast<uint32_t>(std::floor(u)), 0u, w - 1);
-        uint32_t iy = std::clamp(static_cast<uint32_t>(std::floor(v)), 0u, h - 1);
-
-        auto p_opt = pixmap_.pixel(ix, iy);
-        if (!p_opt) return Color::TRANSPARENT;
-        ColorU8 cu8 = p_opt->demultiply();
-        Color c = Color::from_rgba8(cu8.red(), cu8.green(), cu8.blue(), cu8.alpha());
-        if (opacity_ < 1.0f) {
-            c.apply_opacity(opacity_);
-        }
-        return c;
-    } else {
-        // Bilinear or Bicubic
-        float u = map_coord(pt.x - 0.5f, w);
-        float v = map_coord(pt.y - 0.5f, h);
-
-        uint32_t x0 = std::clamp(static_cast<uint32_t>(std::floor(u)), 0u, w - 1);
-        uint32_t y0 = std::clamp(static_cast<uint32_t>(std::floor(v)), 0u, h - 1);
-        uint32_t x1 = (x0 + 1 < w) ? x0 + 1 : ((mode_ == SpreadMode::Repeat) ? 0u : x0);
-        uint32_t y1 = (y0 + 1 < h) ? y0 + 1 : ((mode_ == SpreadMode::Repeat) ? 0u : y0);
-
-        float fx = u - std::floor(u);
-        float fy = v - std::floor(v);
-
-        auto to_c = [&](uint32_t px, uint32_t py) {
-            auto opt = pixmap_.pixel(px, py);
-            if (!opt) return Color::TRANSPARENT;
-            ColorU8 cu8 = opt->demultiply();
-            return Color::from_rgba8(cu8.red(), cu8.green(), cu8.blue(), cu8.alpha());
-        };
-
-        Color p00 = to_c(x0, y0);
-        Color p10 = to_c(x1, y0);
-        Color p01 = to_c(x0, y1);
-        Color p11 = to_c(x1, y1);
-
-        auto lerp_c = [](const Color& a, const Color& b, float t) {
-            return Color::from_rgba_unchecked(
-                a.red() + (b.red() - a.red()) * t,
-                a.green() + (b.green() - a.green()) * t,
-                a.blue() + (b.blue() - a.blue()) * t,
-                a.alpha() + (b.alpha() - a.alpha()) * t
-            );
-        };
-
-        Color top = lerp_c(p00, p10, fx);
-        Color bot = lerp_c(p01, p11, fx);
-        Color c = lerp_c(top, bot, fy);
-
-        if (opacity_ < 1.0f) {
-            c.apply_opacity(opacity_);
-        }
-        return c;
-    }
-}
-
-PremultipliedColor Pattern::sample_premul(float x, float y) const noexcept {
-    return premul(sample(x, y));
-}
-
 namespace {
 
 inline uint32_t pattern_clamp_or_wrap(int32_t v, uint32_t len, SpreadMode mode) noexcept {
+    if (len == 0) return 0;
     if (mode == SpreadMode::Repeat) {
         if ((len & (len - 1)) == 0) {
             return static_cast<uint32_t>(v) & (len - 1);
@@ -875,15 +857,110 @@ inline uint32_t pattern_clamp_or_wrap(int32_t v, uint32_t len, SpreadMode mode) 
 
 } // anonymous namespace
 
+PremultipliedColor Pattern::sample_premul(float x, float y) const noexcept {
+    if (!inv_ts_ || pixmap_.width() == 0 || pixmap_.height() == 0) {
+        return PremultipliedColor();
+    }
+
+    Point pt = Point::from_xy(x, y);
+    inv_ts_->map_point(pt);
+    const PixmapRef active_pm = rgba_storage_ ? rgba_storage_->as_ref() : pixmap_;
+    const uint32_t w = active_pm.width();
+    const uint32_t h = active_pm.height();
+
+    auto to_pm = [&](uint32_t px, uint32_t py) noexcept -> PremultipliedColor {
+        auto opt = active_pm.pixel(px, py);
+        if (!opt) return PremultipliedColor();
+        constexpr float inv255 = 1.0f / 255.0f;
+        return PremultipliedColor(
+            NormalizedF32::create_unchecked(opt->red() * inv255),
+            NormalizedF32::create_unchecked(opt->green() * inv255),
+            NormalizedF32::create_unchecked(opt->blue() * inv255),
+            NormalizedF32::create_unchecked(opt->alpha() * inv255)
+        );
+    };
+
+    PremultipliedColor res;
+    if (quality_ == FilterQuality::Nearest) {
+        uint32_t ix = pattern_clamp_or_wrap(static_cast<int32_t>(std::floor(pt.x)), w, mode_);
+        uint32_t iy = pattern_clamp_or_wrap(static_cast<int32_t>(std::floor(pt.y)), h, mode_);
+        res = to_pm(ix, iy);
+    } else {
+        float uf = pt.x - 0.5f;
+        float vf = pt.y - 0.5f;
+        float fu_floor = std::floor(uf);
+        float fv_floor = std::floor(vf);
+        int32_t iu = static_cast<int32_t>(fu_floor);
+        int32_t iv = static_cast<int32_t>(fv_floor);
+        float fx = uf - fu_floor;
+        float fy = vf - fv_floor;
+
+        uint32_t x0 = pattern_clamp_or_wrap(iu, w, mode_);
+        uint32_t y0 = pattern_clamp_or_wrap(iv, h, mode_);
+        uint32_t x1 = pattern_clamp_or_wrap(iu + 1, w, mode_);
+        uint32_t y1 = pattern_clamp_or_wrap(iv + 1, h, mode_);
+
+        PremultipliedColor p00 = to_pm(x0, y0);
+        PremultipliedColor p10 = to_pm(x1, y0);
+        PremultipliedColor p01 = to_pm(x0, y1);
+        PremultipliedColor p11 = to_pm(x1, y1);
+
+        auto bilerp = [fx, fy](float c00, float c10, float c01, float c11) noexcept {
+            float top = c00 + (c10 - c00) * fx;
+            float bot = c01 + (c11 - c01) * fx;
+            return top + (bot - top) * fy;
+        };
+
+        res = PremultipliedColor(
+            NormalizedF32::create_unchecked(bilerp(p00.red(), p10.red(), p01.red(), p11.red())),
+            NormalizedF32::create_unchecked(bilerp(p00.green(), p10.green(), p01.green(), p11.green())),
+            NormalizedF32::create_unchecked(bilerp(p00.blue(), p10.blue(), p01.blue(), p11.blue())),
+            NormalizedF32::create_unchecked(bilerp(p00.alpha(), p10.alpha(), p01.alpha(), p11.alpha()))
+        );
+    }
+
+    if (opacity_ < 1.0f) {
+        res = PremultipliedColor(
+            NormalizedF32::create_unchecked(res.red() * opacity_),
+            NormalizedF32::create_unchecked(res.green() * opacity_),
+            NormalizedF32::create_unchecked(res.blue() * opacity_),
+            NormalizedF32::create_unchecked(res.alpha() * opacity_)
+        );
+    }
+    return res;
+}
+
+Color Pattern::sample(float x, float y) const noexcept {
+    return sample_premul(x, y).demultiply();
+}
+
+static inline void apply_pattern_opacity(PremultipliedColorU8* dst, uint32_t count, float opacity) noexcept {
+    if (opacity >= 0.999f) return;
+    uint32_t op_u8 = static_cast<uint32_t>(opacity * 255.0f + 0.5f) + 1;
+    for (uint32_t i = 0; i < count; ++i) {
+        PremultipliedColorU8 c = dst[i];
+        uint8_t r = static_cast<uint8_t>((c.red() * op_u8) >> 8);
+        uint8_t g = static_cast<uint8_t>((c.green() * op_u8) >> 8);
+        uint8_t b = static_cast<uint8_t>((c.blue() * op_u8) >> 8);
+        uint8_t a = static_cast<uint8_t>((c.alpha() * op_u8) >> 8);
+        dst[i] = PremultipliedColorU8::from_rgba_unchecked(r, g, b, a);
+    }
+}
+
 void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8* dst) const noexcept {
     if (!inv_ts_ || pixmap_.width() == 0 || pixmap_.height() == 0 || count == 0) {
         std::fill_n(dst, count, PremultipliedColorU8::TRANSPARENT);
         return;
     }
 
-    uint32_t w = pixmap_.width();
-    uint32_t h = pixmap_.height();
-    const PremultipliedColorU8* src_pixels = pixmap_.pixels();
+    const PixmapRef active_pm = rgba_storage_ ? rgba_storage_->as_ref() : pixmap_;
+    const uint32_t w = active_pm.width();
+    const uint32_t h = active_pm.height();
+    const uint8_t* base = active_pm.data();
+    const size_t stride = active_pm.stride_bytes();
+    auto row_ptr = [base, stride](uint32_t py) noexcept -> const PremultipliedColorU8* {
+        return reinterpret_cast<const PremultipliedColorU8*>(base + static_cast<size_t>(py) * stride);
+    };
 
     // -------------------------------------------------------------------------
     // FAST PATH: Axis-Aligned 1:1 Identity / Translation (Test 33 & 34)
@@ -906,7 +983,7 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
 
             if (mode_ == SpreadMode::Repeat) {
                 uint32_t sy = pattern_clamp_or_wrap(static_cast<int32_t>(start_y), h, SpreadMode::Repeat);
-                const PremultipliedColorU8* tile_row = src_pixels + sy * w;
+                const PremultipliedColorU8* tile_row = row_ptr(sy);
                 uint32_t sx = pattern_clamp_or_wrap(static_cast<int32_t>(start_x), w, SpreadMode::Repeat);
 
                 uint32_t done = 0;
@@ -917,21 +994,11 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
                     sx = 0;
                 }
 
-                if (opacity_ < 0.999f) {
-                    uint32_t op_u8 = static_cast<uint32_t>(opacity_ * 255.0f + 0.5f) + 1;
-                    for (uint32_t i = 0; i < count; ++i) {
-                        PremultipliedColorU8 c = dst[i];
-                        uint8_t r = static_cast<uint8_t>((c.red() * op_u8) >> 8);
-                        uint8_t g = static_cast<uint8_t>((c.green() * op_u8) >> 8);
-                        uint8_t b = static_cast<uint8_t>((c.blue() * op_u8) >> 8);
-                        uint8_t a = static_cast<uint8_t>((c.alpha() * op_u8) >> 8);
-                        dst[i] = PremultipliedColorU8::from_rgba_unchecked(r, g, b, a);
-                    }
-                }
+                apply_pattern_opacity(dst, count, opacity_);
                 return;
             } else if (mode_ == SpreadMode::Pad) {
                 int64_t clamped_y = std::clamp(start_y, int64_t(0), static_cast<int64_t>(h - 1));
-                const PremultipliedColorU8* pad_row = src_pixels + clamped_y * w;
+                const PremultipliedColorU8* pad_row = row_ptr(static_cast<uint32_t>(clamped_y));
 
                 if (start_x >= 0 && start_x + count <= static_cast<int64_t>(w)) {
                     std::memcpy(dst, pad_row + start_x, count * sizeof(PremultipliedColorU8));
@@ -959,17 +1026,7 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
                     }
                 }
 
-                if (opacity_ < 0.999f) {
-                    uint32_t op_u8 = static_cast<uint32_t>(opacity_ * 255.0f + 0.5f) + 1;
-                    for (uint32_t i = 0; i < count; ++i) {
-                        PremultipliedColorU8 c = dst[i];
-                        uint8_t r = static_cast<uint8_t>((c.red() * op_u8) >> 8);
-                        uint8_t g = static_cast<uint8_t>((c.green() * op_u8) >> 8);
-                        uint8_t b = static_cast<uint8_t>((c.blue() * op_u8) >> 8);
-                        uint8_t a = static_cast<uint8_t>((c.alpha() * op_u8) >> 8);
-                        dst[i] = PremultipliedColorU8::from_rgba_unchecked(r, g, b, a);
-                    }
-                }
+                apply_pattern_opacity(dst, count, opacity_);
                 return;
             }
         }
@@ -996,7 +1053,7 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
         if (is_axis_aligned) {
             int32_t iv = static_cast<int32_t>(v_fixed >> 16);
             uint32_t py = pattern_clamp_or_wrap(iv, h, mode_);
-            const PremultipliedColorU8* row = src_pixels + py * w;
+            const PremultipliedColorU8* row = row_ptr(py);
 
             for (uint32_t i = 0; i < count; ++i) {
                 int32_t iu = static_cast<int32_t>(u_fixed >> 16);
@@ -1015,7 +1072,7 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
                 int32_t iv = static_cast<int32_t>(v_fixed >> 16);
                 uint32_t px = pattern_clamp_or_wrap(iu, w, mode_);
                 uint32_t py = pattern_clamp_or_wrap(iv, h, mode_);
-                dst[i] = src_pixels[py * w + px];
+                dst[i] = row_ptr(py)[px];
                 u_fixed += du_fixed;
                 v_fixed += dv_fixed;
             }
@@ -1030,9 +1087,10 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
             uint32_t y0 = pattern_clamp_or_wrap(iv, h, mode_);
             uint32_t y1 = pattern_clamp_or_wrap(iv + 1, h, mode_);
 
-            const PremultipliedColorU8* row0 = src_pixels + y0 * w;
-            const PremultipliedColorU8* row1 = src_pixels + y1 * w;
+            const PremultipliedColorU8* row0 = row_ptr(y0);
+            const PremultipliedColorU8* row1 = row_ptr(y1);
 
+            bool fast_done = false;
             if (du_fixed == 0x10000) {
                 int32_t iu0 = static_cast<int32_t>(u_fixed >> 16);
                 uint32_t fu = static_cast<uint32_t>((u_fixed >> 8) & 0xFF);
@@ -1040,6 +1098,7 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
                 if (iu0 >= 0 && iu0 + static_cast<int32_t>(count) + 1 <= static_cast<int32_t>(w)) {
                     if (fu == 0 && fv == 0) {
                         std::memcpy(dst, row0 + iu0, count * sizeof(PremultipliedColorU8));
+                        apply_pattern_opacity(dst, count, opacity_);
                         return;
                     }
 #if defined(__SSE2__)
@@ -1099,11 +1158,12 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
                         __m128i res = _mm_srli_epi16(_mm_add_epi16(_mm_mullo_epi16(top, v_inv_fv), _mm_mullo_epi16(bot, v_fv)), 8);
                         *reinterpret_cast<int32_t*>(&dst[i]) = _mm_cvtsi128_si32(_mm_packus_epi16(res, zero));
                     }
-                    return;
+                    fast_done = true;
 #endif
                 }
             }
 
+            if (!fast_done) {
 #if defined(__SSE2__)
             __m128i zero = _mm_setzero_si128();
             __m128i v_fv = _mm_set1_epi16(static_cast<short>(fv));
@@ -1190,6 +1250,7 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
                 u_fixed += du_fixed;
             }
 #endif
+            }
         } else {
             // General Affine Bilinear
 #if defined(__SSE2__)
@@ -1206,10 +1267,12 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
                 uint32_t x1 = pattern_clamp_or_wrap(iu + 1, w, mode_);
                 uint32_t y1 = pattern_clamp_or_wrap(iv + 1, h, mode_);
 
-                int32_t c00 = *reinterpret_cast<const int32_t*>(&src_pixels[y0 * w + x0]);
-                int32_t c10 = *reinterpret_cast<const int32_t*>(&src_pixels[y0 * w + x1]);
-                int32_t c01 = *reinterpret_cast<const int32_t*>(&src_pixels[y1 * w + x0]);
-                int32_t c11 = *reinterpret_cast<const int32_t*>(&src_pixels[y1 * w + x1]);
+                const PremultipliedColorU8* r0 = row_ptr(y0);
+                const PremultipliedColorU8* r1 = row_ptr(y1);
+                int32_t c00 = *reinterpret_cast<const int32_t*>(&r0[x0]);
+                int32_t c10 = *reinterpret_cast<const int32_t*>(&r0[x1]);
+                int32_t c01 = *reinterpret_cast<const int32_t*>(&r1[x0]);
+                int32_t c11 = *reinterpret_cast<const int32_t*>(&r1[x1]);
 
                 __m128i p00 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(c00), zero);
                 __m128i p10 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(c10), zero);
@@ -1243,10 +1306,12 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
                 uint32_t x1 = pattern_clamp_or_wrap(iu + 1, w, mode_);
                 uint32_t y1 = pattern_clamp_or_wrap(iv + 1, h, mode_);
 
-                PremultipliedColorU8 p00 = src_pixels[y0 * w + x0];
-                PremultipliedColorU8 p10 = src_pixels[y0 * w + x1];
-                PremultipliedColorU8 p01 = src_pixels[y1 * w + x0];
-                PremultipliedColorU8 p11 = src_pixels[y1 * w + x1];
+                const PremultipliedColorU8* r0 = row_ptr(y0);
+                const PremultipliedColorU8* r1 = row_ptr(y1);
+                PremultipliedColorU8 p00 = r0[x0];
+                PremultipliedColorU8 p10 = r0[x1];
+                PremultipliedColorU8 p01 = r1[x0];
+                PremultipliedColorU8 p11 = r1[x1];
 
                 uint32_t inv_fu = 256 - fu;
                 uint32_t inv_fv = 256 - fv;
@@ -1280,71 +1345,12 @@ void Pattern::shade_span(float x, float y, uint32_t count, PremultipliedColorU8*
         }
     }
 
-    if (opacity_ < 0.999f) {
-        uint32_t op_u8 = static_cast<uint32_t>(opacity_ * 255.0f + 0.5f) + 1;
-        for (uint32_t i = 0; i < count; ++i) {
-            PremultipliedColorU8 c = dst[i];
-            uint8_t r = static_cast<uint8_t>((c.red() * op_u8) >> 8);
-            uint8_t g = static_cast<uint8_t>((c.green() * op_u8) >> 8);
-            uint8_t b = static_cast<uint8_t>((c.blue() * op_u8) >> 8);
-            uint8_t a = static_cast<uint8_t>((c.alpha() * op_u8) >> 8);
-            dst[i] = PremultipliedColorU8::from_rgba_unchecked(r, g, b, a);
-        }
-    }
+    apply_pattern_opacity(dst, count, opacity_);
 }
 
 // =========================================================================
 // TwoPointConicalGradient
 // =========================================================================
-
-namespace {
-
-inline float solve_conical_t(
-    float px, float py,
-    float start_radius, [[maybe_unused]] float end_radius,
-    float dx, float dy, float dr, float A,
-    bool is_concentric
-) noexcept {
-    if (is_concentric) {
-        float dist = std::hypot(px, py);
-        if (std::abs(dr) > 1e-6f) {
-            return (dist - start_radius) / dr;
-        }
-        return 0.0f;
-    }
-
-    float B = -2.0f * (px * dx + py * dy + start_radius * dr);
-    float C = px * px + py * py - start_radius * start_radius;
-
-    if (std::abs(A) < 1e-7f) {
-        if (std::abs(B) < 1e-7f) return -1.0f;
-        float t = -C / B;
-        if (start_radius + t * dr < 0.0f) return -1.0f;
-        return t;
-    }
-
-    float disc = B * B - 4.0f * A * C;
-    if (disc < 0.0f) return -1.0f;
-
-    float sqrt_disc = std::sqrt(disc);
-    float t1 = (-B - sqrt_disc) / (2.0f * A);
-    float t2 = (-B + sqrt_disc) / (2.0f * A);
-
-    float r1 = start_radius + t1 * dr;
-    float r2 = start_radius + t2 * dr;
-
-    bool v1 = (r1 >= -1e-4f);
-    bool v2 = (r2 >= -1e-4f);
-
-    if (v1 && !v2) return t1;
-    if (v2 && !v1) return t2;
-    if (v1 && v2) {
-        return (dr >= 0.0f) ? t1 : t2;
-    }
-    return -1.0f;
-}
-
-} // namespace
 
 std::optional<TwoPointConicalGradient> TwoPointConicalGradient::create(
     Point start_center,
@@ -1389,11 +1395,11 @@ Color TwoPointConicalGradient::sample(float x, float y) const noexcept {
     float px = p.x - start_center_.x;
     float py = p.y - start_center_.y;
 
-    float t = solve_conical_t(px, py, start_radius_, end_radius_, dx_, dy_, dr_, A_, is_concentric_);
-    if (t < -0.5f) {
+    auto t = solve_conical_t(px, py, start_radius_, end_radius_, dx_, dy_, dr_, A_, is_concentric_);
+    if (!t) {
         return Color::TRANSPARENT;
     }
-    return eval(t);
+    return eval(*t);
 }
 
 PremultipliedColor TwoPointConicalGradient::sample_premul(float x, float y) const noexcept {
@@ -1516,6 +1522,10 @@ const RadialGradient& Shader::radial_gradient() const noexcept {
     return *std::get<std::shared_ptr<RadialGradient>>(complex_);
 }
 
+const SweepGradient& Shader::sweep_gradient() const noexcept {
+    return *std::get<std::shared_ptr<SweepGradient>>(complex_);
+}
+
 const TwoPointConicalGradient& Shader::conical_gradient() const noexcept {
     return *std::get<std::shared_ptr<TwoPointConicalGradient>>(complex_);
 }
@@ -1536,8 +1546,10 @@ bool Shader::is_opaque() const noexcept {
             const auto& ptr = std::get<std::shared_ptr<LinearGradient>>(complex_);
             return ptr ? ptr->colors_are_opaque() : false;
         }
-        case Type::RadialGradient:
-            return false;
+        case Type::RadialGradient: {
+            const auto& ptr = std::get<std::shared_ptr<RadialGradient>>(complex_);
+            return (ptr && !ptr->is_2point()) ? ptr->colors_are_opaque() : false;
+        }
         case Type::SweepGradient: {
             const auto& ptr = std::get<std::shared_ptr<SweepGradient>>(complex_);
             return ptr ? ptr->colors_are_opaque() : false;
@@ -1564,6 +1576,14 @@ bool Shader::has_uniform_alpha() const noexcept {
         const auto& ptr = std::get<std::shared_ptr<LinearGradient>>(complex_);
         return ptr ? ptr->has_uniform_alpha() : true;
     }
+    if (type_ == Type::RadialGradient) {
+        const auto& ptr = std::get<std::shared_ptr<RadialGradient>>(complex_);
+        return (ptr && !ptr->is_2point()) ? ptr->has_uniform_alpha() : false;
+    }
+    if (type_ == Type::SweepGradient) {
+        const auto& ptr = std::get<std::shared_ptr<SweepGradient>>(complex_);
+        return ptr ? ptr->has_uniform_alpha() : true;
+    }
     return false;
 }
 
@@ -1573,6 +1593,14 @@ uint8_t Shader::uniform_alpha() const noexcept {
     }
     if (type_ == Type::LinearGradient) {
         const auto& ptr = std::get<std::shared_ptr<LinearGradient>>(complex_);
+        return ptr ? ptr->uniform_alpha() : 255;
+    }
+    if (type_ == Type::RadialGradient) {
+        const auto& ptr = std::get<std::shared_ptr<RadialGradient>>(complex_);
+        return ptr ? ptr->uniform_alpha() : 255;
+    }
+    if (type_ == Type::SweepGradient) {
+        const auto& ptr = std::get<std::shared_ptr<SweepGradient>>(complex_);
         return ptr ? ptr->uniform_alpha() : 255;
     }
     return 255;
@@ -1773,6 +1801,15 @@ void Shader::shade_span(float x, float y, uint32_t count, PremultipliedColorU8* 
         const auto& ptr = std::get<std::shared_ptr<RadialGradient>>(complex_);
         if (ptr) {
             ptr->shade_span(x, y, count, dst);
+        } else {
+            std::fill_n(dst, count, PremultipliedColorU8::TRANSPARENT);
+        }
+    } else if (type_ == Type::SweepGradient) {
+        const auto& ptr = std::get<std::shared_ptr<SweepGradient>>(complex_);
+        if (ptr) {
+            for (uint32_t i = 0; i < count; ++i) {
+                dst[i] = ptr->sample_premul(x + static_cast<float>(i), y).to_color_u8();
+            }
         } else {
             std::fill_n(dst, count, PremultipliedColorU8::TRANSPARENT);
         }

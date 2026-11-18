@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <span>
 #include <vector>
 #include <optional>
 #include "nisaba/gpu/types.hpp"
@@ -25,6 +26,7 @@ struct GpuCanvasState {
     nisaba::Transform transform{};
     std::optional<ScreenIntRect> scissor_clip{};
     int stencil_clip_depth{0};
+    bool is_layer{false};
 };
 
 /// High-level, hardware-accelerated GPU Canvas bridging Nisaba 2D to the sovereign C++20 GPU engine.
@@ -45,7 +47,16 @@ public:
 
     // State stack
     void save() override;
+    void save_layer(const nisaba::Paint& paint = nisaba::Paint(nisaba::Color::WHITE)) override;
+    void save_layer_bounds(const nisaba::Rect& bounds, const nisaba::Paint& paint = nisaba::Paint(nisaba::Color::WHITE)) override;
+    void save_layer_backdrop(
+        std::optional<nisaba::Rect> bounds = std::nullopt,
+        const nisaba::Paint& paint = nisaba::Paint(nisaba::Color::WHITE),
+        float blur_sigma = 0.0f
+    ) override;
     void restore() override;
+    /// Invalidates cached GPU/GL state when sharing the underlying context with an external embedder.
+    void reset_state() noexcept;
     void reset_transform() noexcept;
     void set_transform(const nisaba::Transform& ts) noexcept;
     [[nodiscard]] const nisaba::Transform& transform() const noexcept { return current_transform_; }
@@ -53,7 +64,8 @@ public:
 
     void translate(float dx, float dy) noexcept override;
     void scale(float sx, float sy) noexcept override;
-    void rotate(float degrees) noexcept;
+    void rotate(float degrees) noexcept override;
+    void skew(float kx, float ky) noexcept override;
     void concat(const nisaba::Transform& ts) noexcept override;
 
     // Clipping
@@ -70,10 +82,10 @@ public:
 
     // Drawing primitives
     void fill_rect(const nisaba::Rect& rect, const nisaba::Paint& paint) override;
-    void stroke_rect(const nisaba::Rect& rect, const nisaba::Paint& paint, const nisaba::Stroke& stroke);
+    void stroke_rect(const nisaba::Rect& rect, const nisaba::Paint& paint, const nisaba::Stroke& stroke) override;
 
-    void fill_round_rect(const nisaba::Rect& rect, float rx, float ry, const nisaba::Paint& paint);
-    void stroke_round_rect(const nisaba::Rect& rect, float rx, float ry, const nisaba::Paint& paint, const nisaba::Stroke& stroke);
+    void fill_round_rect(const nisaba::Rect& rect, float rx, float ry, const nisaba::Paint& paint) override;
+    void stroke_round_rect(const nisaba::Rect& rect, float rx, float ry, const nisaba::Paint& paint, const nisaba::Stroke& stroke) override;
 
     void fill_rrect(const nisaba::Rect& rect, const nisaba::BorderRadius& radii, const nisaba::Paint& paint);
     void stroke_rrect(const nisaba::Rect& rect, const nisaba::BorderRadius& radii, const nisaba::Paint& paint, const nisaba::Stroke& stroke);
@@ -81,6 +93,20 @@ public:
     void stroke_rrect(const nisaba::RRect& rrect, const nisaba::Paint& paint, const nisaba::Stroke& stroke) override;
     void clip_rrect(const nisaba::RRect& rrect) override;
     void clip_rrect(const nisaba::Rect& rect, const nisaba::BorderRadius& radii);
+
+    void fill_oval(const nisaba::Rect& oval, const nisaba::Paint& paint) override;
+    void stroke_oval(const nisaba::Rect& oval, const nisaba::Paint& paint, const nisaba::Stroke& stroke) override;
+    void clip_oval(const nisaba::Rect& oval) override;
+
+    void fill_drrect(const nisaba::RRect& outer, const nisaba::RRect& inner, const nisaba::Paint& paint) override;
+    void stroke_drrect(const nisaba::RRect& outer, const nisaba::RRect& inner, const nisaba::Paint& paint, const nisaba::Stroke& stroke) override;
+
+    void draw_points(
+        nisaba::PointMode mode,
+        std::span<const nisaba::Point> points,
+        const nisaba::Paint& paint,
+        const nisaba::Stroke& stroke = nisaba::Stroke{}
+    ) override;
 
     void fill_circle(float cx, float cy, float radius, const nisaba::Paint& paint);
     void stroke_circle(float cx, float cy, float radius, const nisaba::Paint& paint, const nisaba::Stroke& stroke);
@@ -92,16 +118,41 @@ public:
     void stroke_path(const nisaba::Path& path, const nisaba::Paint& paint, const nisaba::Stroke& stroke) override;
 
     void draw_pixmap(int32_t x, int32_t y, const PixmapRef& src, const PixmapPaint& paint = PixmapPaint()) override;
+    void draw_pixmap_rect(const PixmapRef& src, const nisaba::Rect& src_rect, const nisaba::Rect& dst_rect, const PixmapPaint& paint = PixmapPaint()) override;
+    using ICanvas::draw_pixmap_rect;
+    void draw_pixmap_3d(
+        const PixmapRef& src,
+        const nisaba::Rect& src_rect,
+        const Transform4x4& transform3d,
+        float opacity = 1.0f,
+        BlendMode blend_mode = BlendMode::SourceOver
+    );
+    void draw_pixmap_3d(
+        const PixmapRef& src,
+        const Transform4x4& transform3d,
+        float opacity = 1.0f,
+        BlendMode blend_mode = BlendMode::SourceOver
+    ) override;
     void draw_gpu_texture(int32_t x, int32_t y, const std::shared_ptr<GpuTexture>& texture, const PixmapPaint& paint = PixmapPaint());
+    void draw_gpu_texture_rect(const std::shared_ptr<GpuTexture>& texture, const nisaba::Rect& src_rect, const nisaba::Rect& dst_rect, const PixmapPaint& paint = PixmapPaint());
+    void draw_gpu_texture_rect(const std::shared_ptr<GpuTexture>& texture, const nisaba::Rect& dst_rect, const PixmapPaint& paint = PixmapPaint());
 
     void draw_vertices(const nisaba::Vertices& vertices, BlendMode blend_mode = BlendMode::SourceOver, float opacity = 1.0f);
     void draw_textured_vertices(const nisaba::Vertices& vertices, const std::shared_ptr<GpuTexture>& texture, BlendMode blend_mode = BlendMode::SourceOver, float opacity = 1.0f);
+    void draw_textured_vertices(const nisaba::Vertices& vertices, const PixmapRef& texture, BlendMode blend_mode = BlendMode::SourceOver, float opacity = 1.0f);
 
     // --- Effects & Glassmorphism ---
     void draw_round_rect_shadow(const nisaba::Rect& rect, float rx, float ry, const effects::DropShadow& shadow);
     void draw_rrect_shadow(const nisaba::Rect& rect, const nisaba::BorderRadius& radii, const effects::DropShadow& shadow);
     void draw_rrect_shadow(const nisaba::RRect& rrect, const effects::DropShadow& shadow);
     void draw_rect_shadow(const nisaba::Rect& rect, const effects::DropShadow& shadow);
+    void draw_circle_shadow(float cx, float cy, float radius, const effects::DropShadow& shadow);
+    void draw_path_shadow(const nisaba::Path& path, const effects::DropShadow& shadow, nisaba::FillRule fill_rule = nisaba::FillRule::Winding);
+    void draw_path_with_shadow(const nisaba::Path& path, const nisaba::Paint& paint, const effects::DropShadow& shadow, nisaba::FillRule fill_rule = nisaba::FillRule::Winding) override;
+    void draw_rect_with_shadow(const nisaba::Rect& rect, const nisaba::Paint& paint, const effects::DropShadow& shadow) override;
+    void draw_round_rect_with_shadow(const nisaba::Rect& rect, float rx, float ry, const nisaba::Paint& paint, const effects::DropShadow& shadow) override;
+    void draw_rrect_with_shadow(const nisaba::RRect& rrect, const nisaba::Paint& paint, const effects::DropShadow& shadow) override;
+    void draw_circle_with_shadow(float cx, float cy, float radius, const nisaba::Paint& paint, const effects::DropShadow& shadow) override;
     void draw_glow(const nisaba::Rect& rect, float rx, float ry, nisaba::Color glow_color, float radius);
     void draw_glass_panel(const nisaba::Rect& rect, float rx, float ry, const effects::GlassParams& params);
     void draw_glass_panel(const nisaba::Rect& rect, const nisaba::BorderRadius& radii, const effects::GlassParams& params);
@@ -138,6 +189,7 @@ private:
     std::shared_ptr<GpuSurface> surface_;
     std::unique_ptr<Context> context_;
     bool in_frame_{false};
+    bool needs_surface_bind_{false};
 
     nisaba::Transform current_transform_{};
     std::optional<ScreenIntRect> scissor_clip_{};
@@ -153,9 +205,47 @@ private:
         bool valid{false};
     } backdrop_cache_{};
 
+    struct GradLutEntry {
+        uint64_t key{0};
+        int img_id{0};
+    };
+    std::vector<GradLutEntry> grad_lut_cache_{};
+
+    struct PixmapTexCacheEntry {
+        const void* data_ptr{nullptr};
+        uint32_t width{0};
+        uint32_t height{0};
+        uint32_t stride{0};
+        PixelFormat format{PixelFormat::RGBA8888};
+        int flags{0};
+        uint64_t content_hash{0};
+        uint64_t last_used_frame{0};
+        uint64_t last_use_seq{0};
+        size_t byte_size{0};
+        int img_id{0};
+    };
+    std::vector<PixmapTexCacheEntry> pixmap_tex_cache_{};
+    size_t pixmap_cache_bytes_{0};
+    uint64_t frame_counter_{1};
+    uint64_t pixmap_use_seq_{0};
+
+    [[nodiscard]] int get_or_upload_pixmap(const PixmapRef& src, int flags);
+    [[nodiscard]] int get_or_create_grad_lut(const nisaba::Gradient& grad);
+    void populate_gradient_stops_and_xform(const nisaba::Gradient& grad, Paint& gp);
+
+    [[nodiscard]] Paint build_gpu_paint(const nisaba::Paint& paint);
     void apply_fill_paint(const nisaba::Paint& paint);
     void apply_stroke(const nisaba::Stroke& stroke, const nisaba::Paint& paint);
+    void push_layer_internal(std::optional<nisaba::Rect> bounds, const nisaba::Paint& paint, bool with_backdrop, float blur_sigma);
+    template <typename DrawFn>
+    void draw_with_image_filter(
+        const std::optional<nisaba::Rect>& local_bounds,
+        const nisaba::Paint& paint,
+        float extra_margin,
+        DrawFn&& draw_fn
+    );
     void ensure_frame();
+    void flush_internal(const ScreenIntRect* damage_rect, const std::vector<ScreenIntRect>* damage_rects);
 };
 
 } // namespace nisaba::gpu

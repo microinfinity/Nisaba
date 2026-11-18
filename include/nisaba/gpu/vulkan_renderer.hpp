@@ -31,9 +31,11 @@ public:
     GpuBackendType backendType() const override { return GpuBackendType::Vulkan; }
 
     int createTexture(TextureType type, int width, int height, int imageFlags, const unsigned char* data) override;
+    int createTextureWithStride(TextureType type, int width, int height, int strideBytes, int imageFlags, const unsigned char* data) override;
     bool deleteTexture(int image) override;
     bool updateTexture(int image, int x, int y, int width, int height, const unsigned char* data) override;
     bool getTextureSize(int image, int& outWidth, int& outHeight) override;
+    int textureFlags(int image) const override;
     int createTextureFromNativeHandle(uint64_t handle, int w, int h, int imageFlags) override;
 
     void viewport(float width, float height, float devicePixelRatio) override;
@@ -51,6 +53,11 @@ public:
     void renderTriangles(const Paint& paint, const CompositeOperationState& compOp,
                          const Scissor& scissor, const Vertex* verts, int nverts,
                          float fringe, int shaderType = 3) override;
+
+    void renderClip(const RenderPath* paths, int npaths, Winding winding, int targetDepth,
+                    const Scissor& scissor, const float* bounds) override;
+    void restoreClip(int targetDepth) override;
+    void resetClip() override;
 
     void setTargetSurface(VulkanSurface* surface);
     void setCommandBuffer(VkCommandBuffer cmd);

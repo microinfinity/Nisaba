@@ -266,6 +266,75 @@ public:
         }
     }
 
+    /// Appends an elliptical arc bounded by `oval`, with start and sweep angles in degrees.
+    /// When `use_center` is true, creates a closed pie wedge connected to the oval center.
+    void push_arc(
+        const Rect& oval,
+        float start_deg,
+        float sweep_deg,
+        bool use_center = false,
+        bool force_move_to = false
+    ) {
+        const float rx = oval.width() * 0.5f;
+        const float ry = oval.height() * 0.5f;
+        if (rx <= 0.0f || ry <= 0.0f || std::abs(sweep_deg) < 1e-6f) return;
+
+        const float cx = oval.left() + rx;
+        const float cy = oval.top() + ry;
+
+        constexpr float kDegToRad = static_cast<float>(M_PI) / 180.0f;
+        const float clamped_sweep_deg = std::clamp(sweep_deg, -360.0f, 360.0f);
+        const float start_rad = start_deg * kDegToRad;
+        const float sweep_rad = clamped_sweep_deg * kDegToRad;
+
+        int n_splits = static_cast<int>(std::ceil(std::abs(sweep_rad) / (static_cast<float>(M_PI) * 0.5f)));
+        n_splits = std::clamp(n_splits, 1, 8);
+        const float step = sweep_rad / static_cast<float>(n_splits);
+        const float k = (4.0f / 3.0f) * std::tan(step * 0.25f);
+
+        float cur_a = start_rad;
+        float cos_a = std::cos(cur_a);
+        float sin_a = std::sin(cur_a);
+        float x0 = cx + rx * cos_a;
+        float y0 = cy + ry * sin_a;
+
+        if (use_center) {
+            move_to(cx, cy);
+            line_to(x0, y0);
+        } else if (force_move_to || verbs_.empty() || move_to_required_) {
+            move_to(x0, y0);
+        } else {
+            line_to(x0, y0);
+        }
+
+        for (int i = 0; i < n_splits; ++i) {
+            const float next_a = cur_a + step;
+            const float cos_next = std::cos(next_a);
+            const float sin_next = std::sin(next_a);
+
+            const float cp1_x = x0 - k * rx * sin_a;
+            const float cp1_y = y0 + k * ry * cos_a;
+
+            const float x1 = cx + rx * cos_next;
+            const float y1 = cy + ry * sin_next;
+
+            const float cp2_x = x1 + k * rx * sin_next;
+            const float cp2_y = y1 - k * ry * cos_next;
+
+            cubic_to(cp1_x, cp1_y, cp2_x, cp2_y, x1, y1);
+
+            cur_a = next_a;
+            cos_a = cos_next;
+            sin_a = sin_next;
+            x0 = x1;
+            y0 = y1;
+        }
+
+        if (use_center) {
+            close();
+        }
+    }
+
     void push_rounded_rect(const Rect& rect, float rx, float ry) {
         float max_rx = scalar::half(rect.width());
         float max_ry = scalar::half(rect.height());

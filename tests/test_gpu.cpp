@@ -1,8 +1,15 @@
+#include <GL/glew.h>
+#include <GL/gl.h>
 #include <cassert>
 #include <iostream>
 #include <cmath>
 #include <fstream>
+#include <array>
+#include <vector>
 #include "nisaba/nisaba.hpp"
+#include "nisaba/gpu/gpu_blur.hpp"
+#include "nisaba/svg/svg_document.hpp"
+#include "nisaba/lottie/animation.hpp"
 #include "nisaba/text/ttf_font.hpp"
 #include "nisaba/text/buffer.hpp"
 #include "nisaba/text/font_system.hpp"
@@ -665,7 +672,1798 @@ void test_gpu_backdrop_blur() {
     canvas.draw_backdrop_blur(asym_rrect, 10.0f);
     canvas.flush();
 
+    // 6. Verify vertical orientation (top stays top, bottom stays bottom across rect & rrect)
+    for (int sample_count : {0, 1, 4}) {
+        auto v_surf = GpuSurface::create(device, 200, 200, sample_count);
+        assert(v_surf != nullptr);
+        GpuCanvas v_canvas(v_surf);
+
+        auto check_vertical = [&](const BorderRadius& br) {
+            v_canvas.clear(Color::BLACK);
+            v_canvas.fill_rect(*Rect::from_xywh(0.0f, 0.0f, 200.0f, 100.0f), Paint(RED));
+            v_canvas.fill_rect(*Rect::from_xywh(0.0f, 100.0f, 200.0f, 100.0f), Paint(BLUE));
+            v_canvas.draw_backdrop_blur(*Rect::from_xywh(20.0f, 20.0f, 160.0f, 160.0f), br, 8.0f);
+            v_canvas.flush();
+            auto v_pm = v_surf->to_pixmap();
+            assert(v_pm.has_value());
+            auto top_px = v_pm->as_ref().pixel(100, 40);
+            auto bot_px = v_pm->as_ref().pixel(100, 160);
+            assert(top_px.has_value() && bot_px.has_value());
+            assert(top_px->r > 200 && top_px->b < 30);
+            assert(bot_px->b > 200 && bot_px->r < 30);
+        };
+
+        check_vertical(BorderRadius::zero());
+        check_vertical(BorderRadius::all(12.0f));
+        check_vertical(BorderRadius(40.0f, 12.0f, 40.0f, 12.0f));
+    }
+
     std::cout << "  -> Hardware GPU Dual-Kawase Backdrop Blur OK (Seam blending verified, sharpness preserved)" << std::endl;
+}
+
+void test_gpu_stage0_stability() {
+    std::cout << "Testing Stage 0 GPU & path/gradient fixes..." << std::endl;
+
+    auto device = GpuDevice::create();
+    assert(device != nullptr);
+
+    // 1. Mid-frame flush() inside active clip_path preserves stencil clip depth
+    {
+        auto surface = GpuSurface::create(device, 200, 200, 1);
+        assert(surface != nullptr);
+        GpuCanvas canvas(surface);
+
+        canvas.clear(Color::WHITE);
+        PathBuilder pb;
+        pb.push_circle(100.0f, 100.0f, 40.0f);
+        auto circle_clip = pb.finish();
+        assert(circle_clip.has_value());
+
+        canvas.save();
+        canvas.clip_path(*circle_clip);
+        assert(canvas.stencil_clip_depth() == 1);
+
+        canvas.fill_rect(*Rect::from_xywh(0.0f, 0.0f, 100.0f, 200.0f), Paint(RED));
+        canvas.flush(); // Mid-frame flush while clipped
+
+        assert(canvas.stencil_clip_depth() == 1);
+        canvas.fill_rect(*Rect::from_xywh(100.0f, 0.0f, 100.0f, 200.0f), Paint(BLUE));
+        canvas.restore();
+        assert(canvas.stencil_clip_depth() == 0);
+        canvas.flush();
+
+        auto pm = surface->to_pixmap();
+        assert(pm.has_value());
+        auto in_left = pm->as_ref().pixel(80, 100);
+        auto in_right = pm->as_ref().pixel(120, 100);
+        auto out_left = pm->as_ref().pixel(20, 100);
+        auto out_right = pm->as_ref().pixel(180, 100);
+        assert(in_left && in_left->r > 200 && in_left->g < 30 && in_left->b < 30);
+        assert(in_right && in_right->b > 200 && in_right->r < 30 && in_right->g < 30);
+        assert(out_left && out_left->r > 200 && out_left->g > 200 && out_left->b > 200);
+        assert(out_right && out_right->r > 200 && out_right->g > 200 && out_right->b > 200);
+    }
+
+    // 2. Partial damage resolve Y-flip with MSAA=4 & >32 nested saves
+    {
+        auto surface = GpuSurface::create(device, 200, 200, 4);
+        assert(surface != nullptr);
+        GpuCanvas canvas(surface);
+
+        canvas.clear(Color::WHITE);
+        for (int i = 0; i < 40; ++i) {
+            canvas.save();
+            canvas.translate(1.0f, 0.0f);
+        }
+        for (int i = 0; i < 40; ++i) {
+            canvas.restore();
+        }
+        assert(std::abs(canvas.current_transform().tx) < 1e-4f);
+
+        canvas.fill_rect(*Rect::from_xywh(0.0f, 0.0f, 50.0f, 50.0f), Paint(RED));
+        auto dmg = ScreenIntRect::from_xywh(0, 0, 50, 50);
+        assert(dmg.has_value());
+        canvas.flush(*dmg);
+
+        auto pm = surface->to_pixmap();
+        assert(pm.has_value());
+        auto top_left = pm->as_ref().pixel(25, 25);
+        assert(top_left && top_left->r > 200 && top_left->g < 30 && top_left->b < 30);
+    }
+
+    // 3. Path::reset() bounds and RadialGradient::create_2point negative t wrapping
+    {
+        PathBuilder pb;
+        pb.push_rect(*Rect::from_xywh(10.0f, 10.0f, 50.0f, 50.0f));
+        auto p = pb.finish();
+        assert(p.has_value());
+        assert(!p->bounds().is_empty());
+        p->reset();
+        assert(p->is_empty() && p->bounds().is_empty());
+
+        auto g2 = RadialGradient::create_2point(
+            Point::from_xy(50.0f, 50.0f), 20.0f,
+            Point::from_xy(50.0f, 50.0f), 40.0f,
+            {GradientStop::create(0.0f, RED), GradientStop::create(1.0f, BLUE)},
+            SpreadMode::Reflect
+        );
+        assert(g2.has_value());
+        Color c = g2->sample(50.0f, 50.0f); // dist=0 => t=-1.0 => Reflect(1.0) => BLUE
+        assert(c.alpha() > 0.9f && c.blue() > 0.9f);
+    }
+
+    std::cout << "  -> Stage 0 GPU & path/gradient fixes OK" << std::endl;
+}
+
+void test_gpu_vertices_and_pixmap_rect() {
+    std::cout << "Testing GPU Vertices, Strided BGRA8888 PixmapRef, and draw_pixmap_rect..." << std::endl;
+    auto device = GpuDevice::create();
+    assert(device != nullptr);
+
+    // Construct a strided 4x4 BGRA8888 raw buffer (stride = 24 bytes: 16B pixels + 8B 0xAA sentinel)
+    std::vector<uint8_t> raw_bgra(24 * 4, 0xAA);
+    auto set_bgra = [&](uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+        size_t off = y * 24 + x * 4;
+        raw_bgra[off + 0] = b;
+        raw_bgra[off + 1] = g;
+        raw_bgra[off + 2] = r;
+        raw_bgra[off + 3] = a;
+    };
+    for (uint32_t y = 0; y < 4; ++y) {
+        for (uint32_t x = 0; x < 4; ++x) {
+            set_bgra(x, y, 0, 0, 0, 255);
+        }
+    }
+    // Top-left 2x2 texels: (0,0)=Red, (1,0)=Green, (0,1)=Blue, (1,1)=White
+    set_bgra(0, 0, 255, 0, 0, 255);
+    set_bgra(1, 0, 0, 255, 0, 255);
+    set_bgra(0, 1, 0, 0, 255, 255);
+    set_bgra(1, 1, 255, 255, 255, 255);
+
+    auto bgra_ref = PixmapRef::from_raw_parts(raw_bgra.data(), 4, 4, 24, PixelFormat::BGRA8888);
+    assert(bgra_ref.has_value());
+    assert(bgra_ref->stride_bytes() == 24);
+
+    // Check CPU PixmapMut::is_opaque ignores padding sentinel & painter::draw_pixmap_rect works
+    {
+        auto owned = bgra_ref->to_owned();
+        assert(owned.is_opaque());
+        auto cpu_pm = Pixmap::allocate(40, 40);
+        assert(cpu_pm.has_value());
+        Canvas cpu_canvas(cpu_pm->as_mut());
+        cpu_canvas.clear(Color::BLACK);
+        PixmapPaint pp;
+        pp.quality = FilterQuality::Nearest;
+        auto srect = Rect::from_xywh(0.0f, 0.0f, 2.0f, 2.0f);
+        auto drect = Rect::from_xywh(0.0f, 0.0f, 40.0f, 40.0f);
+        cpu_canvas.draw_pixmap_rect(*bgra_ref, *srect, *drect, pp);
+        auto p00 = cpu_pm->as_ref().pixel(5, 5);
+        auto p10 = cpu_pm->as_ref().pixel(35, 5);
+        auto p01 = cpu_pm->as_ref().pixel(5, 35);
+        auto p11 = cpu_pm->as_ref().pixel(35, 35);
+        assert(p00 && p00->r > 240 && p00->g < 10 && p00->b < 10);
+        assert(p10 && p10->g > 240 && p10->r < 10 && p10->b < 10);
+        assert(p01 && p01->b > 240 && p01->r < 10 && p01->g < 10);
+        assert(p11 && p11->r > 240 && p11->g > 240 && p11->b > 240);
+    }
+
+    auto surface = GpuSurface::create(device, 260, 220, 1);
+    assert(surface != nullptr);
+    GpuCanvas canvas(surface);
+    canvas.clear(Color::BLACK);
+
+    // 1. draw_pixmap_rect sub-rect [0..2, 0..2] -> [10..90, 10..90] with FilterQuality::Nearest
+    {
+        PixmapPaint pp;
+        pp.quality = FilterQuality::Nearest;
+        auto src_r = Rect::from_xywh(0.0f, 0.0f, 2.0f, 2.0f);
+        auto dst_r = Rect::from_xywh(10.0f, 10.0f, 80.0f, 80.0f);
+        canvas.draw_pixmap_rect(*bgra_ref, *src_r, *dst_r, pp);
+    }
+
+    // 2. draw_pixmap_rect with tint Color(120, 200, 50, 255) on White texel (1,1) -> [100..140, 10..50]
+    {
+        PixmapPaint pp;
+        pp.quality = FilterQuality::Nearest;
+        pp.tint = Color::from_rgba8(120, 200, 50, 255);
+        auto src_r = Rect::from_xywh(1.0f, 1.0f, 1.0f, 1.0f);
+        auto dst_r = Rect::from_xywh(100.0f, 10.0f, 40.0f, 40.0f);
+        canvas.draw_pixmap_rect(*bgra_ref, *src_r, *dst_r, pp);
+    }
+
+    // 3. draw_pixmap_rect with BlendMode::Plus (Green over Red -> Yellow) -> [100..140, 60..100]
+    {
+        auto r = Rect::from_xywh(100.0f, 60.0f, 40.0f, 40.0f);
+        canvas.fill_rect(*r, Paint(RED));
+        PixmapPaint pp;
+        pp.quality = FilterQuality::Nearest;
+        pp.blend_mode = BlendMode::Plus;
+        auto src_r = Rect::from_xywh(1.0f, 0.0f, 1.0f, 1.0f); // Green texel
+        canvas.draw_pixmap_rect(*bgra_ref, *src_r, *r, pp);
+    }
+
+    // 4. draw_gpu_texture_rect from GpuTexture::create_from_pixmap(*bgra_ref) with Nearest -> [160..240, 10..90]
+    {
+        auto tex = nisaba::gpu::GpuTexture::create_from_pixmap(device, *bgra_ref);
+        assert(tex != nullptr);
+        PixmapPaint pp;
+        pp.quality = FilterQuality::Nearest;
+        auto src_r = Rect::from_xywh(0.0f, 0.0f, 2.0f, 2.0f);
+        auto dst_r = Rect::from_xywh(160.0f, 10.0f, 80.0f, 80.0f);
+        canvas.draw_gpu_texture_rect(tex, *src_r, *dst_r, pp);
+    }
+
+    // 5. Gouraud TriangleStrip (both CCW & CW tris!) -> [10..90, 110..190]
+    {
+        auto verts = Vertices::create_triangle_strip(
+            {Point::from_xy(10.0f, 110.0f), Point::from_xy(10.0f, 190.0f),
+             Point::from_xy(90.0f, 110.0f), Point::from_xy(90.0f, 190.0f)},
+            {RED, BLUE, GREEN, Color::WHITE}
+        );
+        canvas.draw_vertices(verts, BlendMode::SourceOver, 1.0f);
+    }
+
+    // 6. Textured Vertices (pixel tex_coords into strided BGRA8888 PixmapRef) -> [110..190, 110..190]
+    {
+        auto verts = Vertices::create_triangle_strip(
+            {Point::from_xy(110.0f, 110.0f), Point::from_xy(110.0f, 190.0f),
+             Point::from_xy(190.0f, 110.0f), Point::from_xy(190.0f, 190.0f)},
+            {},
+            {Point::from_xy(0.0f, 0.0f), Point::from_xy(0.0f, 2.0f),
+             Point::from_xy(2.0f, 0.0f), Point::from_xy(2.0f, 2.0f)}
+        );
+        canvas.draw_textured_vertices(verts, *bgra_ref, BlendMode::SourceOver, 1.0f);
+    }
+
+    canvas.flush();
+    auto pm = surface->to_pixmap();
+    assert(pm.has_value());
+    const auto pm_ref = pm->as_ref();
+
+    // Verify 1: sub-rect Nearest crisp step across texel boundary at x=50 (dst=[10..90])
+    auto p_tl = pm_ref.pixel(20, 20);
+    auto p_step_l = pm_ref.pixel(48, 20);
+    auto p_step_r = pm_ref.pixel(52, 20);
+    auto p_bl = pm_ref.pixel(20, 70);
+    auto p_br = pm_ref.pixel(70, 70);
+    assert(p_tl && p_tl->r > 240 && p_tl->g < 10 && p_tl->b < 10);
+    assert(p_step_l && p_step_l->r > 240 && p_step_l->g < 10);
+    assert(p_step_r && p_step_r->g > 240 && p_step_r->r < 10);
+    assert(p_bl && p_bl->b > 240 && p_bl->r < 10 && p_bl->g < 10);
+    assert(p_br && p_br->r > 240 && p_br->g > 240 && p_br->b > 240);
+
+    // Verify 2: tint modulation
+    auto p_tint = pm_ref.pixel(120, 30);
+    assert(p_tint && std::abs(int(p_tint->r) - 120) <= 3 &&
+           std::abs(int(p_tint->g) - 200) <= 3 &&
+           std::abs(int(p_tint->b) - 50) <= 3);
+
+    // Verify 3: BlendMode::Plus
+    auto p_plus = pm_ref.pixel(120, 80);
+    assert(p_plus && p_plus->r > 240 && p_plus->g > 240 && p_plus->b < 10);
+
+    // Verify 4: GpuTexture Nearest sub-rect
+    auto p_gt_tl = pm_ref.pixel(180, 30);
+    auto p_gt_tr = pm_ref.pixel(220, 30);
+    assert(p_gt_tl && p_gt_tl->r > 240 && p_gt_tl->g < 10);
+    assert(p_gt_tr && p_gt_tr->g > 240 && p_gt_tr->r < 10);
+
+    // Verify 5: Gouraud TriangleStrip (both CCW tri0 and CW tri1 rendered!)
+    auto g_tl = pm_ref.pixel(15, 115);
+    auto g_bl = pm_ref.pixel(15, 185);
+    auto g_tr = pm_ref.pixel(85, 115);
+    auto g_br = pm_ref.pixel(85, 185);
+    assert(g_tl && g_tl->r > 180 && g_tl->b < 80);
+    assert(g_bl && g_bl->b > 180 && g_bl->r < 80);
+    assert(g_tr && g_tr->g > 180 && g_tr->b < 80);
+    assert(g_br && g_br->r > 180 && g_br->g > 180 && g_br->b > 180);
+
+    // Verify 6: Textured Vertices UVs in pixel coords
+    auto tv_tl = pm_ref.pixel(120, 120);
+    auto tv_tr = pm_ref.pixel(165, 120);
+    auto tv_bl = pm_ref.pixel(120, 165);
+    assert(tv_tl && tv_tl->r > 180 && tv_tl->b < 60);
+    assert(tv_tr && tv_tr->g > 180 && tv_tr->r < 60);
+    assert(tv_bl && tv_bl->b > 180 && tv_bl->r < 60);
+
+    // Verify 7: Default PixmapPaint (Bilinear) & mipmapped downscaling avoid nearest-neighbor pixelation
+    {
+        auto q_surf = GpuSurface::create(device, 120, 60, 1);
+        assert(q_surf != nullptr);
+        GpuCanvas q_canvas(q_surf);
+        q_canvas.clear(Color::BLACK);
+
+        // 7a: 2x1 Red|Green stretched 0..80 with default PixmapPaint{} must blend across midpoint x=40
+        auto pair_pm = Pixmap::allocate(2, 1, PixelFormat::RGBA8888);
+        assert(pair_pm.has_value());
+        pair_pm->as_mut().set_pixel(0, 0, PremultipliedColorU8::from_rgba_unchecked(255, 0, 0, 255));
+        pair_pm->as_mut().set_pixel(1, 0, PremultipliedColorU8::from_rgba_unchecked(0, 255, 0, 255));
+        q_canvas.draw_pixmap_rect(
+            pair_pm->as_ref(),
+            *Rect::from_xywh(0.0f, 0.0f, 2.0f, 1.0f),
+            *Rect::from_xywh(0.0f, 0.0f, 80.0f, 20.0f)
+        );
+        auto pair_tex = nisaba::gpu::GpuTexture::create_from_pixmap(device, pair_pm->as_ref());
+        assert(pair_tex != nullptr);
+        q_canvas.draw_gpu_texture_rect(
+            pair_tex,
+            *Rect::from_xywh(0.0f, 0.0f, 2.0f, 1.0f),
+            *Rect::from_xywh(0.0f, 24.0f, 80.0f, 20.0f)
+        );
+
+        // 7b: 128x128 1px B/W checkerboard downscaled 16x -> 8x8 must average to mid-gray via mipmaps
+        auto cb_pm = Pixmap::allocate(128, 128, PixelFormat::RGBA8888);
+        assert(cb_pm.has_value());
+        for (uint32_t y = 0; y < 128; ++y) {
+            for (uint32_t x = 0; x < 128; ++x) {
+                const uint8_t v = ((x ^ y) & 1u) ? 255 : 0;
+                cb_pm->as_mut().set_pixel(x, y, PremultipliedColorU8::from_rgba_unchecked(v, v, v, 255));
+            }
+        }
+        q_canvas.draw_pixmap_rect(
+            cb_pm->as_ref(),
+            *Rect::from_xywh(0.0f, 0.0f, 128.0f, 128.0f),
+            *Rect::from_xywh(90.0f, 10.0f, 8.0f, 8.0f)
+        );
+        q_canvas.flush();
+
+        auto q_out = q_surf->to_pixmap();
+        assert(q_out.has_value());
+        auto seam_pm = q_out->as_ref().pixel(40, 10);
+        auto seam_tex = q_out->as_ref().pixel(40, 34);
+        auto down_px = q_out->as_ref().pixel(94, 14);
+        assert(seam_pm && seam_pm->r > 80 && seam_pm->g > 80);
+        assert(seam_tex && seam_tex->r > 80 && seam_tex->g > 80);
+        assert(down_px && down_px->r >= 80 && down_px->r <= 175 &&
+               std::abs(int(down_px->r) - int(down_px->g)) <= 5);
+    }
+
+    std::cout << "  -> GPU Vertices, Strided BGRA8888 & draw_pixmap_rect OK" << std::endl;
+}
+
+void test_gpu_dashed_strokes() {
+    std::cout << "Testing GPU Dashed Strokes & Odd-Length Dash Patterns..." << std::endl;
+    auto device = GpuDevice::create();
+    assert(device != nullptr);
+    auto surface = GpuSurface::create(device, 220, 220, 1);
+    assert(surface != nullptr);
+    GpuCanvas canvas(surface);
+    canvas.clear(Color::BLACK);
+
+    // 1. Even dash {20, 20} on line (20,30)->(180,30)
+    {
+        Stroke s(6.0f);
+        s.dash = StrokeDash::create({20.0f, 20.0f}, 0.0f);
+        assert(s.dash.has_value());
+        canvas.stroke_line(20.0f, 30.0f, 180.0f, 30.0f, Paint(RED), s);
+    }
+
+    // 2. Odd-length dash {15} on line (20,60)->(140,60) -> auto-duplicates to {15, 15}
+    {
+        Stroke s(6.0f);
+        s.dash = StrokeDash::create({15.0f}, 0.0f);
+        assert(s.dash.has_value());
+        canvas.stroke_line(20.0f, 60.0f, 140.0f, 60.0f, Paint(GREEN), s);
+    }
+
+    // 3. Dashed stroke_rect {16, 16} at (20, 90, 100, 50)
+    {
+        Stroke s(4.0f);
+        s.dash = StrokeDash::create({16.0f, 16.0f}, 0.0f);
+        assert(s.dash.has_value());
+        canvas.stroke_rect(*Rect::from_xywh(20.0f, 90.0f, 100.0f, 50.0f), Paint(BLUE), s);
+    }
+
+    // 4. Dashed stroke_circle {15, 15} at (160, 165) r=25
+    {
+        Stroke s(4.0f);
+        s.dash = StrokeDash::create({15.0f, 15.0f}, 0.0f);
+        assert(s.dash.has_value());
+        canvas.stroke_circle(160.0f, 165.0f, 25.0f, Paint(YELLOW), s);
+    }
+
+    // 5. Elliptical fill_round_rect (rx=30, ry=8) at (20, 165, 80, 40)
+    {
+        canvas.fill_round_rect(*Rect::from_xywh(20.0f, 165.0f, 80.0f, 40.0f), 30.0f, 8.0f, Paint(CYAN));
+    }
+
+    canvas.flush();
+    auto pm = surface->to_pixmap();
+    assert(pm.has_value());
+    const auto r = pm->as_ref();
+
+    // Check line dashes vs gaps
+    assert(r.pixel(30, 30)->r > 200 && r.pixel(50, 30)->r < 10);
+    assert(r.pixel(70, 30)->r > 200 && r.pixel(90, 30)->r < 10);
+
+    // Check odd-length dash {15}
+    assert(r.pixel(27, 60)->g > 200 && r.pixel(42, 60)->g < 10);
+    assert(r.pixel(57, 60)->g > 200);
+
+    // Check dashed rect top edge
+    assert(r.pixel(28, 90)->b > 200 && r.pixel(44, 90)->b < 10);
+
+    // Check dashed circle has both yellow dash pixels and black gap pixels on radius=25
+    size_t yellow_ring = 0, black_ring = 0;
+    for (int deg = 0; deg < 360; deg += 5) {
+        float rad = deg * 3.14159265f / 180.0f;
+        int px = static_cast<int>(std::round(160.0f + 25.0f * std::cos(rad)));
+        int py = static_cast<int>(std::round(165.0f + 25.0f * std::sin(rad)));
+        auto p = r.pixel(px, py);
+        if (p && p->r > 180 && p->g > 180 && p->b < 30) yellow_ring++;
+        else if (p && p->r < 20 && p->g < 20 && p->b < 20) black_ring++;
+    }
+    assert(yellow_ring > 10 && black_ring > 10);
+
+    // Elliptical corner (rx=30, ry=8): at (30, 175) -> y_offset=10 (> ry=8), inside rect, outside rx=8 circle!
+    // Must be CYAN (unlike min(30,8)=8 if corners had been clipped to 8x8)! Wait: if rx=30, ry=8:
+    // ellipse boundary at x=30 (dx = 20 from rx=30 corner center at x=50) has dy = 8*sqrt(1 - (20/30)^2) = 5.96,
+    // so y = 173 - 5.96 = 167.04; at (25, 169) -> inside ry=8? dx=25/30=0.833, y_rel=(173-169)/8=0.5 -> (0.833)^2+(0.5)^2 = 0.944 < 1 (INSIDE rx=30,ry=8) whereas for rx=8,ry=8 x=25 is OUTSIDE corner [20..28] vs circle!
+    // More directly: (25, 166) has dx=25 from x=50 -> outside circle rx=30,ry=8 (`(25/30)^2+(7/8)^2 = 1.46 > 1` -> BLACK!), while for rx=8,ry=8 corner at x=25 is ALREADY straight horizontal edge y=165 -> would be CYAN!
+    auto ellip_cutout = r.pixel(25, 166);
+    assert(ellip_cutout && ellip_cutout->r < 20 && ellip_cutout->g < 20 && ellip_cutout->b < 20);
+    auto ellip_inside = r.pixel(60, 185);
+    assert(ellip_inside && ellip_inside->g > 200 && ellip_inside->b > 200);
+
+    std::cout << "  -> GPU Dashed Strokes & Odd-Length Patterns OK" << std::endl;
+}
+
+void test_gpu_geometry_apis() {
+    std::cout << "Testing GPU & CPU P1.8 Geometry APIs (skew, oval, arc, drrect, points, PaintStyle)..." << std::endl;
+
+    // 1. PathBuilder::push_arc (oval, degrees) + Path::compute_tight_bounds + Transform skew
+    {
+        Transform t = Transform::identity().pre_skew(0.5f, 0.0f);
+        Point tp = Point::from_xy(10.0f, 20.0f);
+        t.map_point(tp);
+        assert(std::abs(tp.x - 20.0f) < 1e-4f && std::abs(tp.y - 20.0f) < 1e-4f);
+
+        PathBuilder pb;
+        pb.move_to(0.0f, 0.0f);
+        pb.cubic_to(50.0f, 200.0f, 50.0f, 200.0f, 100.0f, 0.0f);
+        auto p = pb.finish();
+        assert(p.has_value());
+        auto tight = p->compute_tight_bounds();
+        assert(tight.has_value() && tight->bottom() < 160.0f); // Tight curve peak (~150), well below control point y=200
+
+        PathBuilder arc_pb;
+        arc_pb.push_arc(*Rect::from_xywh(20.0f, 20.0f, 100.0f, 60.0f), 0.0f, 90.0f, false, true);
+        auto arc_p = arc_pb.finish();
+        assert(arc_p.has_value() && !arc_p->is_empty());
+        auto arc_b = arc_p->compute_tight_bounds();
+        assert(arc_b.has_value());
+        assert(arc_b->left() >= 69.5f && arc_b->right() <= 120.5f);
+        assert(arc_b->top() >= 49.5f && arc_b->bottom() <= 80.5f);
+    }
+
+    // 2. GPU Surface pixel-readback verification for all P1.8 drawing APIs
+    auto device = GpuDevice::create();
+    assert(device != nullptr);
+    auto surface = GpuSurface::create(device, 320, 260, 1);
+    assert(surface != nullptr);
+    GpuCanvas canvas(surface);
+    canvas.clear(Color::BLACK);
+
+    // 2a. skew
+    canvas.save();
+    canvas.skew(0.5f, 0.0f);
+    canvas.fill_rect(*Rect::from_xywh(10.0f, 10.0f, 40.0f, 30.0f), Paint(CYAN));
+    canvas.restore();
+
+    // 2b. fill_oval, stroke_oval, clip_oval
+    canvas.fill_oval(*Rect::from_xywh(120.0f, 10.0f, 80.0f, 40.0f), Paint(RED));
+    canvas.stroke_oval(*Rect::from_xywh(120.0f, 60.0f, 80.0f, 40.0f), Paint(GREEN), Stroke(4.0f));
+    canvas.save();
+    canvas.clip_oval(*Rect::from_xywh(20.0f, 60.0f, 60.0f, 40.0f));
+    canvas.fill_rect(*Rect::from_xywh(20.0f, 60.0f, 60.0f, 40.0f), Paint(BLUE));
+    canvas.restore();
+
+    // 2c. draw_arc (use_center = true -> pie wedge in bottom-right quadrant 0..90 deg)
+    canvas.draw_arc(*Rect::from_xywh(20.0f, 110.0f, 80.0f, 60.0f), 0.0f, 90.0f, true, Paint(YELLOW));
+
+    // 2d. fill_drrect (nested fast stencil path) + snug concentric deflate (difference fallback)
+    {
+        auto outer = RRect::from_rect_and_radius(*Rect::from_xywh(120.0f, 110.0f, 90.0f, 60.0f), 12.0f);
+        auto inner = outer.deflate(18.0f, 14.0f);
+        canvas.fill_drrect(outer, inner, Paint(CYAN));
+
+        auto outer_snug = RRect::from_rect_and_radius(*Rect::from_xywh(220.0f, 110.0f, 80.0f, 60.0f), 25.0f);
+        auto inner_snug = outer_snug.deflate(6.0f, 6.0f);
+        canvas.fill_drrect(outer_snug, inner_snug, Paint(GREEN));
+    }
+
+    // 2e. stroke_drrect
+    {
+        auto outer2 = RRect::from_rect_and_radius(*Rect::from_xywh(220.0f, 180.0f, 80.0f, 50.0f), 6.0f);
+        auto inner2 = outer2.deflate(10.0f, 10.0f);
+        canvas.stroke_drrect(outer2, inner2, Paint(MAGENTA), Stroke(2.0f));
+    }
+
+    // 2f. draw_points (Points, Lines, Polygon)
+    {
+        std::array<Point, 2> pts{Point::from_xy(30.0f, 200.0f), Point::from_xy(60.0f, 200.0f)};
+        Stroke pt_stroke(8.0f);
+        pt_stroke.line_cap = LineCap::Round;
+        canvas.draw_points(PointMode::Points, pts, Paint(Color::WHITE), pt_stroke);
+
+        std::array<Point, 4> lines{
+            Point::from_xy(80.0f, 190.0f), Point::from_xy(110.0f, 190.0f),
+            Point::from_xy(80.0f, 210.0f), Point::from_xy(110.0f, 210.0f)
+        };
+        canvas.draw_points(PointMode::Lines, lines, Paint(GREEN), Stroke(4.0f));
+
+        std::array<Point, 3> poly{
+            Point::from_xy(125.0f, 190.0f), Point::from_xy(155.0f, 190.0f), Point::from_xy(155.0f, 215.0f)
+        };
+        canvas.draw_points(PointMode::Polygon, poly, Paint(BLUE), Stroke(4.0f));
+    }
+
+    // 2g. PaintStyle::StrokeAndFill
+    {
+        Paint sf_paint(RED);
+        sf_paint.set_style(PaintStyle::StrokeAndFill);
+        canvas.draw_rect(*Rect::from_xywh(175.0f, 185.0f, 30.0f, 30.0f), sf_paint, Stroke(6.0f));
+    }
+
+    canvas.flush();
+    auto pm = surface->to_pixmap();
+    assert(pm.has_value());
+    const auto r = pm->as_ref();
+
+    // Skew assertions: row y=35 shifted right by 17.5 -> x in [27.5, 67.5]; row y=12 shifted by 6 -> x in [16, 56]
+    assert(r.pixel(60, 35)->g > 200 && r.pixel(60, 35)->b > 200);
+    assert(r.pixel(60, 12)->g < 10 && r.pixel(60, 12)->b < 10);
+
+    // Oval assertions
+    assert(r.pixel(160, 30)->r > 200 && r.pixel(160, 30)->g < 10);
+    assert(r.pixel(122, 12)->r < 10);
+    assert(r.pixel(160, 60)->g > 200 && r.pixel(160, 80)->g < 10);
+    assert(r.pixel(50, 80)->b > 200 && r.pixel(22, 62)->b < 10);
+
+    // Arc assertions
+    assert(r.pixel(75, 155)->r > 200 && r.pixel(75, 155)->g > 200 && r.pixel(75, 155)->b < 10);
+    assert(r.pixel(45, 125)->r < 10 && r.pixel(45, 155)->r < 10);
+
+    // DRRect assertions
+    assert(r.pixel(128, 140)->g > 200 && r.pixel(128, 140)->b > 200);
+    assert(r.pixel(165, 140)->g < 10 && r.pixel(165, 140)->b < 10);
+    assert(r.pixel(223, 140)->g > 200 && r.pixel(260, 140)->g < 10);
+    assert(r.pixel(260, 180)->r > 200 && r.pixel(260, 190)->r > 200 && r.pixel(260, 185)->r < 10);
+
+    // Points / Lines / Polygon assertions
+    assert(r.pixel(30, 200)->r > 200 && r.pixel(60, 200)->r > 200 && r.pixel(45, 200)->r < 10);
+    assert(r.pixel(95, 190)->g > 200 && r.pixel(95, 200)->g < 10 && r.pixel(95, 210)->g > 200);
+    assert(r.pixel(140, 190)->b > 200 && r.pixel(155, 205)->b > 200);
+
+    // PaintStyle::StrokeAndFill assertions (interior + expanded stroke rim)
+    assert(r.pixel(190, 200)->r > 200 && r.pixel(173, 200)->r > 200);
+
+    // 3. CPU Canvas parity checks (draw_oval, draw_drrect, StrokeAndFill, elliptical stroke_round_rect)
+    {
+        auto cpu_pm = Pixmap::allocate(160, 120, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(Color::BLACK);
+        Canvas cpu_canvas(cpu_pm->as_mut());
+
+        Paint sf(RED);
+        sf.set_style(PaintStyle::StrokeAndFill);
+        cpu_canvas.draw_rect(*Rect::from_xywh(10.0f, 10.0f, 20.0f, 20.0f), sf, Stroke(4.0f));
+        assert(cpu_pm->as_ref().pixel(20, 20)->r > 200);
+        assert(cpu_pm->as_ref().pixel(9, 20)->r > 200);
+
+        // Elliptical stroke_round_rect (rx=24, ry=6) on [50, 10, 80, 40]
+        cpu_canvas.stroke_round_rect(*Rect::from_xywh(50.0f, 10.0f, 80.0f, 40.0f), 24.0f, 6.0f, Paint(GREEN), Stroke(2.0f));
+        assert(cpu_pm->as_ref().pixel(50, 10)->g < 20); // Corner cut out
+        assert(cpu_pm->as_ref().pixel(80, 10)->g > 150); // Straight horizontal top segment
+
+        auto outer = RRect::from_rect_and_radius(*Rect::from_xywh(10.0f, 55.0f, 60.0f, 50.0f), 8.0f);
+        cpu_canvas.fill_drrect(outer, outer.deflate(10.0f, 10.0f), Paint(BLUE));
+        assert(cpu_pm->as_ref().pixel(15, 80)->b > 200 && cpu_pm->as_ref().pixel(40, 80)->b < 20);
+    }
+
+    std::cout << "  -> GPU & CPU P1.8 Geometry APIs OK" << std::endl;
+}
+
+void test_gpu_text_buffer_parity() {
+    std::cout << "Testing CPU-vs-GPU P1.6-PartA text baseline, background, & decoration parity..." << std::endl;
+
+    std::string font_path = resolve_test_font("NotoSans-Regular.ttf");
+    text::FontSystem font_system;
+    auto fid = font_system.load_font_file(font_path);
+    assert(fid.has_value());
+    font_system.set_default_font(*fid);
+
+    text::Buffer buf(text::Metrics(24.0f, 34.0f));
+    buf.set_text("HHH UUU SSS");
+    {
+        auto& attrs = buf.lines_mut()[0].attrs_list_mut();
+        text::Attrs bg_attrs;
+        bg_attrs.set_color(text::TextColor::rgb(255, 255, 255))
+                .set_background_color(text::TextColor::rgb(0, 0, 220));
+        text::Attrs ul_attrs;
+        ul_attrs.set_color(text::TextColor::rgb(255, 0, 0)).set_underline(true);
+        text::Attrs st_attrs;
+        st_attrs.set_color(text::TextColor::rgb(0, 255, 0)).set_strikethrough(true);
+        attrs.add_span(0, 3, bg_attrs);
+        attrs.add_span(4, 7, ul_attrs);
+        attrs.add_span(8, 11, st_attrs);
+    }
+
+    constexpr uint32_t W = 360;
+    constexpr uint32_t H = 100;
+    const float ox = 20.0f;
+    const float oy = 20.0f;
+
+    auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+    assert(cpu_pm.has_value());
+    cpu_pm->fill(Color::BLACK);
+    {
+        Canvas cpu_canvas(cpu_pm->as_mut());
+        text::GlyphCache cpu_cache(128);
+        buf.draw(cpu_canvas, cpu_cache, font_system, Color::WHITE, ox, oy);
+    }
+
+    auto device = GpuDevice::create();
+    auto surface = GpuSurface::create(device, W, H);
+    assert(surface != nullptr);
+    GpuCanvas gpu_canvas(surface);
+    gpu_canvas.clear(Color::BLACK);
+    gpu_canvas.draw_text_buffer(buf, font_system, Point(ox, oy), Color::WHITE);
+    gpu_canvas.flush();
+    auto gpu_pm = surface->to_pixmap();
+    assert(gpu_pm.has_value());
+
+    const auto cpu_r = cpu_pm->as_ref();
+    const auto gpu_r = gpu_pm->as_ref();
+
+    // 1. Background highlight parity on word 0 ("HHH"): blue fill inside line_top..line_top+line_height [20..54)
+    auto find_blue_bounds = [&](const PixmapRef& pm, uint32_t& min_y, uint32_t& max_y, size_t& count) {
+        min_y = H; max_y = 0; count = 0;
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto p = pm.pixel(x, y);
+                if (p && p->b > 180 && p->r < 40 && p->g < 40) {
+                    min_y = std::min(min_y, y);
+                    max_y = std::max(max_y, y);
+                    ++count;
+                }
+            }
+        }
+    };
+    uint32_t cpu_bg_y0, cpu_bg_y1, gpu_bg_y0, gpu_bg_y1;
+    size_t cpu_bg_cnt, gpu_bg_cnt;
+    find_blue_bounds(cpu_r, cpu_bg_y0, cpu_bg_y1, cpu_bg_cnt);
+    find_blue_bounds(gpu_r, gpu_bg_y0, gpu_bg_y1, gpu_bg_cnt);
+    assert(cpu_bg_cnt > 300 && gpu_bg_cnt > 300);
+    assert(std::abs(int(cpu_bg_y0) - int(gpu_bg_y0)) <= 1);
+    assert(std::abs(int(cpu_bg_y1) - int(gpu_bg_y1)) <= 1);
+    assert(gpu_r.pixel(30, 15)->b < 10 && gpu_r.pixel(30, 60)->b < 10);
+
+    // 2. Baseline Y parity + underline parity on red glyphs ("UUU")
+    auto find_red_bounds = [&](const PixmapRef& pm, uint32_t& min_y, uint32_t& max_y, uint32_t& best_row, uint32_t& best_row_cnt) {
+        min_y = H; max_y = 0; best_row = 0; best_row_cnt = 0;
+        for (uint32_t y = 0; y < H; ++y) {
+            uint32_t row_cnt = 0;
+            for (uint32_t x = 0; x < W; ++x) {
+                auto p = pm.pixel(x, y);
+                if (p && p->r > 150 && p->g < 40 && p->b < 40) {
+                    min_y = std::min(min_y, y);
+                    max_y = std::max(max_y, y);
+                    ++row_cnt;
+                }
+            }
+            if (row_cnt > best_row_cnt) {
+                best_row_cnt = row_cnt;
+                best_row = y;
+            }
+        }
+    };
+    uint32_t cpu_ry0, cpu_ry1, cpu_ul_y, cpu_ul_w;
+    uint32_t gpu_ry0, gpu_ry1, gpu_ul_y, gpu_ul_w;
+    find_red_bounds(cpu_r, cpu_ry0, cpu_ry1, cpu_ul_y, cpu_ul_w);
+    find_red_bounds(gpu_r, gpu_ry0, gpu_ry1, gpu_ul_y, gpu_ul_w);
+    assert(cpu_ry0 < cpu_ry1 && gpu_ry0 < gpu_ry1);
+    assert(std::abs(int(cpu_ry0) - int(gpu_ry0)) <= 2);
+    assert(std::abs(int(cpu_ry1) - int(gpu_ry1)) <= 2);
+    assert(cpu_ul_w > 30 && gpu_ul_w > 30);
+    assert(std::abs(int(cpu_ul_y) - int(gpu_ul_y)) <= 1);
+
+    // 3. Strikethrough parity on green glyphs ("SSS"): brightest wide horizontal green bar across word
+    auto find_green_bar = [&](const PixmapRef& pm, uint32_t& min_y, uint32_t& max_y, uint32_t& best_row, uint32_t& best_row_cnt) {
+        min_y = H; max_y = 0; best_row = 0; best_row_cnt = 0;
+        for (uint32_t y = 0; y < H; ++y) {
+            uint32_t row_cnt = 0;
+            for (uint32_t x = 0; x < W; ++x) {
+                auto p = pm.pixel(x, y);
+                if (p && p->g > 180 && p->r < 40 && p->b < 40) {
+                    min_y = std::min(min_y, y);
+                    max_y = std::max(max_y, y);
+                    ++row_cnt;
+                }
+            }
+            if (row_cnt > best_row_cnt) {
+                best_row_cnt = row_cnt;
+                best_row = y;
+            }
+        }
+    };
+    uint32_t cpu_gy0, cpu_gy1, cpu_st_y, cpu_st_w;
+    uint32_t gpu_gy0, gpu_gy1, gpu_st_y, gpu_st_w;
+    find_green_bar(cpu_r, cpu_gy0, cpu_gy1, cpu_st_y, cpu_st_w);
+    find_green_bar(gpu_r, gpu_gy0, gpu_gy1, gpu_st_y, gpu_st_w);
+    assert(cpu_st_w > 25 && gpu_st_w > 25);
+    assert(std::abs(int(cpu_gy0) - int(gpu_gy0)) <= 2);
+    assert(std::abs(int(cpu_gy1) - int(gpu_gy1)) <= 2);
+    assert(std::abs(int(cpu_st_y) - int(gpu_st_y)) <= 1);
+    assert(cpu_st_y < cpu_ul_y && gpu_st_y < gpu_ul_y);
+
+    std::cout << "  -> P1.6-PartA Text baseline, bg, & decorations parity OK" << std::endl;
+}
+
+static void test_gpu_blend_modes_parity() {
+    std::cout << "[Test 20/20] P0.2 All 29 BlendModes CPU-vs-GPU parity & MSAA..." << std::endl;
+
+    constexpr std::array<BlendMode, 29> kAllModes = {
+        BlendMode::Clear, BlendMode::Source, BlendMode::Destination,
+        BlendMode::SourceOver, BlendMode::DestinationOver, BlendMode::SourceIn,
+        BlendMode::DestinationIn, BlendMode::SourceOut, BlendMode::DestinationOut,
+        BlendMode::SourceAtop, BlendMode::DestinationAtop, BlendMode::Xor,
+        BlendMode::Plus, BlendMode::Modulate, BlendMode::Screen,
+        BlendMode::Overlay, BlendMode::Darken, BlendMode::Lighten,
+        BlendMode::ColorDodge, BlendMode::ColorBurn, BlendMode::HardLight,
+        BlendMode::SoftLight, BlendMode::Difference, BlendMode::Exclusion,
+        BlendMode::Multiply, BlendMode::Hue, BlendMode::Saturation,
+        BlendMode::Color, BlendMode::Luminosity
+    };
+
+    constexpr uint32_t W = 64;
+    constexpr uint32_t H = 64;
+    auto device = GpuDevice::create();
+    assert(device != nullptr);
+
+    const Color bg_clear = Color::TRANSPARENT;
+    const Color dst_col = Color::from_rgba8(64, 180, 210, 170);
+    const Color src_col = Color::from_rgba8(220, 90, 45, 190);
+    const Rect r_dst = *Rect::from_xywh(6.0f, 6.0f, 40.0f, 40.0f);
+    const Rect r_src = *Rect::from_xywh(20.0f, 20.0f, 38.0f, 38.0f);
+
+    auto surface = GpuSurface::create(device, W, H);
+    assert(surface != nullptr);
+
+    for (size_t idx = 0; idx < kAllModes.size(); ++idx) {
+        BlendMode mode = kAllModes[idx];
+
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(bg_clear);
+        {
+            Canvas cpu(cpu_pm->as_mut());
+            cpu.fill_rect(r_dst, Paint(dst_col));
+            Paint src_paint(src_col);
+            src_paint.blend_mode = mode;
+            cpu.fill_rect(r_src, src_paint);
+            cpu.fill_circle(32.0f, 16.0f, 10.5f, src_paint);
+        }
+
+        GpuCanvas gpu(surface);
+        gpu.clear(bg_clear);
+        gpu.fill_rect(r_dst, Paint(dst_col));
+        {
+            Paint src_paint(src_col);
+            src_paint.blend_mode = mode;
+            gpu.fill_rect(r_src, src_paint);
+            gpu.fill_circle(32.0f, 16.0f, 10.5f, src_paint);
+        }
+        gpu.flush();
+        auto gpu_pm = surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        const auto cpu_r = cpu_pm->as_ref();
+        const auto gpu_r = gpu_pm->as_ref();
+
+        auto check_pt = [&](uint32_t px, uint32_t py, int tol) {
+            auto cp = cpu_r.pixel(px, py);
+            auto gp = gpu_r.pixel(px, py);
+            assert(cp.has_value() && gp.has_value());
+            int dr = std::abs(int(cp->red()) - int(gp->red()));
+            int dg = std::abs(int(cp->green()) - int(gp->green()));
+            int db = std::abs(int(cp->blue()) - int(gp->blue()));
+            int da = std::abs(int(cp->alpha()) - int(gp->alpha()));
+            assert(dr <= tol && dg <= tol && db <= tol && da <= tol);
+        };
+
+        // Untouched transparent background
+        check_pt(2, 2, 1);
+        // Backdrop-only region (must remain intact even after Clear/Source AA quad draws!)
+        check_pt(12, 12, 2);
+        // Overlap interior: src over semi-transparent dst
+        check_pt(30, 30, 3);
+        // Overlap with transparent bg outside dst
+        check_pt(50, 50, 2);
+        // Circle center (semi-transparent dst behind) & outside bounding corner of circle quad
+        check_pt(32, 16, 3);
+        check_pt(21, 6, 3);
+    }
+
+    // Verify MSAA surface snapshot resolve with programmable blend modes
+    auto msaa_surface = GpuSurface::create(device, W, H, 4);
+    assert(msaa_surface != nullptr);
+    constexpr std::array<BlendMode, 6> kMsaaModes = {
+        BlendMode::Multiply, BlendMode::SoftLight, BlendMode::ColorDodge,
+        BlendMode::Hue, BlendMode::Modulate, BlendMode::Source
+    };
+    for (BlendMode mode : kMsaaModes) {
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(bg_clear);
+        {
+            Canvas cpu(cpu_pm->as_mut());
+            cpu.fill_rect(r_dst, Paint(dst_col));
+            Paint p(src_col);
+            p.blend_mode = mode;
+            cpu.fill_rect(r_src, p);
+        }
+
+        GpuCanvas gpu(msaa_surface);
+        gpu.clear(bg_clear);
+        gpu.fill_rect(r_dst, Paint(dst_col));
+        {
+            Paint p(src_col);
+            p.blend_mode = mode;
+            gpu.fill_rect(r_src, p);
+        }
+        gpu.flush();
+        auto gpu_pm = msaa_surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        auto cp = cpu_pm->as_ref().pixel(30, 30);
+        auto gp = gpu_pm->as_ref().pixel(30, 30);
+        assert(cp.has_value() && gp.has_value());
+        assert(std::abs(int(cp->red()) - int(gp->red())) <= 3);
+        assert(std::abs(int(cp->green()) - int(gp->green())) <= 3);
+        assert(std::abs(int(cp->blue()) - int(gp->blue())) <= 3);
+        assert(std::abs(int(cp->alpha()) - int(gp->alpha())) <= 3);
+    }
+
+    std::cout << "  -> P0.2 All 29 BlendModes CPU-vs-GPU parity & MSAA OK" << std::endl;
+}
+
+static void test_gpu_save_layer_parity() {
+    std::cout << "[TEST] P0.1 save_layer / bounds / backdrop CPU-vs-GPU Parity..." << std::endl;
+
+    auto dev = GpuDevice::create_headless();
+    assert(dev && dev->is_valid());
+
+    constexpr uint32_t W = 200;
+    constexpr uint32_t H = 200;
+    const Color bg = Color::from_rgba8(30, 60, 120, 255);
+
+    auto render_scene = [&](ICanvas& c) {
+        c.save();
+        // 1. Opacity isolation: opaque red overlapped by opaque green inside 0.5 layer
+        c.save_layer_alpha(0.5f);
+        c.fill_rect(*Rect::from_xywh(10, 10, 70, 70), Paint(Color::from_rgba8(255, 0, 0, 255)));
+        c.fill_rect(*Rect::from_xywh(30, 30, 70, 70), Paint(Color::from_rgba8(0, 255, 0, 255)));
+        c.restore();
+
+        // 2. Bounded layer with BlendMode::Multiply + ColorMatrix + clip path
+        {
+            Paint lp(Color::from_rgba_unchecked(1.0f, 1.0f, 1.0f, 0.8f));
+            lp.blend_mode = BlendMode::Multiply;
+            lp.set_color_filter(effects::ColorMatrix::invert());
+
+            PathBuilder clip_pb;
+            clip_pb.push_circle(140.0f, 55.0f, 40.0f);
+            auto clip_p = clip_pb.finish();
+            assert(clip_p.has_value());
+
+            c.save();
+            c.clip_path(*clip_p);
+            c.save_layer_bounds(*Rect::from_xywh(100, 15, 80, 80), lp);
+            c.translate(100.0f, 15.0f);
+            // White inverted -> black (0,0,0,1); 0.8 alpha Multiply over bg
+            c.fill_rect(*Rect::from_xywh(-10, -10, 100, 100), Paint(Color::from_rgba8(255, 255, 255, 255)));
+            c.restore();
+            c.restore();
+        }
+
+        // 3. Nested layers
+        {
+            Paint outer_p(Color::from_rgba_unchecked(1.0f, 1.0f, 1.0f, 0.5f));
+            Paint inner_p(Color::WHITE);
+            inner_p.blend_mode = BlendMode::Plus;
+            c.save_layer(outer_p);
+            c.fill_rect(*Rect::from_xywh(110, 115, 70, 70), Paint(Color::from_rgba8(200, 0, 0, 255)));
+            c.save_layer(inner_p);
+            c.fill_rect(*Rect::from_xywh(125, 130, 40, 40), Paint(Color::from_rgba8(0, 200, 0, 255)));
+            c.restore();
+            c.restore();
+        }
+
+        // 4. Backdrop blur layer on sharp step edge
+        c.fill_rect(*Rect::from_xywh(10, 115, 40, 70), Paint(Color::from_rgba8(255, 255, 255, 255)));
+        c.fill_rect(*Rect::from_xywh(50, 115, 40, 70), Paint(Color::from_rgba8(0, 0, 0, 255)));
+        c.save_layer_backdrop(*Rect::from_xywh(20, 125, 60, 50), Paint(Color::WHITE), 4.0f);
+        c.fill_rect(*Rect::from_xywh(45, 145, 10, 10), Paint(Color::from_rgba8(255, 0, 0, 255)));
+        c.restore();
+
+        c.restore();
+    };
+
+    auto cpu_pm = Pixmap::allocate(W, H);
+    assert(cpu_pm.has_value());
+    {
+        Canvas cpu(*cpu_pm);
+        cpu.clear(bg);
+        render_scene(cpu);
+    }
+
+    for (uint32_t samples : {1u, 4u}) {
+        auto surface = GpuSurface::create(dev, W, H, samples);
+        assert(surface);
+        GpuCanvas gpu(surface);
+        gpu.clear(bg);
+        render_scene(gpu);
+        gpu.flush();
+
+        auto gpu_pm = surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        auto check_pt = [&](uint32_t x, uint32_t y, int tol) {
+            auto cp = cpu_pm->as_ref().pixel(x, y);
+            auto gp = gpu_pm->as_ref().pixel(x, y);
+            assert(cp.has_value() && gp.has_value());
+            assert(std::abs(int(cp->red()) - int(gp->red())) <= tol);
+            assert(std::abs(int(cp->green()) - int(gp->green())) <= tol);
+            assert(std::abs(int(cp->blue()) - int(gp->blue())) <= tol);
+            assert(std::abs(int(cp->alpha()) - int(gp->alpha())) <= tol);
+        };
+
+        // 1. Isolated opacity checks (red-only, overlap green-over-red, green-only)
+        check_pt(15, 15, 3);
+        check_pt(45, 45, 3);
+        check_pt(90, 90, 3);
+
+        // 2. Bounded + Multiply + Invert ColorMatrix + Outer Circular Clip
+        check_pt(140, 55, 4);   // Inside both bounds and circle clip
+        check_pt(102, 17, 3);   // Inside bounds [100..180] but OUTSIDE circle clip (r=40 at 140,55)
+        check_pt(185, 55, 3);   // Outside bounds
+
+        // 3. Nested layers
+        check_pt(145, 150, 4);
+        check_pt(115, 120, 3);
+
+        // 4. Backdrop blur: check step transition softened & center red painted over blurred backdrop
+        check_pt(50, 135, 15);  // Both CPU box-gaussian and GPU separable Gaussian blur step ~127
+        check_pt(50, 150, 3);   // Center red drawn on top of backdrop
+    }
+
+    std::cout << "  -> P0.1 save_layer / bounds / backdrop CPU-vs-GPU Parity (1x & 4x MSAA) OK" << std::endl;
+}
+
+static void test_gpu_gradients_and_pattern_parity() {
+    std::cout << "[TEST] P0.3 Full GPU Gradients & Pattern (ImageShader) CPU-vs-GPU Parity..." << std::endl;
+
+    auto dev = GpuDevice::create_headless();
+    assert(dev && dev->is_valid());
+
+    constexpr uint32_t W = 240;
+    constexpr uint32_t H = 200;
+    const Color bg = Color::from_rgba8(20, 28, 44, 255);
+
+    auto run_parity_case = [&](const char* label, auto&& draw_fn,
+                               const std::vector<std::pair<uint32_t, uint32_t>>& pts,
+                               int pt_tol = 4, float max_avg_diff = 3.0f) {
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(bg);
+        {
+            Canvas cpu(cpu_pm->as_mut());
+            draw_fn(cpu);
+        }
+
+        auto surface = GpuSurface::create(dev, W, H, 1);
+        assert(surface != nullptr);
+        {
+            GpuCanvas gpu(surface);
+            gpu.clear(bg);
+            draw_fn(gpu);
+            gpu.flush();
+        }
+        auto gpu_pm = surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        const auto cpu_r = cpu_pm->as_ref();
+        const auto gpu_r = gpu_pm->as_ref();
+
+        for (auto [px, py] : pts) {
+            auto cp = cpu_r.pixel(px, py);
+            auto gp = gpu_r.pixel(px, py);
+            assert(cp.has_value() && gp.has_value());
+            int dr = std::abs(int(cp->red()) - int(gp->red()));
+            int dg = std::abs(int(cp->green()) - int(gp->green()));
+            int db = std::abs(int(cp->blue()) - int(gp->blue()));
+            int da = std::abs(int(cp->alpha()) - int(gp->alpha()));
+            if (dr > pt_tol || dg > pt_tol || db > pt_tol || da > pt_tol) {
+                std::cerr << "  [MISMATCH] " << label << " @(" << px << "," << py << ") "
+                          << "CPU=(" << int(cp->red()) << "," << int(cp->green()) << "," << int(cp->blue()) << "," << int(cp->alpha()) << ") "
+                          << "GPU=(" << int(gp->red()) << "," << int(gp->green()) << "," << int(gp->blue()) << "," << int(gp->alpha()) << ")\n";
+                assert(false);
+            }
+        }
+
+        double sum_diff = 0.0;
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cpu_r.pixel(x, y);
+                auto gp = gpu_r.pixel(x, y);
+                int dr = std::abs(int(cp->red()) - int(gp->red()));
+                int dg = std::abs(int(cp->green()) - int(gp->green()));
+                int db = std::abs(int(cp->blue()) - int(gp->blue()));
+                int da = std::abs(int(cp->alpha()) - int(gp->alpha()));
+                sum_diff += (dr + dg + db + da) * 0.25;
+            }
+        }
+        double avg_diff = sum_diff / double(W * H);
+        if (avg_diff > max_avg_diff) {
+            std::cerr << "  [AVG MISMATCH] " << label << " avg_diff=" << avg_diff << " > " << max_avg_diff << "\n";
+            assert(false);
+        }
+    };
+
+    const std::vector<GradientStop> stops4 = {
+        GradientStop::create(0.0f, Color::from_rgba8(240, 40, 40, 255)),
+        GradientStop::create(0.35f, Color::from_rgba8(240, 220, 40, 220)),
+        GradientStop::create(0.7f, Color::from_rgba8(40, 210, 120, 180)),
+        GradientStop::create(1.0f, Color::from_rgba8(50, 90, 255, 255)),
+    };
+
+    // 1. Multi-stop LinearGradient: Pad, Repeat, Reflect + Shader Transform + RoundRect & Stroke
+    run_parity_case("LinearGradient Pad/Repeat/Reflect + Transform", [&](ICanvas& c) {
+        Transform grad_xf = Transform::from_translate(12.0f, 16.0f).post_concat(Transform::from_rotate(22.0f));
+        auto lg_pad = LinearGradient::create(Point::from_xy(20.0f, 20.0f), Point::from_xy(70.0f, 20.0f), stops4, SpreadMode::Pad, grad_xf);
+        auto lg_rep = LinearGradient::create(Point::from_xy(100.0f, 20.0f), Point::from_xy(130.0f, 20.0f), stops4, SpreadMode::Repeat);
+        auto lg_ref = LinearGradient::create(Point::from_xy(170.0f, 20.0f), Point::from_xy(200.0f, 20.0f), stops4, SpreadMode::Reflect);
+        assert(lg_pad && lg_rep && lg_ref);
+
+        c.fill_rect(*Rect::from_xywh(10.0f, 10.0f, 70.0f, 70.0f), Paint(Shader(*lg_pad)));
+        c.fill_round_rect(*Rect::from_xywh(90.0f, 10.0f, 70.0f, 70.0f), 10.0f, 10.0f, Paint(Shader(*lg_rep)));
+        c.fill_rect(*Rect::from_xywh(165.0f, 10.0f, 65.0f, 70.0f), Paint(Shader(*lg_ref)));
+
+        // Stroke with multi-stop Repeat gradient + canvas scale
+        c.save();
+        c.translate(10.0f, 100.0f);
+        auto lg_stroke = LinearGradient::create(Point::from_xy(0.0f, 0.0f), Point::from_xy(35.0f, 25.0f), stops4, SpreadMode::Repeat);
+        c.stroke_rect(*Rect::from_xywh(10.0f, 10.0f, 190.0f, 65.0f), Paint(Shader(*lg_stroke)), Stroke(8.0f));
+        c.restore();
+    }, {{25, 35}, {55, 50}, {108, 45}, {140, 45}, {182, 45}, {212, 45}, {24, 140}, {180, 110}}, 5, 2.5f);
+
+    // 2. >16 stop LUT fallback (20 stops) Linear & RadialGradient
+    {
+        std::vector<GradientStop> stops20;
+        for (int i = 0; i < 20; ++i) {
+            float t = float(i) / 19.0f;
+            uint8_t r = uint8_t(127.5f + 127.5f * std::sin(t * 6.28318f));
+            uint8_t g = uint8_t(127.5f + 127.5f * std::cos(t * 4.5f));
+            uint8_t b = uint8_t(255.0f * (1.0f - t));
+            uint8_t a = uint8_t(160.0f + 95.0f * t);
+            stops20.push_back(GradientStop::create(t, Color::from_rgba8(r, g, b, a)));
+        }
+        run_parity_case("20-stop LUT Linear & Radial", [&](ICanvas& c) {
+            auto lg20 = LinearGradient::create(Point::from_xy(15.0f, 20.0f), Point::from_xy(95.0f, 90.0f), stops20, SpreadMode::Reflect);
+            auto rg20 = RadialGradient::create(Point::from_xy(170.0f, 100.0f), 42.0f, stops20, SpreadMode::Repeat);
+            assert(lg20 && rg20);
+            c.fill_rect(*Rect::from_xywh(10.0f, 15.0f, 105.0f, 160.0f), Paint(Shader(*lg20)));
+            c.fill_oval(*Rect::from_xywh(110.0f, 40.0f, 120.0f, 120.0f), Paint(Shader(*rg20)));
+        }, {{30, 40}, {60, 80}, {90, 140}, {170, 100}, {195, 100}, {140, 75}}, 6, 3.0f);
+    }
+
+    // 3. RadialGradient (1pt & 2pt) & TwoPointConicalGradient (concentric & eccentric)
+    run_parity_case("Radial 1pt/2pt & TwoPointConical", [&](ICanvas& c) {
+        auto rg_rep = RadialGradient::create(Point::from_xy(55.0f, 50.0f), 22.0f, stops4, SpreadMode::Repeat);
+        auto rg_2pt = RadialGradient::create_2point(
+            Point::from_xy(155.0f, 45.0f), 10.0f,
+            Point::from_xy(185.0f, 55.0f), 40.0f,
+            stops4, SpreadMode::Reflect);
+        auto cg_con = TwoPointConicalGradient::create(
+            Point::from_xy(60.0f, 145.0f), 8.0f,
+            Point::from_xy(60.0f, 145.0f), 42.0f,
+            stops4, SpreadMode::Pad);
+        auto cg_ecc = TwoPointConicalGradient::create(
+            Point::from_xy(150.0f, 145.0f), 6.0f,
+            Point::from_xy(190.0f, 150.0f), 34.0f,
+            stops4, SpreadMode::Repeat);
+        assert(rg_rep && rg_2pt && cg_con && cg_ecc);
+
+        c.fill_rect(*Rect::from_xywh(10.0f, 10.0f, 95.0f, 80.0f), Paint(Shader(*rg_rep)));
+        c.fill_rect(*Rect::from_xywh(120.0f, 10.0f, 110.0f, 80.0f), Paint(Shader(*rg_2pt)));
+        c.fill_rect(*Rect::from_xywh(10.0f, 100.0f, 95.0f, 90.0f), Paint(Shader(*cg_con)));
+        c.fill_rect(*Rect::from_xywh(120.0f, 100.0f, 110.0f, 90.0f), Paint(Shader(*cg_ecc)));
+    }, {{55, 50}, {85, 50}, {165, 50}, {210, 50}, {60, 145}, {80, 145}, {165, 148}, {195, 150}}, 6, 3.0f);
+
+    // 4. SweepGradient (full & partial angle arc, Pad/Repeat/Reflect + Transform + ColorMatrix)
+    run_parity_case("SweepGradient + ColorMatrix", [&](ICanvas& c) {
+        auto sg_pad = SweepGradient::create(Point::from_xy(55.0f, 55.0f), 30.0f, 240.0f, stops4, SpreadMode::Pad);
+        auto sg_rep = SweepGradient::create(Point::from_xy(175.0f, 55.0f), 0.0f, 120.0f, stops4, SpreadMode::Repeat,
+                                            Transform::from_rotate_at(35.0f, 175.0f, 55.0f));
+        auto sg_ref = SweepGradient::create(Point::from_xy(115.0f, 145.0f), 20.0f, 140.0f, stops4, SpreadMode::Reflect);
+        assert(sg_pad && sg_rep && sg_ref);
+
+        c.fill_oval(*Rect::from_xywh(13.0f, 13.0f, 84.0f, 84.0f), Paint(Shader(*sg_pad)));
+        c.fill_oval(*Rect::from_xywh(133.0f, 13.0f, 84.0f, 84.0f), Paint(Shader(*sg_rep)));
+
+        Paint p_gray{Shader(*sg_ref)};
+        p_gray.set_color_filter(effects::ColorMatrix::saturation(0.0f));
+        c.fill_rect(*Rect::from_xywh(40.0f, 105.0f, 150.0f, 80.0f), p_gray);
+    }, {{78, 55}, {35, 35}, {195, 65}, {155, 45}, {145, 145}, {85, 145}}, 6, 3.5f);
+
+    // 5. Pattern (ImageShader): strided BGRA8888, Pad/Repeat/Reflect, Nearest/Bilinear, Transform, opacity, Path & Stroke + ColorMatrix::invert
+    {
+        // 4x4 strided BGRA8888 pattern (stride = 24 bytes)
+        std::vector<uint8_t> raw_bgra(24 * 4, 0x55);
+        for (uint32_t y = 0; y < 4; ++y) {
+            for (uint32_t x = 0; x < 4; ++x) {
+                size_t off = y * 24 + x * 4;
+                bool cx = (x < 2);
+                bool cy = (y < 2);
+                uint8_t r = cx ? 240 : 40;
+                uint8_t g = cy ? 220 : 50;
+                uint8_t b = (cx != cy) ? 240 : 30;
+                uint8_t a = ((x + y) % 2 == 0) ? 255 : 180;
+                uint8_t rp = static_cast<uint8_t>((uint32_t(r) * a + 127) / 255);
+                uint8_t gp = static_cast<uint8_t>((uint32_t(g) * a + 127) / 255);
+                uint8_t bp = static_cast<uint8_t>((uint32_t(b) * a + 127) / 255);
+                raw_bgra[off + 0] = bp;
+                raw_bgra[off + 1] = gp;
+                raw_bgra[off + 2] = rp;
+                raw_bgra[off + 3] = a;
+            }
+        }
+        auto tile_ref = PixmapRef::from_raw_parts(raw_bgra.data(), 4, 4, 24, PixelFormat::BGRA8888);
+        assert(tile_ref.has_value());
+
+        run_parity_case("Pattern ImageShader Spread/Filter/Transform/Opacity", [&](ICanvas& c) {
+            Transform px_rep = Transform::from_scale(8.0f, 8.0f);
+            Transform px_rot = Transform::from_translate(20.0f, 20.0f)
+                                   .post_concat(Transform::from_rotate(20.0f))
+                                   .post_concat(Transform::from_scale(6.0f, 6.0f));
+
+            Pattern pat_rep(*tile_ref, SpreadMode::Repeat, FilterQuality::Nearest, 0.85f, px_rep);
+            Pattern pat_ref(*tile_ref, SpreadMode::Reflect, FilterQuality::Bilinear, 0.75f, px_rot);
+            Pattern pat_pad(*tile_ref, SpreadMode::Pad, FilterQuality::Bilinear, 1.0f,
+                            Transform::from_translate(15.0f, 115.0f).post_concat(Transform::from_scale(12.0f, 12.0f)));
+
+            c.fill_rect(*Rect::from_xywh(10.0f, 10.0f, 95.0f, 80.0f), Paint(Shader(pat_rep)));
+
+            Paint p_ref_inv{Shader(pat_ref)};
+            p_ref_inv.set_color_filter(effects::ColorMatrix::invert());
+            c.fill_round_rect(*Rect::from_xywh(120.0f, 10.0f, 105.0f, 80.0f), 12.0f, 12.0f, p_ref_inv);
+
+            // Arbitrary concave triangle path + stroked rect using Pattern
+            PathBuilder pb;
+            pb.move_to(20.0f, 110.0f);
+            pb.line_to(110.0f, 125.0f);
+            pb.line_to(65.0f, 185.0f);
+            pb.close();
+            auto tri = pb.finish();
+            assert(tri.has_value());
+            c.fill_path(*tri, Paint(Shader(pat_pad)));
+
+            c.stroke_rect(*Rect::from_xywh(130.0f, 115.0f, 90.0f, 65.0f), Paint(Shader(pat_rep)), Stroke(8.0f));
+        }, {{20, 20}, {42, 42}, {150, 35}, {180, 55}, {55, 135}, {132, 135}}, 8, 5.0f);
+    }
+
+    std::cout << "  -> P0.3 Full GPU Gradients & Pattern (ImageShader) CPU-vs-GPU Parity OK" << std::endl;
+}
+
+static void test_gpu_effects_and_shadows_parity() {
+    std::cout << "[TEST] P0.4-B ColorEffect, ImageFilter Blur/DropShadow & RRect/Circle Shadows CPU-vs-GPU Parity..." << std::endl;
+
+    auto dev = GpuDevice::create_headless();
+    assert(dev && dev->is_valid());
+
+    constexpr uint32_t W = 240;
+    constexpr uint32_t H = 200;
+    const Color bg = Color::from_rgba8(230, 235, 245, 255);
+
+    auto run_parity_case = [&](const char* label, auto&& draw_fn,
+                               const std::vector<std::pair<uint32_t, uint32_t>>& pts,
+                               int pt_tol = 6, float max_avg_diff = 3.5f) {
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(bg);
+        {
+            Canvas cpu(cpu_pm->as_mut());
+            draw_fn(cpu);
+        }
+
+        auto surface = GpuSurface::create(dev, W, H, 1);
+        assert(surface != nullptr);
+        {
+            GpuCanvas gpu(surface);
+            gpu.clear(bg);
+            draw_fn(gpu);
+            gpu.flush();
+        }
+        auto gpu_pm = surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        const auto cpu_r = cpu_pm->as_ref();
+        const auto gpu_r = gpu_pm->as_ref();
+
+        for (auto [px, py] : pts) {
+            auto cp = cpu_r.pixel(px, py);
+            auto gp = gpu_r.pixel(px, py);
+            assert(cp.has_value() && gp.has_value());
+            int dr = std::abs(int(cp->red()) - int(gp->red()));
+            int dg = std::abs(int(cp->green()) - int(gp->green()));
+            int db = std::abs(int(cp->blue()) - int(gp->blue()));
+            int da = std::abs(int(cp->alpha()) - int(gp->alpha()));
+            if (dr > pt_tol || dg > pt_tol || db > pt_tol || da > pt_tol) {
+                std::cerr << "  [MISMATCH] " << label << " @(" << px << "," << py << ") "
+                          << "CPU=(" << int(cp->red()) << "," << int(cp->green()) << "," << int(cp->blue()) << "," << int(cp->alpha()) << ") "
+                          << "GPU=(" << int(gp->red()) << "," << int(gp->green()) << "," << int(gp->blue()) << "," << int(gp->alpha()) << ")\n";
+                assert(false);
+            }
+        }
+
+        double sum_diff = 0.0;
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cpu_r.pixel(x, y);
+                auto gp = gpu_r.pixel(x, y);
+                int dr = std::abs(int(cp->red()) - int(gp->red()));
+                int dg = std::abs(int(cp->green()) - int(gp->green()));
+                int db = std::abs(int(cp->blue()) - int(gp->blue()));
+                int da = std::abs(int(cp->alpha()) - int(gp->alpha()));
+                sum_diff += (dr + dg + db + da) * 0.25;
+            }
+        }
+        double avg_diff = sum_diff / double(W * H);
+        if (avg_diff > max_avg_diff) {
+            std::cerr << "  [AVG MISMATCH] " << label << " avg_diff=" << avg_diff << " > " << max_avg_diff << "\n";
+            assert(false);
+        }
+    };
+
+    // 1. ColorEffect variants (SourceAtop, Multiply, Screen, Tint, srgb_to_linear, linear_to_srgb)
+    run_parity_case("ColorEffect Mode & Gamma", [&](ICanvas& c) {
+        Paint p1(Color::from_rgba8(60, 140, 220, 255));
+        p1.set_color_filter(effects::ColorEffect::mode(Color::from_rgba8(220, 40, 40, 140), BlendMode::SourceAtop));
+        c.fill_rect(*Rect::from_xywh(10.0f, 10.0f, 65.0f, 75.0f), p1);
+
+        Paint p2(Color::from_rgba8(200, 180, 100, 255));
+        p2.set_color_filter(effects::ColorEffect::mode(Color::from_rgba8(120, 200, 240, 255), BlendMode::Multiply));
+        c.fill_rect(*Rect::from_xywh(85.0f, 10.0f, 65.0f, 75.0f), p2);
+
+        Paint p3(Color::from_rgba8(80, 120, 180, 255));
+        p3.set_color_filter(effects::ColorEffect::mode(Color::from_rgba8(90, 60, 40, 255), BlendMode::Screen));
+        c.fill_rect(*Rect::from_xywh(160.0f, 10.0f, 65.0f, 75.0f), p3);
+
+        Paint p4(Color::from_rgba8(140, 180, 90, 255));
+        p4.set_color_filter(effects::ColorEffect::srgb_to_linear());
+        c.fill_rect(*Rect::from_xywh(10.0f, 105.0f, 65.0f, 75.0f), p4);
+
+        Paint p5(Color::from_rgba8(80, 120, 200, 255));
+        p5.set_color_filter(effects::ColorEffect::linear_to_srgb());
+        c.fill_rect(*Rect::from_xywh(85.0f, 105.0f, 65.0f, 75.0f), p5);
+
+        Paint p6(Color::from_rgba8(180, 180, 180, 255));
+        p6.set_color_filter(effects::ColorEffect::tint(Color::from_rgba8(40, 200, 120, 255), 0.65f));
+        c.fill_rect(*Rect::from_xywh(160.0f, 105.0f, 65.0f, 75.0f), p6);
+    }, {{40, 40}, {115, 40}, {190, 40}, {40, 140}, {115, 140}, {190, 140}}, 5, 2.0f);
+
+    // 2. Paint::set_image_filter(Blur & DropShadow) + SaveLayer composite opacity + ColorEffect
+    run_parity_case("ImageFilter Blur & DropShadow", [&](ICanvas& c) {
+        Paint bp(Color::from_rgba8(220, 70, 50, 255));
+        bp.set_image_filter(effects::ImageFilter::blur(3.5f, 1.5f));
+        c.fill_round_rect(*Rect::from_xywh(20.0f, 20.0f, 80.0f, 60.0f), 10.0f, 10.0f, bp);
+
+        Paint dsp(Color::from_rgba8(40, 150, 230, 255));
+        dsp.set_image_filter(effects::ImageFilter::drop_shadow(
+            6.0f, 6.0f, 3.0f, 3.0f, Color::from_rgba8(10, 20, 40, 190), false));
+        c.fill_rect(*Rect::from_xywh(130.0f, 22.0f, 75.0f, 55.0f), dsp);
+
+        // shadow_only + layer opacity + ColorEffect
+        Paint layer_p(Color::from_rgba8(255, 255, 255, 200));
+        layer_p.set_image_filter(effects::ImageFilter::drop_shadow(
+            5.0f, 4.0f, 2.5f, 2.5f, Color::from_rgba8(20, 120, 60, 220), true));
+        auto bnds = Rect::from_xywh(20.0f, 110.0f, 95.0f, 75.0f);
+        c.save_layer_bounds(*bnds, layer_p);
+        c.fill_rect(*Rect::from_xywh(30.0f, 120.0f, 60.0f, 45.0f), Paint(Color::WHITE));
+        c.restore();
+    }, {{60, 50}, {165, 50}, {175, 81}, {65, 145}}, 12, 4.5f);
+
+    // 3. Asymmetric 4-corner draw_rrect_with_shadow, draw_circle_with_shadow, draw_path_with_shadow
+    run_parity_case("Asymmetric RRect & Circle DropShadow", [&](ICanvas& c) {
+        auto rr = RRect::from_xywh(20.0f, 20.0f, 85.0f, 70.0f, BorderRadius::only(24.0f, 0.0f, 16.0f, 6.0f));
+        assert(rr.has_value());
+        effects::DropShadow ds(6.0f, 7.0f, 4.0f, Color::from_rgba8(15, 20, 35, 180));
+        c.draw_rrect_with_shadow(*rr, Paint(Color::from_rgba8(55, 125, 235, 255)), ds);
+
+        c.draw_circle_with_shadow(175.0f, 60.0f, 32.0f, Paint(Color::from_rgba8(235, 90, 65, 255)), ds);
+
+        PathBuilder pb;
+        pb.move_to(55.0f, 115.0f);
+        pb.line_to(115.0f, 175.0f);
+        pb.line_to(25.0f, 175.0f);
+        pb.close();
+        auto tri = pb.finish();
+        assert(tri.has_value());
+        c.draw_path_with_shadow(*tri, Paint(Color::from_rgba8(50, 180, 110, 255)), ds);
+    }, {{60, 55}, {23, 23}, {102, 23}, {60, 96}, {175, 60}, {182, 98}, {60, 155}}, 12, 4.5f);
+
+    std::cout << "  -> P0.4-B ColorEffect, ImageFilter Blur/DropShadow & RRect/Circle Shadows Parity OK" << std::endl;
+}
+
+static void test_gpu_text_decorations_and_shadows_parity() {
+    std::cout << "[Test 24/24] P1.6-PartB & P1.7 Text decorations, shadows, Align::Start & font aliases parity..." << std::endl;
+
+    text::FontSystem font_system;
+    auto fid_noto = font_system.load_font_file(resolve_test_font("NotoSans-Regular.ttf"), 0, "UiParitySans");
+    auto fid_arabic = font_system.load_font_file(resolve_test_font("NotoSansArabic.ttf"));
+    assert(fid_noto.has_value() && fid_arabic.has_value());
+    font_system.register_family_alias("ParityBody", "UiParitySans");
+    font_system.set_default_font(*fid_noto);
+
+    // Part A: Rich decorations (overline, Double/Dotted/Dashed/Wavy, custom colors/thickness) & sharp/blurred shadows
+    text::Buffer buf(text::Metrics(22.0f, 34.0f));
+    text::Attrs base;
+    base.set_family(text::Family("ParityBody"))
+        .set_color(text::TextColor::rgb(255, 255, 255));
+    buf.set_text("OOO DDD TTT AAA WWW SHW", base);
+    {
+        auto& alist = buf.lines_mut()[0].attrs_list_mut();
+        text::Attrs a_over = base;
+        a_over.set_overline(true)
+              .set_decoration_color(text::TextColor::rgb(255, 50, 50))
+              .set_decoration_thickness(1.5f);
+        text::Attrs a_dbl = base;
+        a_dbl.set_underline(true)
+             .set_decoration_style(text::DecorationStyle::Double)
+             .set_decoration_color(text::TextColor::rgb(50, 255, 50));
+        text::Attrs a_dot = base;
+        a_dot.set_underline(true)
+             .set_decoration_style(text::DecorationStyle::Dotted)
+             .set_decoration_color(text::TextColor::rgb(50, 240, 255));
+        text::Attrs a_dash = base;
+        a_dash.set_underline(true)
+              .set_decoration_style(text::DecorationStyle::Dashed)
+              .set_decoration_color(text::TextColor::rgb(255, 230, 40));
+        text::Attrs a_wavy = base;
+        a_wavy.set_underline(true)
+              .set_decoration_style(text::DecorationStyle::Wavy)
+              .set_decoration_color(text::TextColor::rgb(255, 50, 255));
+        text::Attrs a_shw = base;
+        a_shw.add_shadow(text::TextColor::rgb(0, 220, 0), 6.0f, 5.0f, 0.0f)
+             .add_shadow(text::TextColor::rgb(0, 130, 255), -5.0f, 8.0f, 2.5f);
+
+        alist.add_span(0, 3, a_over);
+        alist.add_span(4, 7, a_dbl);
+        alist.add_span(8, 11, a_dot);
+        alist.add_span(12, 15, a_dash);
+        alist.add_span(16, 19, a_wavy);
+        alist.add_span(20, 23, a_shw);
+    }
+
+    // Part B: RTL Align::Start buffer
+    text::Buffer rtl_buf(text::Metrics(20.0f, 28.0f));
+    rtl_buf.set_size(240.0f, std::nullopt);
+    rtl_buf.set_align(text::Align::Start);
+    rtl_buf.set_text("\xD9\x85\xD8\xB1\xD8\xAD\xD8\xA8\xD8\xA7");
+
+    constexpr uint32_t W = 500;
+    constexpr uint32_t H = 140;
+
+    auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+    assert(cpu_pm.has_value());
+    cpu_pm->fill(Color::BLACK);
+    {
+        Canvas cpu_canvas(cpu_pm->as_mut());
+        text::GlyphCache cpu_cache(256);
+        buf.draw(cpu_canvas, cpu_cache, font_system, Color::WHITE, 16.0f, 20.0f);
+        rtl_buf.draw(cpu_canvas, cpu_cache, font_system, Color::from_rgba8(255, 180, 50, 255), 16.0f, 86.0f);
+    }
+
+    auto device = GpuDevice::create();
+    auto surface = GpuSurface::create(device, W, H);
+    assert(surface != nullptr);
+    GpuCanvas gpu_canvas(surface);
+    gpu_canvas.clear(Color::BLACK);
+    gpu_canvas.draw_text_buffer(buf, font_system, Point(16.0f, 20.0f), Color::WHITE);
+    gpu_canvas.draw_text_buffer(rtl_buf, font_system, Point(16.0f, 86.0f), Color::from_rgba8(255, 180, 50, 255));
+
+    // Also verify createFontAtIndex & createFontMemAtIndex on gpu::Context
+    {
+        auto* ctx = gpu_canvas.context();
+        assert(ctx != nullptr);
+        std::string mono_path = resolve_test_font("FiraMono-Medium.ttf");
+        int idx_font = ctx->createFontAtIndex("mono_idx_alias", mono_path.c_str(), 0);
+        assert(idx_font > 0);
+        assert(ctx->findFont("mono_idx_alias") == idx_font);
+
+        std::ifstream f(mono_path, std::ios::binary | std::ios::ate);
+        assert(f.is_open());
+        std::vector<unsigned char> raw(static_cast<size_t>(f.tellg()));
+        f.seekg(0, std::ios::beg);
+        f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+        int mem_font = ctx->createFontMemAtIndex("mono_mem_alias", raw.data(), int(raw.size()), 0, 0);
+        assert(mem_font > 0);
+        assert(ctx->findFont("mono_mem_alias") == mem_font);
+    }
+
+    gpu_canvas.flush();
+    auto gpu_pm = surface->to_pixmap();
+    assert(gpu_pm.has_value());
+
+    const auto cpu_r = cpu_pm->as_ref();
+    const auto gpu_r = gpu_pm->as_ref();
+
+    struct ColorBounds {
+        uint32_t min_x = W, max_x = 0, min_y = H, max_y = 0, count = 0;
+        std::array<uint32_t, H> row_counts{};
+    };
+    auto scan_bounds = [&](const PixmapRef& pm, uint32_t y0, uint32_t y1, auto&& pred) {
+        ColorBounds b;
+        for (uint32_t y = y0; y < y1; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto p = pm.pixel(x, y);
+                if (p && pred(*p)) {
+                    b.min_x = std::min(b.min_x, x);
+                    b.max_x = std::max(b.max_x, x);
+                    b.min_y = std::min(b.min_y, y);
+                    b.max_y = std::max(b.max_y, y);
+                    ++b.count;
+                    ++b.row_counts[y];
+                }
+            }
+        }
+        return b;
+    };
+
+    // 1. Overline (red bar strictly at top of row 1)
+    auto is_red = [](const PremultipliedColorU8& p) { return p.r > 180 && p.g < 70 && p.b < 70; };
+    auto cpu_red = scan_bounds(cpu_r, 0, 75, is_red);
+    auto gpu_red = scan_bounds(gpu_r, 0, 75, is_red);
+    assert(cpu_red.count > 20 && gpu_red.count > 20);
+    assert(std::abs(int(cpu_red.min_y) - int(gpu_red.min_y)) <= 1);
+    assert(cpu_red.max_y < 40 && gpu_red.max_y < 40);
+
+    // 2. Double underline ("DDD" green lines, 2 rows separated or multi-row around baseline)
+    auto is_green = [](const PremultipliedColorU8& p) { return p.g > 180 && p.r < 70 && p.b < 70; };
+    auto cpu_dbl = scan_bounds(cpu_r, 38, 70, is_green);
+    auto gpu_dbl = scan_bounds(gpu_r, 38, 70, is_green);
+    assert(cpu_dbl.count > 40 && gpu_dbl.count > 40);
+    assert(std::abs(int(cpu_dbl.min_y) - int(gpu_dbl.min_y)) <= 2);
+    assert(std::abs(int(cpu_dbl.max_y) - int(gpu_dbl.max_y)) <= 2);
+    assert(gpu_dbl.max_y - gpu_dbl.min_y >= 2);
+
+    // 3. Dotted (cyan) and Dashed (yellow) periodic horizontal gaps
+    auto is_cyan = [](const PremultipliedColorU8& p) { return p.g > 85 && p.b > 85 && p.r < 50; };
+    auto is_yellow = [](const PremultipliedColorU8& p) { return p.r > 85 && p.g > 75 && p.b < 50; };
+    auto cpu_dot = scan_bounds(cpu_r, 38, 70, is_cyan);
+    auto gpu_dot = scan_bounds(gpu_r, 38, 70, is_cyan);
+    auto cpu_dash = scan_bounds(cpu_r, 38, 70, is_yellow);
+    auto gpu_dash = scan_bounds(gpu_r, 38, 70, is_yellow);
+    assert(cpu_dot.count >= 6 && gpu_dot.count >= 6);
+    assert(cpu_dash.count >= 12 && gpu_dash.count >= 12);
+    assert(cpu_dot.max_x > cpu_dot.min_x + 15 && gpu_dot.max_x > gpu_dot.min_x + 15);
+    assert(std::abs(int(cpu_dot.min_y) - int(gpu_dot.min_y)) <= 2);
+    assert(std::abs(int(cpu_dash.min_y) - int(gpu_dash.min_y)) <= 2);
+
+    // 4. Wavy (magenta) spans multiple scanlines below baseline
+    auto is_mag = [](const PremultipliedColorU8& p) { return p.r > 180 && p.b > 180 && p.g < 70; };
+    auto cpu_wav = scan_bounds(cpu_r, 38, 70, is_mag);
+    auto gpu_wav = scan_bounds(gpu_r, 38, 70, is_mag);
+    assert(cpu_wav.count > 25 && gpu_wav.count > 25);
+    assert(cpu_wav.max_y - cpu_wav.min_y >= 2 && gpu_wav.max_y - gpu_wav.min_y >= 2);
+    assert(std::abs(int(cpu_wav.min_y) - int(gpu_wav.min_y)) <= 2);
+
+    // 5. TextShadow ("SHW": sharp green shadow x > 300, blurred blue glow halo x > 280)
+    auto is_shw_green = [](const PremultipliedColorU8& p) { return p.g > 140 && p.r < 60 && p.b < 60; };
+    auto is_shw_blue = [](const PremultipliedColorU8& p) { return p.b > 15 && p.r < 30 && p.g < 140; };
+    ColorBounds cpu_sg, gpu_sg, cpu_sb, gpu_sb;
+    for (uint32_t y = 20; y < 80; ++y) {
+        for (uint32_t x = 250; x < W; ++x) {
+            auto cp = cpu_r.pixel(x, y);
+            auto gp = gpu_r.pixel(x, y);
+            if (cp && is_shw_green(*cp)) ++cpu_sg.count, cpu_sg.min_y = std::min(cpu_sg.min_y, y), cpu_sg.max_y = std::max(cpu_sg.max_y, y);
+            if (gp && is_shw_green(*gp)) ++gpu_sg.count, gpu_sg.min_y = std::min(gpu_sg.min_y, y), gpu_sg.max_y = std::max(gpu_sg.max_y, y);
+            if (cp && is_shw_blue(*cp)) ++cpu_sb.count, cpu_sb.min_y = std::min(cpu_sb.min_y, y), cpu_sb.max_y = std::max(cpu_sb.max_y, y);
+            if (gp && is_shw_blue(*gp)) ++gpu_sb.count, gpu_sb.min_y = std::min(gpu_sb.min_y, y), gpu_sb.max_y = std::max(gpu_sb.max_y, y);
+        }
+    }
+    assert(cpu_sg.count > 25 && gpu_sg.count > 25);
+    assert(cpu_sb.count > 40 && gpu_sb.count > 40);
+    assert(std::abs(int(cpu_sg.min_y) - int(gpu_sg.min_y)) <= 2);
+    assert(std::abs(int(cpu_sb.min_y) - int(gpu_sb.min_y)) <= 4);
+
+    // 6. RTL Align::Start amber row (y >= 80) right-aligned against width 240
+    auto is_amber = [](const PremultipliedColorU8& p) { return p.r > 120 && p.g > 60 && p.b < 60; };
+    auto cpu_rtl = scan_bounds(cpu_r, 80, H, is_amber);
+    auto gpu_rtl = scan_bounds(gpu_r, 80, H, is_amber);
+    assert(cpu_rtl.count > 40 && gpu_rtl.count > 40);
+    assert(cpu_rtl.min_x > 120 && gpu_rtl.min_x > 120);
+    assert(std::abs(int(cpu_rtl.max_x) - int(gpu_rtl.max_x)) <= 2);
+    assert(std::abs(int(cpu_rtl.min_y) - int(gpu_rtl.min_y)) <= 2);
+
+    std::cout << "  -> P1.6-PartB & P1.7 Text decorations, shadows, Align::Start & aliases parity OK" << std::endl;
+}
+
+static void test_gpu_shared_state_reset_and_blur_hardening() {
+    std::cout << "[Test 25/25] P2.10 Shared GL context resetState() & DualKawaseBlur state preservation..." << std::endl;
+
+    constexpr uint32_t W = 128;
+    constexpr uint32_t H = 128;
+    auto device = GpuDevice::create();
+    assert(device != nullptr);
+    auto surface = GpuSurface::create(device, W, H, 4);
+    assert(surface != nullptr);
+
+    GpuCanvas canvas(surface);
+    canvas.clear(Color::TRANSPARENT);
+    canvas.fill_rect(*Rect::from_xywh(16.0f, 16.0f, 40.0f, 40.0f), Paint(Color::from_rgba8(240, 40, 40, 200)));
+    canvas.flush();
+
+    // 1. Verify DualKawaseBlur preserves FBO, viewport, scissor, stencil, blend & alpha over MSAA FBO
+    {
+        GLint beforeDrawFbo = 0;
+        GLint beforeVp[4]{};
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &beforeDrawFbo);
+        glGetIntegerv(GL_VIEWPORT, beforeVp);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(10, 10, 50, 50);
+        glEnable(GL_BLEND);
+
+        nisaba::gpu::DualKawaseBlur blur;
+        nisaba::gpu::DualKawaseConfig cfg;
+        cfg.passes = 2;
+        cfg.radius = 2.0f;
+        // Pass MSAA fbo_id directly (tests MSAA resolve + RGBA8 alpha preservation!)
+        uint32_t out_tex = blur.blur_framebuffer(surface->fbo_id(), static_cast<int>(W), static_cast<int>(H), cfg);
+        assert(out_tex != 0);
+
+        GLint afterDrawFbo = 0;
+        GLint afterVp[4]{};
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &afterDrawFbo);
+        glGetIntegerv(GL_VIEWPORT, afterVp);
+        assert(afterDrawFbo == beforeDrawFbo);
+        assert(afterVp[0] == beforeVp[0] && afterVp[1] == beforeVp[1] && afterVp[2] == beforeVp[2] && afterVp[3] == beforeVp[3]);
+        assert(glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE);
+        assert(glIsEnabled(GL_BLEND) == GL_TRUE);
+        glDisable(GL_SCISSOR_TEST);
+    }
+
+    // 2. Deliberately corrupt GL state as an external embedder host might do
+    glActiveTexture(GL_TEXTURE1);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, 2, 2);
+    glEnable(GL_STENCIL_TEST);
+    glEnable(GL_CULL_FACE);
+    glBlendEquation(GL_FUNC_SUBTRACT);
+    glBlendFunc(GL_ZERO, GL_ZERO);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 13);
+
+    // Notify Nisaba that host mutated shared GL state, then draw a crisp green rect + strided pixmap
+    canvas.reset_state();
+    assert(glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE); // resetState resets caches & unpack/blendEq without failing draws
+
+    canvas.fill_rect(*Rect::from_xywh(60.0f, 20.0f, 48.0f, 48.0f), Paint(Color::from_rgba8(20, 220, 40, 255)));
+
+    auto stamp = Pixmap::allocate(16, 16, PixelFormat::RGBA8888);
+    assert(stamp.has_value());
+    stamp->fill(Color::from_rgba8(40, 80, 240, 255));
+    canvas.draw_pixmap(60, 76, stamp->as_ref());
+    canvas.flush();
+
+    auto pm = surface->to_pixmap();
+    assert(pm.has_value());
+    auto p_green = pm->as_ref().pixel(80, 40);
+    auto p_blue = pm->as_ref().pixel(68, 84);
+    assert(p_green.has_value() && p_green->g > 200 && p_green->r < 40 && p_green->b < 60 && p_green->a > 240);
+    assert(p_blue.has_value() && p_blue->b > 220 && p_blue->g >= 70 && p_blue->g <= 95 && p_blue->r <= 50 && p_blue->a > 240);
+
+    std::cout << "  -> P2.10 Shared GL context resetState() & DualKawaseBlur state preservation OK" << std::endl;
+}
+
+static void test_gpu_p3_svg_lottie_3d_parity() {
+    std::cout << "[TEST] P3.11 draw_pixmap_3d, SvgDocument::render_gpu & 3D Lottie CPU-vs-GPU Parity..." << std::endl;
+
+    auto dev = GpuDevice::create_headless();
+    assert(dev && dev->is_valid());
+
+    constexpr uint32_t W = 240;
+    constexpr uint32_t H = 200;
+    const Color bg = Color::from_rgba8(24, 28, 36, 255);
+
+    auto run_parity_case = [&](const char* label, auto&& draw_fn,
+                               const std::vector<std::pair<uint32_t, uint32_t>>& pts,
+                               int pt_tol = 10, float max_avg_diff = 5.5f) {
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(bg);
+        {
+            Canvas cpu(cpu_pm->as_mut());
+            draw_fn(cpu, false);
+        }
+
+        auto surface = GpuSurface::create(dev, W, H, 1);
+        assert(surface != nullptr);
+        GpuCanvas gpu(surface);
+        gpu.clear(bg);
+        draw_fn(gpu, true);
+        gpu.flush();
+        auto gpu_pm = surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        const auto cpu_r = cpu_pm->as_ref();
+        const auto gpu_r = gpu_pm->as_ref();
+        for (auto [px, py] : pts) {
+            auto cp = cpu_r.pixel(px, py);
+            auto gp = gpu_r.pixel(px, py);
+            assert(cp.has_value() && gp.has_value());
+            int dr = std::abs(int(cp->red()) - int(gp->red()));
+            int dg = std::abs(int(cp->green()) - int(gp->green()));
+            int db = std::abs(int(cp->blue()) - int(gp->blue()));
+            int da = std::abs(int(cp->alpha()) - int(gp->alpha()));
+            if (dr > pt_tol || dg > pt_tol || db > pt_tol || da > pt_tol) {
+                std::cerr << "  [MISMATCH] " << label << " @(" << px << "," << py << ") "
+                          << "CPU=(" << int(cp->red()) << "," << int(cp->green()) << "," << int(cp->blue()) << "," << int(cp->alpha()) << ") "
+                          << "GPU=(" << int(gp->red()) << "," << int(gp->green()) << "," << int(gp->blue()) << "," << int(gp->alpha()) << ")\n";
+                assert(false);
+            }
+        }
+
+        double sum_diff = 0.0;
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cpu_r.pixel(x, y);
+                auto gp = gpu_r.pixel(x, y);
+                int dr = std::abs(int(cp->red()) - int(gp->red()));
+                int dg = std::abs(int(cp->green()) - int(gp->green()));
+                int db = std::abs(int(cp->blue()) - int(gp->blue()));
+                int da = std::abs(int(cp->alpha()) - int(gp->alpha()));
+                sum_diff += (dr + dg + db + da) * 0.25;
+            }
+        }
+        double avg_diff = sum_diff / double(W * H);
+        if (avg_diff > max_avg_diff) {
+            std::cerr << "  [AVG MISMATCH] " << label << " avg_diff=" << avg_diff << " > " << max_avg_diff << "\n";
+            assert(false);
+        }
+    };
+
+    // 1. draw_pixmap_3d full + src_rect + opacity + BlendMode::Screen
+    {
+        auto quad_pm = Pixmap::allocate(64, 64, PixelFormat::RGBA8888);
+        assert(quad_pm.has_value());
+        Canvas qcanvas(quad_pm->as_mut());
+        qcanvas.fill_rect(*Rect::from_xywh(0, 0, 32, 32), Paint(Color::from_rgba8(230, 50, 40, 255)));
+        qcanvas.fill_rect(*Rect::from_xywh(32, 0, 32, 32), Paint(Color::from_rgba8(40, 220, 60, 255)));
+        qcanvas.fill_rect(*Rect::from_xywh(0, 32, 32, 32), Paint(Color::from_rgba8(40, 90, 240, 255)));
+        qcanvas.fill_rect(*Rect::from_xywh(32, 32, 32, 32), Paint(Color::from_rgba8(240, 220, 40, 255)));
+
+        Transform4x4 tr1 = Transform4x4::from_translate(35.0f, 35.0f) *
+                           Transform4x4::from_camera_orbit(32.0f, 32.0f, 24.0f, -26.0f, 10.0f, 320.0f);
+        Transform4x4 tr2 = Transform4x4::from_translate(145.0f, 80.0f) *
+                           Transform4x4::from_camera_orbit(16.0f, 16.0f, -20.0f, 22.0f, -8.0f, 280.0f);
+
+        run_parity_case("draw_pixmap_3d", [&](ICanvas& c, bool is_gpu) {
+            c.draw_pixmap_3d(quad_pm->as_ref(), tr1, 1.0f, BlendMode::SourceOver);
+            c.fill_rect(*Rect::from_xywh(135.0f, 70.0f, 70.0f, 70.0f), Paint(Color::from_rgba8(30, 60, 120, 255)));
+            if (is_gpu) {
+                static_cast<GpuCanvas&>(c).draw_pixmap_3d(
+                    quad_pm->as_ref(), *Rect::from_xywh(16.0f, 16.0f, 32.0f, 32.0f),
+                    tr2, 0.85f, BlendMode::Screen);
+            } else {
+                static_cast<Canvas&>(c).draw_pixmap_3d(
+                    quad_pm->as_ref(), *Rect::from_xywh(16.0f, 16.0f, 32.0f, 32.0f),
+                    tr2, 0.85f, BlendMode::Screen);
+            }
+        }, {{67, 67}, {161, 96}, {10, 10}}, 14, 4.0f);
+    }
+
+    // 2. SvgDocument::render vs render_gpu: gradients, pattern, objectBoundingBox clipPath,
+    //    isolated <g opacity>, stroke-dasharray, mix-blend-mode, nested <text>
+    {
+        const std::string svg_xml = R"svg(
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="200" viewBox="0 0 240 200">
+  <defs>
+    <linearGradient id="lg" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#f03040"/>
+      <stop offset="100%" stop-color="#3080f0"/>
+    </linearGradient>
+    <radialGradient id="rg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#fff040"/>
+      <stop offset="100%" stop-color="#20b050"/>
+    </radialGradient>
+    <pattern id="pat" width="16" height="16" patternUnits="userSpaceOnUse">
+      <rect x="0" y="0" width="8" height="8" fill="#40d0e0"/>
+      <rect x="8" y="8" width="8" height="8" fill="#e060c0"/>
+    </pattern>
+    <clipPath id="cp" clipPathUnits="objectBoundingBox">
+      <circle cx="0.5" cy="0.5" r="0.45"/>
+    </clipPath>
+  </defs>
+  <rect x="12" y="12" width="90" height="70" rx="10" fill="url(#lg)"/>
+  <g opacity="0.55">
+    <rect x="115" y="15" width="55" height="55" fill="#ff3030"/>
+    <rect x="140" y="30" width="55" height="55" fill="#30ff60"/>
+  </g>
+  <rect x="15" y="100" width="80" height="80" fill="url(#pat)" clip-path="url(#cp)"/>
+  <circle cx="145" cy="135" r="35" fill="url(#rg)" stroke="#ffffff" stroke-width="4" stroke-dasharray="10 6"/>
+  <rect x="165" y="110" width="55" height="55" fill="#6090ff" style="mix-blend-mode:multiply"/>
+</svg>)svg";
+        auto doc = svg::SvgDocument::parse(svg_xml);
+        assert(doc.has_value());
+        Rect bounds = Rect::from_xywh(0.0f, 0.0f, float(W), float(H)).value();
+
+        run_parity_case("SvgDocument::render vs render_gpu", [&](ICanvas& c, bool is_gpu) {
+            if (is_gpu) {
+                doc->render_gpu(static_cast<GpuCanvas&>(c), &bounds);
+            } else {
+                doc->render(static_cast<Canvas&>(c), &bounds);
+            }
+        }, {{30, 45}, {152, 48}, {55, 140}, {145, 135}, {180, 135}}, 14, 5.5f);
+    }
+
+    // 3. 3D Lottie animation layer with blend mode ("ddd": 1, "rx": 28, "bm": 2 Screen)
+    {
+        const std::string lottie_3d_json = R"({
+            "v": "5.7.4",
+            "fr": 60,
+            "ip": 0,
+            "op": 60,
+            "w": 240,
+            "h": 200,
+            "layers": [
+                {
+                    "ddd": 0,
+                    "ind": 1,
+                    "ty": 4,
+                    "nm": "Backdrop",
+                    "ks": {
+                        "p": {"a": 0, "k": [120, 100]},
+                        "a": {"a": 0, "k": [0, 0]},
+                        "s": {"a": 0, "k": [100, 100]}
+                    },
+                    "shapes": [
+                        {"ty": "rc", "p": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [150, 120]}, "r": {"a": 0, "k": 12}},
+                        {"ty": "fl", "c": {"a": 0, "k": [0.15, 0.25, 0.65, 1.0]}, "o": {"a": 0, "k": 100}}
+                    ]
+                },
+                {
+                    "ddd": 1,
+                    "ind": 2,
+                    "ty": 4,
+                    "nm": "Plane3D",
+                    "bm": 2,
+                    "ks": {
+                        "p": {"a": 0, "k": [120, 100, 0]},
+                        "a": {"a": 0, "k": [0, 0, 0]},
+                        "s": {"a": 0, "k": [100, 100, 100]},
+                        "rx": {"a": 0, "k": 28},
+                        "ry": {"a": 0, "k": -22},
+                        "rz": {"a": 0, "k": 8},
+                        "o": {"a": 0, "k": 85}
+                    },
+                    "shapes": [
+                        {"ty": "rc", "p": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 80]}, "r": {"a": 0, "k": 8}},
+                        {"ty": "fl", "c": {"a": 0, "k": [0.95, 0.35, 0.20, 1.0]}, "o": {"a": 0, "k": 100}}
+                    ]
+                }
+            ]
+        })";
+        auto anim = lottie::Animation::load_from_data(lottie_3d_json);
+        assert(anim != nullptr);
+
+        run_parity_case("Lottie 3D layer + BlendMode", [&](ICanvas& c, bool) {
+            anim->render(c, 10.0f);
+        }, {{120, 100}, {60, 60}, {10, 10}}, 14, 5.0f);
+    }
+
+    std::cout << "  -> P3.11 draw_pixmap_3d, SvgDocument::render_gpu & 3D Lottie Parity OK" << std::endl;
 }
 
 int main() {
@@ -687,9 +2485,21 @@ int main() {
     test_gpu_text_buffer_rendering();
     test_gpu_clip_path();
     test_gpu_backdrop_blur();
+    test_gpu_stage0_stability();
+    test_gpu_vertices_and_pixmap_rect();
+    test_gpu_dashed_strokes();
+    test_gpu_geometry_apis();
+    test_gpu_text_buffer_parity();
+    test_gpu_blend_modes_parity();
+    test_gpu_save_layer_parity();
+    test_gpu_gradients_and_pattern_parity();
+    test_gpu_effects_and_shadows_parity();
+    test_gpu_text_decorations_and_shadows_parity();
+    test_gpu_shared_state_reset_and_blur_hardening();
+    test_gpu_p3_svg_lottie_3d_parity();
 
     std::cout << "========================================" << std::endl;
-    std::cout << "All Nisaba GPU pipeline tests PASSED (14/14)!" << std::endl;
+    std::cout << "All Nisaba GPU pipeline tests PASSED (26/26)!" << std::endl;
     std::cout << "========================================" << std::endl;
 
     return 0;

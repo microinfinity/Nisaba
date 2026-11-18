@@ -22,6 +22,7 @@
 #include "nisaba/effects/color_matrix.hpp"
 
 namespace nisaba {
+    class ICanvas;
     class Canvas;
     namespace gpu {
         class GpuCanvas;
@@ -433,9 +434,14 @@ public:
     void set_css_variable(std::string name, Color col) { root_css_vars_[std::move(name)] = col; }
 
 private:
+    void apply_clip_path_to_canvas(ICanvas& canvas, const SvgElement& elem) const;
+    void render_element_dispatch(ICanvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth, bool is_gpu) const;
     void render_element(Canvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth = 0) const;
-    void render_element_raw(Canvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth) const;
-    void render_markers(Canvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth) const;
+    void render_element_raw(ICanvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth, bool is_gpu = false) const;
+    void render_markers(ICanvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth, bool is_gpu = false) const;
+#if defined(NISABA_HAS_GPU) || defined(NISABA_GLEW)
+    void render_element_gpu(gpu::GpuCanvas& canvas, const SvgElement& elem, const SvgTheme& theme, int use_depth = 0) const;
+#endif
     Path build_text_path(const SvgElement& elem) const;
     Rect compute_element_local_bounds(const SvgElement& elem, int depth = 0) const;
 

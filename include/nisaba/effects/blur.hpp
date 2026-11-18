@@ -28,6 +28,9 @@ void box_blur_pixmap(PixmapMut& pixmap, int32_t radius);
 /// Performs a 3-pass fast Gaussian blur approximation in-place on a 32-bit premultiplied RGBA pixmap.
 void gaussian_blur_pixmap(PixmapMut& pixmap, float sigma);
 
+/// Performs an anisotropic separable 3-pass Gaussian blur in-place with independent X/Y sigmas.
+void gaussian_blur_pixmap_xy(PixmapMut& pixmap, float sigma_x, float sigma_y);
+
 /// Creates a new blurred Pixmap from a source pixmap reference.
 Pixmap blur_pixmap(const PixmapRef& src, float sigma);
 

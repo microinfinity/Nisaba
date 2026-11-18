@@ -276,30 +276,3 @@ void WaylandLayerSurface::swapBuffers() {
 }
 
 } // namespace nisaba::backend_os::wayland
-
-namespace nisaba::backend_os {
-
-// ════════════════════════════════════════════════════════════════
-// Factory Method
-// ════════════════════════════════════════════════════════════════
-
-Result<std::unique_ptr<LayerSurface>> LayerSurface::create(Platform& platform, LayerSurfaceConfig config) {
-    auto* wayland_backend = static_cast<wayland::WaylandPlatformBackend*>(platform.getWaylandBackend());
-    if (wayland_backend) {
-        auto surface = std::make_unique<wayland::WaylandLayerSurface>(*wayland_backend, config);
-        if (!surface->init()) {
-            return Result<std::unique_ptr<LayerSurface>>::err(
-                ErrorCode::WindowError,
-                "Failed to initialize Wayland Layer Surface"
-            );
-        }
-        return Result<std::unique_ptr<LayerSurface>>::ok(std::move(surface));
-    }
-
-    return Result<std::unique_ptr<LayerSurface>>::err(
-        ErrorCode::PlatformError,
-        "LayerSurface currently requires Wayland with zwlr_layer_shell_v1 support"
-    );
-}
-
-} // namespace nisaba::backend_os

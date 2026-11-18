@@ -246,6 +246,7 @@ public:
     void reset() noexcept {
         verbs_.clear();
         points_.clear();
+        bounds_ = Rect{};
     }
 
     bool operator==(const Path& o) const noexcept {

@@ -66,14 +66,28 @@ public:
     size_t scan_font_directory(std::string_view dir_path, bool recursive = true);
 
     /// Loads a TrueType/OpenType font (or specific face of a .ttc collection) eagerly from a file path.
-    /// Returns unique font ID if successful.
-    std::optional<uint32_t> load_font_file(std::string_view path, uint32_t face_index = 0);
+    /// Returns unique font ID if successful, optionally binding a custom family alias name.
+    std::optional<uint32_t> load_font_file(
+        std::string_view path,
+        uint32_t face_index = 0,
+        std::string_view family_alias = {}
+    );
 
     /// Loads all faces from a TrueType/OpenType Collection (.ttc/.otc) or single font file.
     std::vector<uint32_t> load_font_collection(std::string_view path);
 
     /// Loads a TrueType/OpenType font from a memory buffer. Returns unique font ID if successful.
-    std::optional<uint32_t> load_font_data(std::span<const uint8_t> data, uint32_t face_index = 0);
+    std::optional<uint32_t> load_font_data(
+        std::span<const uint8_t> data,
+        uint32_t face_index = 0,
+        std::string_view family_alias = {}
+    );
+
+    /// Registers a custom alias family name resolving to an existing target family name.
+    void register_family_alias(std::string_view alias_name, std::string_view target_family);
+
+    /// Registers a custom alias family name resolving directly to a specific loaded font ID.
+    void register_family_alias(std::string_view alias_name, uint32_t font_id);
 
     /// Retrieves a loaded font by its unique ID (lazily instantiating it from disk/mmap if indexed).
     const TtfFont* get_font(uint32_t font_id) const noexcept;
@@ -185,6 +199,7 @@ private:
 
     std::vector<FaceRecord> faces_{};
     std::unordered_map<std::string, std::vector<size_t>> family_to_faces_{};
+    std::unordered_map<std::string, std::vector<uint32_t>> explicit_aliases_{};
     mutable std::unordered_map<std::string, std::weak_ptr<MappedFontData>> mmap_pool_{};
 
     // Fast 256-entry fallback cache indexed by ((primary_font_id * 31) ^ (codepoint >> 8)) & 255

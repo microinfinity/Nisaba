@@ -140,6 +140,25 @@ enum class Shaping : uint8_t {
     Advanced   /// Advanced script analysis, font fallback, GSUB/GPOS, and contextual shaping
 };
 
+/// Line style for text decorations (underline, overline, strikethrough).
+enum class DecorationStyle : uint8_t {
+    Solid,
+    Double,
+    Dotted,
+    Dashed,
+    Wavy
+};
+
+/// Drop shadow attached to a run of text.
+struct TextShadow {
+    TextColor color{TextColor::rgba(0, 0, 0, 128)};
+    float offset_x{0.0f};
+    float offset_y{0.0f};
+    float blur_sigma{0.0f};
+
+    constexpr bool operator==(const TextShadow& other) const noexcept = default;
+};
+
 /// Visual attributes associated with a run of text.
 struct Attrs {
     Family family{Family::sans_serif()};
@@ -154,6 +173,11 @@ struct Attrs {
     float baseline_shift{0.0f};
     bool underline{false};
     bool strikethrough{false};
+    bool overline{false};
+    DecorationStyle decoration_style{DecorationStyle::Solid};
+    std::optional<TextColor> decoration_color_opt{std::nullopt};
+    float decoration_thickness{1.0f};
+    std::vector<TextShadow> shadows{};
     size_t metadata{0};
 
     Attrs() noexcept = default;
@@ -170,6 +194,17 @@ struct Attrs {
     Attrs& set_baseline_shift(float bs) noexcept { baseline_shift = bs; return *this; }
     Attrs& set_underline(bool u = true) noexcept { underline = u; return *this; }
     Attrs& set_strikethrough(bool s = true) noexcept { strikethrough = s; return *this; }
+    Attrs& set_overline(bool o = true) noexcept { overline = o; return *this; }
+    Attrs& set_decoration_style(DecorationStyle ds) noexcept { decoration_style = ds; return *this; }
+    Attrs& set_decoration_color(TextColor c) noexcept { decoration_color_opt = c; return *this; }
+    Attrs& set_decoration_thickness(float t) noexcept { decoration_thickness = t; return *this; }
+    Attrs& add_shadow(const TextShadow& shadow) { shadows.push_back(shadow); return *this; }
+    Attrs& add_shadow(TextColor color, float dx, float dy, float blur_sigma = 0.0f) {
+        shadows.push_back(TextShadow{color, dx, dy, blur_sigma});
+        return *this;
+    }
+    Attrs& set_shadows(std::vector<TextShadow> list) { shadows = std::move(list); return *this; }
+    Attrs& clear_shadows() noexcept { shadows.clear(); return *this; }
     Attrs& set_metadata(size_t meta) noexcept { metadata = meta; return *this; }
 
     [[nodiscard]] bool has_custom_metrics_or_decorations() const noexcept {
@@ -179,6 +214,11 @@ struct Attrs {
                baseline_shift != 0.0f ||
                underline ||
                strikethrough ||
+               overline ||
+               decoration_style != DecorationStyle::Solid ||
+               decoration_color_opt.has_value() ||
+               decoration_thickness != 1.0f ||
+               !shadows.empty() ||
                background_color_opt.has_value();
     }
 

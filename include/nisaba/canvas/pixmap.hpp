@@ -163,8 +163,20 @@ struct SubPixmapMut {
 class PixmapRef {
 public:
     constexpr PixmapRef() noexcept = default;
-    constexpr PixmapRef(const uint8_t* data, size_t data_len, IntSize size, PixelFormat format = PixelFormat::RGBA8888, bool is_opaque = false) noexcept
-        : data_(data), data_len_(data_len), size_(size), format_(format), is_opaque_(is_opaque) {}
+    constexpr PixmapRef(
+        const uint8_t* data,
+        size_t data_len,
+        IntSize size,
+        PixelFormat format = PixelFormat::RGBA8888,
+        bool is_opaque = false,
+        size_t stride_bytes = 0
+    ) noexcept
+        : data_(data),
+          data_len_(data_len),
+          size_(size),
+          stride_bytes_(stride_bytes != 0 ? stride_bytes : static_cast<size_t>(size.width()) * nisaba::bytes_per_pixel(format)),
+          format_(format),
+          is_opaque_(is_opaque) {}
 
     [[nodiscard]] constexpr bool is_opaque() const noexcept {
         return format_ == PixelFormat::RGB565 || is_opaque_;
@@ -178,6 +190,15 @@ public:
         PixelFormat format = PixelFormat::RGBA8888
     ) noexcept;
 
+    static std::optional<PixmapRef> from_raw_parts(
+        const uint8_t* data,
+        uint32_t width,
+        uint32_t height,
+        size_t stride_bytes = 0,
+        PixelFormat format = PixelFormat::RGBA8888,
+        bool is_opaque = false
+    ) noexcept;
+
     Pixmap to_owned() const;
     Pixmap to_rgba8888() const;
 
@@ -186,7 +207,9 @@ public:
     constexpr IntSize size() const noexcept { return size_; }
     constexpr PixelFormat format() const noexcept { return format_; }
     constexpr size_t bytes_per_pixel() const noexcept { return nisaba::bytes_per_pixel(format_); }
-    constexpr size_t stride_bytes() const noexcept { return static_cast<size_t>(size_.width()) * bytes_per_pixel(); }
+    constexpr size_t stride_bytes() const noexcept {
+        return stride_bytes_ != 0 ? stride_bytes_ : static_cast<size_t>(size_.width()) * bytes_per_pixel();
+    }
 
     ScreenIntRect rect() const noexcept {
         return to_screen_int_rect(size_, 0, 0);
@@ -199,17 +222,15 @@ public:
         if (x >= width() || y >= height()) return std::nullopt;
         switch (format_) {
             case PixelFormat::RGBA8888:
-                return pixels()[static_cast<size_t>(y) * static_cast<size_t>(width()) + x];
+                return row(y)[x];
             case PixelFormat::BGRA8888: {
-                const auto* p = data_ + (static_cast<size_t>(y) * static_cast<size_t>(width()) + x) * 4;
+                const auto* p = row_raw(y) + x * 4;
                 return PremultipliedColorU8::from_rgba_unchecked(p[2], p[1], p[0], p[3]);
             }
-            case PixelFormat::RGB565: {
-                const auto* p = reinterpret_cast<const uint16_t*>(data_) + static_cast<size_t>(y) * static_cast<size_t>(width()) + x;
-                return PremultipliedColorU8::from_rgb565(*p);
-            }
+            case PixelFormat::RGB565:
+                return PremultipliedColorU8::from_rgb565(row_u16(y)[x]);
             case PixelFormat::Alpha8: {
-                uint8_t a = data_[static_cast<size_t>(y) * static_cast<size_t>(width()) + x];
+                uint8_t a = row_u8(y)[x];
                 return PremultipliedColorU8::from_rgba_unchecked(a, a, a, a);
             }
         }
@@ -221,7 +242,7 @@ public:
     }
 
     const PremultipliedColorU8* row(size_t y) const noexcept {
-        return pixels() + y * static_cast<size_t>(width());
+        return reinterpret_cast<const PremultipliedColorU8*>(data_ + y * stride_bytes());
     }
 
     const uint16_t* row_u16(size_t y) const noexcept {
@@ -254,6 +275,7 @@ private:
     const uint8_t* data_{nullptr};
     size_t data_len_{0};
     IntSize size_;
+    size_t stride_bytes_{0};
     PixelFormat format_{PixelFormat::RGBA8888};
     bool is_opaque_{false};
 };
@@ -297,13 +319,24 @@ public:
         if (format_ == PixelFormat::RGB565) return true;
         if (format_ == PixelFormat::Alpha8) return false;
         if (is_opaque_cache_.has_value()) return *is_opaque_cache_;
-        bool op = simd::is_buffer_opaque(pixels(), static_cast<size_t>(width()) * static_cast<size_t>(height()));
+        size_t min_stride = static_cast<size_t>(width()) * bytes_per_pixel();
+        bool op = true;
+        if (stride_bytes_ == min_stride) {
+            op = simd::is_buffer_opaque(pixels(), static_cast<size_t>(width()) * static_cast<size_t>(height()));
+        } else {
+            for (uint32_t y = 0; y < height(); ++y) {
+                if (!simd::is_buffer_opaque(row(y), width())) {
+                    op = false;
+                    break;
+                }
+            }
+        }
         is_opaque_cache_ = op;
         return op;
     }
 
     PixmapRef as_ref() const noexcept {
-        return PixmapRef(data_, data_len_, size_, format_, is_opaque());
+        return PixmapRef(data_, data_len_, size_, format_, is_opaque(), stride_bytes_);
     }
 
     constexpr uint32_t width() const noexcept { return size_.width(); }

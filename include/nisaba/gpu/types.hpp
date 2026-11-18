@@ -7,6 +7,7 @@
 #include <optional>
 #include <memory>
 #include "nisaba/color/color.hpp"
+#include "nisaba/color/blend_mode.hpp"
 #include "nisaba/math/point.hpp"
 #include "nisaba/math/rect.hpp"
 #include "nisaba/math/transform.hpp"
@@ -22,7 +23,9 @@ inline constexpr float KAPPA90 = 0.5522847493f; // Length proportional to radius
 enum class Winding : int {
 	CounterClockwise = 1, // Default winding for solid shapes
 	Clockwise = 2,        // Winding for holes
-	Hole = 2              // Alias for Clockwise
+	Hole = 2,             // Alias for Clockwise
+	Preserve = 3,         // Preserve path subpath relative orientations (holes stay opposite outer)
+	EvenOdd = 4           // Even-odd parity fill rule
 };
 
 enum class LineCap : int {
@@ -132,8 +135,11 @@ struct CompositeOperationState {
 	BlendFactor dstRGB{BlendFactor::OneMinusSrcAlpha};
 	BlendFactor srcAlpha{BlendFactor::One};
 	BlendFactor dstAlpha{BlendFactor::OneMinusSrcAlpha};
+	BlendMode blendMode{BlendMode::SourceOver};
+	bool isProgrammableBlend{false};
 
 	static CompositeOperationState fromCompositeOp(CompositeOperation op);
+	static CompositeOperationState fromBlendMode(BlendMode mode) noexcept;
 };
 
 enum ImageFlags : int {
@@ -142,7 +148,11 @@ enum ImageFlags : int {
 	ImageRepeatY         = 1 << 2,
 	ImageFlipY           = 1 << 3,
 	ImagePremultiplied   = 1 << 4,
-	ImageNearest         = 1 << 5
+	ImageNearest         = 1 << 5,
+	ImageForceBilinear   = 1 << 6,
+	ImageForceNearest    = 1 << 7,
+	ImageMirrorX         = 1 << 8,
+	ImageMirrorY         = 1 << 9
 };
 
 enum CreateFlags : int {
@@ -343,18 +353,76 @@ struct Scissor {
 	float extent[2]{-1.0f, -1.0f}; // extent[0] < 0 means scissor is disabled
 };
 
+struct LayerDesc {
+	bool hasBounds{false};
+	float bounds[4]{0.0f, 0.0f, 0.0f, 0.0f}; // device-space AABB [x0, y0, x1, y1]
+	bool copyBackdrop{false};
+	float backdropBlurSigma{0.0f};
+	float opacity{1.0f};
+	CompositeOperationState compOp{};
+	bool hasColorMatrix{false};
+	std::array<float, 20> colorMatrix{};
+	uint8_t colorTransfer{0}; // 0 = None, 1 = SrgbToLinear, 2 = LinearToSrgb
+	bool hasColorBlend{false};
+	Color colorBlendColor{0.0f, 0.0f, 0.0f, 0.0f};
+	BlendMode colorBlendMode{BlendMode::SourceOver};
+	float postBlurSigmaX{0.0f};
+	float postBlurSigmaY{0.0f};
+	bool isDropShadow{false};
+	float shadowDx{0.0f};
+	float shadowDy{0.0f};
+	Color shadowColor{0.0f, 0.0f, 0.0f, 0.0f};
+	bool shadowOnly{false};
+};
+
 // -------------------------------------------------------------
 // Paint (Gradients, Solid Colors, Image Patterns)
 // -------------------------------------------------------------
+enum class GradientKind : uint8_t {
+	None = 0,
+	Linear = 1,
+	Radial = 2,
+	Sweep = 3,
+	TwoPointConical = 4
+};
+
+enum class SpreadKind : uint8_t {
+	Pad = 0,
+	Repeat = 1,
+	Reflect = 2
+};
+
+struct GradientStopGPU {
+	float position{0.0f};
+	Color color{};
+};
+
 struct Paint {
 	Transform2D xform{Transform2D::identity()};
+	Transform2D gradUnitXform{Transform2D::identity()};
 	float extent[2]{0.0f, 0.0f};
 	float radius{0.0f};
 	float feather{0.0f};
 	Color innerColor{0.0f, 0.0f, 0.0f, 1.0f};
 	Color outerColor{0.0f, 0.0f, 0.0f, 1.0f};
 	int image{0};
+	bool hasColorMatrix{false};
+	std::array<float, 20> colorMatrix{};
+	uint8_t colorTransfer{0}; // 0 = None, 1 = SrgbToLinear, 2 = LinearToSrgb
+	bool hasColorBlend{false};
+	Color colorBlendColor{0.0f, 0.0f, 0.0f, 0.0f};
+	BlendMode colorBlendMode{BlendMode::SourceOver};
+	GradientKind gradientKind{GradientKind::None};
+	SpreadKind gradientSpread{SpreadKind::Pad};
+	int gradStopCount{0}; // 0..16 inline stops, -1 = 256x1 RGBA LUT in `image`
+	std::array<float, 4> gradParams0{};
+	std::array<float, 4> gradParams1{};
+	std::array<GradientStopGPU, 16> gradStops{};
 	std::shared_ptr<class Shader> customShader{nullptr};
+
+	[[nodiscard]] bool hasAdvancedGradient() const noexcept {
+		return gradientKind != GradientKind::None;
+	}
 
 	static Paint color(Color col) {
 		Paint p;

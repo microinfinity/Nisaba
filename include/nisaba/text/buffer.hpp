@@ -15,6 +15,57 @@
 
 namespace nisaba::text {
 
+/// Byte offset range [start, end) within flattened buffer coordinates.
+struct TextRange {
+    size_t start{0};
+    size_t end{0};
+
+    constexpr size_t length() const noexcept { return (end > start) ? (end - start) : 0; }
+    constexpr bool empty() const noexcept { return start >= end; }
+    constexpr bool operator==(const TextRange& other) const noexcept = default;
+};
+
+/// Result of hit-testing coordinates against a shaped text buffer.
+struct GlyphPosition {
+    size_t position{0};   /// Flattened UTF-8 byte offset across buffer lines
+    bool upstream{false}; /// true = trailing/upstream affinity, false = leading/downstream affinity
+
+    constexpr bool operator==(const GlyphPosition& other) const noexcept = default;
+};
+
+/// Vertical box extent mode for Buffer::range_rects.
+enum class RectHeightStyle : uint8_t {
+    Max,
+    Tight
+};
+
+/// Shared CPU/GPU decoration geometry generated from a shaped LayoutRun.
+struct DecorationGeometry {
+    struct RectSpan {
+        float x{0.0f};
+        float y{0.0f};
+        float w{0.0f};
+        float h{0.0f};
+        Color color{};
+    };
+    struct WaveStroke {
+        std::vector<Point> points{};
+        float stroke_width{1.0f};
+        Color color{};
+    };
+    std::vector<RectSpan> rects{};
+    std::vector<WaveStroke> waves{};
+};
+
+/// Builds continuous, span-merged decoration primitives for a single LayoutRun.
+[[nodiscard]] DecorationGeometry build_run_decorations(
+    const LayoutRun& run,
+    float origin_x,
+    float origin_y,
+    float default_font_size,
+    Color default_color
+);
+
 /// Represents a single paragraph line of text with its attributes and laid out visual lines.
 class BufferLine {
 public:
@@ -110,6 +161,32 @@ public:
 
     /// Maximum visual width across all formatted lines.
     float max_line_width() const;
+
+    /// Longest wrapped line width across the laid-out buffer.
+    [[nodiscard]] float longest_line_width() const noexcept { return max_line_width(); }
+
+    /// Maximum intrinsic width when shaped without line-wrapping constraints.
+    [[nodiscard]] float max_intrinsic_width(FontSystem& font_system) const;
+
+    /// Computes bounding rectangles covering flattened UTF-8 byte range [start, end).
+    [[nodiscard]] std::vector<Rect> range_rects(
+        size_t start,
+        size_t end,
+        float origin_x = 0.0f,
+        float origin_y = 0.0f,
+        RectHeightStyle height_style = RectHeightStyle::Max
+    ) const;
+
+    /// Maps visual coordinates (x, y) to the closest flattened byte position and edge affinity.
+    [[nodiscard]] GlyphPosition glyph_position_at(
+        float x,
+        float y,
+        float origin_x = 0.0f,
+        float origin_y = 0.0f
+    ) const;
+
+    /// Returns the flattened UTF-8 word range [start, end) containing or adjacent to byte_pos.
+    [[nodiscard]] TextRange word_range_at(size_t byte_pos) const;
 
     /// Draws the buffer onto a Canvas using pre-rendered glyph masks, decorations, and highlights.
     void draw(

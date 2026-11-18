@@ -32,6 +32,7 @@ struct State {
 	Align textAlign{Align::Left | Align::Baseline};
 	int fontId{0};
 	int clipDepth{0};
+	bool isLayer{false};
 };
 
 class Context {
@@ -48,8 +49,10 @@ public:
 
 	// State Handling
 	void save();
+	void pushLayer(const LayerDesc& desc);
 	void restore();
 	void reset();
+	void resetState();
 
 	// State Setting
 	void shapeAntiAlias(bool enabled);
@@ -93,13 +96,17 @@ public:
 
 	// Global Compositing
 	void globalCompositeOperation(CompositeOperation op);
+	void globalCompositeBlendMode(BlendMode mode);
 	void globalCompositeBlendFunc(BlendFactor sfactor, BlendFactor dfactor);
 	void globalCompositeBlendFuncSeparate(BlendFactor srcRGB, BlendFactor dstRGB, BlendFactor srcAlpha, BlendFactor dstAlpha);
+	void setCompositeState(const CompositeOperationState& state);
+	const CompositeOperationState& currentCompositeState() const;
 
 	// Image Creation
 	int createImage(const char* filename, int imageFlags = 0);
 	int createImageMem(int imageFlags, unsigned char* data, int ndata);
 	int createImageRGBA(int w, int h, int imageFlags, const unsigned char* data);
+	int createImageWithFormat(int w, int h, int strideBytes, PixelFormat format, int imageFlags, const unsigned char* data);
 	void updateImage(int image, const unsigned char* data);
 	void imageSize(int image, int& w, int& h);
 	void deleteImage(int image);
@@ -112,7 +119,7 @@ public:
 
 	// Paths
 	void beginPath();
-	void path(const nisaba::Path& p);
+	void path(const nisaba::Path& p, Winding defaultWinding = Winding::Preserve);
 	void moveTo(float x, float y);
 	void lineTo(float x, float y);
 	void bezierTo(float c1x, float c1y, float c2x, float c2y, float x, float y);
@@ -131,6 +138,8 @@ public:
 	// Draw Operations
 	void fill();
 	void stroke();
+	void drawTriangles(const Paint& paint, const Vertex* verts, int nverts, float fringe = 0.0f, int shaderType = 4);
+	void rrectShadow(float x, float y, float w, float h, float rTL, float rTR, float rBR, float rBL, float sigma, Color color, const float* occludedBox = nullptr);
 
 	// Fonts & Text
 	int createFont(const char* name, const char* filename);
@@ -201,7 +210,14 @@ private:
 	const std::vector<MeasuredGlyph>& layoutGlyphsInternal(const State& s, const text::TtfFont* primaryFont, uint32_t fontId, float scaledSize, float fontSize, const char* string, const char* end, float* outTotalWidth) const;
 	const std::vector<MeasuredGlyph>& layoutGlyphs(const State& s, float scaledSize, const char* string, const char* end, float* outTotalWidth) const;
 
+	struct LayerEntry {
+		LayerDesc desc;
+		Scissor parentScissor;
+		int parentClipDepth{0};
+	};
+
 	std::vector<State> m_states;
+	std::vector<LayerEntry> m_layerStack;
 	std::vector<PathCommand> m_commands;
 	float m_commandX{0.0f};
 	float m_commandY{0.0f};

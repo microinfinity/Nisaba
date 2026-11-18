@@ -44,7 +44,7 @@ public:
     void stroke_path(const Path& path, const Paint& paint, const Stroke& stroke) override;
 
     // --- Extended Vector PDF Operations ---
-    void stroke_rect(const Rect& rect, const Paint& paint, const Stroke& stroke);
+    void stroke_rect(const Rect& rect, const Paint& paint, const Stroke& stroke) override;
     void draw_line(Point p1, Point p2, const Paint& paint, const Stroke& stroke);
     void draw_circle(Point center, float radius, const Paint& paint);
     void stroke_circle(Point center, float radius, const Paint& paint, const Stroke& stroke);

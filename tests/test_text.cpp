@@ -1,7 +1,9 @@
 #include <cassert>
+#include <cmath>
 #include <iostream>
 #include <fstream>
 #include <string_view>
+#include <vector>
 #include "nisaba/nisaba.hpp"
 
 using namespace nisaba;
@@ -482,6 +484,189 @@ void test_grapheme_word_cursor_and_selection_rects() {
     std::cout << "  -> PASS" << std::endl;
 }
 
+void test_p16_partb_and_p17_text_features() {
+    std::cout << "[Test] P1.6-PartB & P1.7 Align::Start, Queries, Decorations, Shadows & Aliases..." << std::endl;
+
+    FontSystem fs;
+    auto fid_inter = fs.load_font_file(resolve_font("Inter-Regular.ttf"));
+    auto fid_arabic = fs.load_font_file(resolve_font("NotoSansArabic.ttf"));
+    assert(fid_inter.has_value() && fid_arabic.has_value());
+
+    // 1. Align::Start resolves to Left for LTR and Right for RTL base direction
+    {
+        Buffer ltr_buf(Metrics(18.0f, 24.0f));
+        ltr_buf.set_size(240.0f, std::nullopt);
+        ltr_buf.set_align(Align::Start);
+        ltr_buf.set_text("Hello");
+        ltr_buf.shape_until_scroll(fs);
+        auto ltr_runs = ltr_buf.layout_runs();
+        assert(!ltr_runs.empty() && !ltr_runs[0].glyphs.empty());
+        assert(ltr_runs[0].line_width < 120.0f);
+        assert(ltr_runs[0].glyphs.front().x < 4.0f);
+
+        Buffer rtl_buf(Metrics(18.0f, 24.0f));
+        rtl_buf.set_size(240.0f, std::nullopt);
+        rtl_buf.set_align(Align::Start);
+        rtl_buf.set_text("\xD9\x85\xD8\xB1\xD8\xAD\xD8\xA8\xD8\xA7"); // "مرحبا"
+        rtl_buf.shape_until_scroll(fs);
+        auto rtl_runs = rtl_buf.layout_runs();
+        assert(!rtl_runs.empty() && !rtl_runs[0].glyphs.empty());
+        assert(rtl_runs[0].line_width < 180.0f);
+        assert(rtl_runs[0].glyphs.front().x > 100.0f);
+
+        Buffer rtl_left(Metrics(18.0f, 24.0f));
+        rtl_left.set_size(240.0f, std::nullopt);
+        rtl_left.set_align(Align::Left);
+        rtl_left.set_text("\xD9\x85\xD8\xB1\xD8\xAD\xD8\xA8\xD8\xA7");
+        rtl_left.shape_until_scroll(fs);
+        assert(rtl_left.layout_runs()[0].glyphs.front().x < 4.0f);
+    }
+
+    // 2. max_intrinsic_width vs wrapped longest_line_width, word_range_at, range_rects, glyph_position_at
+    {
+        Buffer qbuf(Metrics(16.0f, 24.0f));
+        const std::string sample = "Alpha Beta\nGamma Delta";
+        qbuf.set_text(sample);
+        qbuf.shape_until_scroll(fs);
+        const float intrinsic_nl = qbuf.max_intrinsic_width(fs);
+        assert(intrinsic_nl > 60.0f);
+
+        Buffer wbuf(Metrics(16.0f, 24.0f));
+        wbuf.set_text("Alpha Beta Gamma Delta Sovereign Typography");
+        wbuf.set_size(120.0f, std::nullopt);
+        wbuf.set_wrap(Wrap::Word);
+        wbuf.shape_until_scroll(fs);
+        assert(wbuf.layout_runs().size() >= 2);
+        const float longest_wrapped = wbuf.longest_line_width();
+        const float max_intrinsic = wbuf.max_intrinsic_width(fs);
+        assert(longest_wrapped <= 125.0f);
+        assert(max_intrinsic > longest_wrapped + 40.0f);
+
+        // word_range_at
+        TextRange w0 = qbuf.word_range_at(2); // inside "Alpha"
+        assert(w0.start == 0 && w0.end == 5);
+        assert(sample.substr(w0.start, w0.length()) == "Alpha");
+
+        const size_t delta_pos = sample.find("Delta");
+        TextRange w1 = qbuf.word_range_at(delta_pos + 2);
+        assert(sample.substr(w1.start, w1.length()) == "Delta");
+
+        // range_rects (Max vs Tight height styles across two lines)
+        auto r_max = qbuf.range_rects(0, sample.size(), 10.0f, 20.0f, RectHeightStyle::Max);
+        auto r_tight = qbuf.range_rects(0, sample.size(), 10.0f, 20.0f, RectHeightStyle::Tight);
+        assert(r_max.size() >= 2 && r_tight.size() >= 2);
+        assert(r_max[0].x() >= 9.9f && r_max[0].y() >= 19.9f);
+        assert(r_max[0].height() >= r_tight[0].height() - 0.1f);
+        assert(r_max[1].y() > r_max[0].y());
+
+        // glyph_position_at hit testing on line 0 and line 1
+        auto gp0 = qbuf.glyph_position_at(
+            r_max[0].x() + r_max[0].width() * 0.25f,
+            r_max[0].y() + r_max[0].height() * 0.5f,
+            10.0f, 20.0f
+        );
+        assert(gp0.position <= 10);
+
+        auto gp1 = qbuf.glyph_position_at(
+            r_max[1].x() + r_max[1].width() * 0.5f,
+            r_max[1].y() + r_max[1].height() * 0.5f,
+            10.0f, 20.0f
+        );
+        assert(gp1.position >= 11);
+    }
+
+    // 3. FontSystem explicit aliases via load_font_file, load_font_data & register_family_alias
+    {
+        FontSystem alias_fs;
+        auto f_inter = alias_fs.load_font_file(resolve_font("Inter-Regular.ttf"), 0, "BrandSans");
+        assert(f_inter.has_value());
+
+        std::ifstream fstream(resolve_font("FiraMono-Medium.ttf"), std::ios::binary | std::ios::ate);
+        assert(fstream.is_open());
+        const auto sz = static_cast<size_t>(fstream.tellg());
+        fstream.seekg(0, std::ios::beg);
+        std::vector<uint8_t> mono_bytes(sz);
+        fstream.read(reinterpret_cast<char*>(mono_bytes.data()), static_cast<std::streamsize>(sz));
+        assert(fstream.good());
+
+        auto f_mono = alias_fs.load_font_data(mono_bytes, 0, "BrandMonoMem");
+        assert(f_mono.has_value());
+
+        alias_fs.register_family_alias("UiBody", "BrandSans");
+        alias_fs.register_family_alias("UiMonoId", *f_mono);
+
+        auto m1 = alias_fs.match_font_styled(Family("BrandSans"));
+        auto m2 = alias_fs.match_font_styled(Family("UiBody"));
+        auto m3 = alias_fs.match_font_styled(Family("BrandMonoMem"));
+        auto m4 = alias_fs.match_font_styled(Family("UiMonoId"));
+        assert(m1.font != nullptr && m1.font_id == *f_inter);
+        assert(m2.font != nullptr && m2.font_id == *f_inter);
+        assert(m3.font != nullptr && m3.font_id == *f_mono);
+        assert(m4.font != nullptr && m4.font_id == *f_mono);
+    }
+
+    // 4. CPU rendering of overline, 5 decoration styles, custom decoration color/thickness, and sharp + blurred shadows
+    {
+        Buffer dec_buf(Metrics(22.0f, 32.0f));
+        Attrs base;
+        base.set_color(TextColor::rgb(255, 255, 255));
+        dec_buf.set_text("OOO DDD TTT AAA WWW SHW", base);
+        auto& alist = dec_buf.lines_mut()[0].attrs_list_mut();
+
+        Attrs a_over = base;
+        a_over.set_overline(true).set_decoration_color(TextColor::rgb(255, 50, 50)).set_decoration_thickness(1.5f);
+        Attrs a_dbl = base;
+        a_dbl.set_underline(true).set_decoration_style(DecorationStyle::Double).set_decoration_color(TextColor::rgb(50, 255, 50));
+        Attrs a_dot = base;
+        a_dot.set_underline(true).set_decoration_style(DecorationStyle::Dotted).set_decoration_color(TextColor::rgb(50, 240, 255));
+        Attrs a_dash = base;
+        a_dash.set_underline(true).set_decoration_style(DecorationStyle::Dashed).set_decoration_color(TextColor::rgb(255, 230, 40));
+        Attrs a_wavy = base;
+        a_wavy.set_underline(true).set_decoration_style(DecorationStyle::Wavy).set_decoration_color(TextColor::rgb(255, 60, 255));
+        Attrs a_shw = base;
+        a_shw.add_shadow(TextColor::rgb(0, 220, 0), 5.0f, 4.0f, 0.0f)
+             .add_shadow(TextColor::rgb(0, 140, 255), -4.0f, 7.0f, 2.5f);
+
+        alist.add_span(0, 3, a_over);
+        alist.add_span(4, 7, a_dbl);
+        alist.add_span(8, 11, a_dot);
+        alist.add_span(12, 15, a_dash);
+        alist.add_span(16, 19, a_wavy);
+        alist.add_span(20, 23, a_shw);
+        dec_buf.shape_until_scroll(fs);
+
+        auto pixmap = Pixmap::allocate(480, 90);
+        assert(pixmap.has_value());
+        Canvas canvas(*pixmap);
+        canvas.clear(Color::BLACK);
+        GlyphCache cache(128);
+        dec_buf.draw(canvas, cache, fs, Color::WHITE, 12.0f, 16.0f);
+
+        size_t red_px = 0, green_px = 0, cyan_px = 0, yellow_px = 0, mag_px = 0, blue_glow_px = 0;
+        const auto pref = pixmap->as_ref();
+        for (uint32_t y = 0; y < 90; ++y) {
+            for (uint32_t x = 0; x < 480; ++x) {
+                auto p = pref.pixel(x, y);
+                if (!p) continue;
+                if (p->r > 180 && p->g < 80 && p->b < 80) ++red_px;
+                if (p->g > 150 && p->r < 80 && p->b < 80) ++green_px;
+                if (p->g > 180 && p->b > 180 && p->r < 80) ++cyan_px;
+                if (p->r > 180 && p->g > 160 && p->b < 80) ++yellow_px;
+                if (p->r > 180 && p->b > 180 && p->g < 80) ++mag_px;
+                if (p->b > 20 && p->b < 200 && p->r < 25) ++blue_glow_px;
+            }
+        }
+        assert(red_px > 20);
+        assert(green_px > 40);
+        assert(cyan_px > 8);
+        assert(yellow_px > 12);
+        assert(mag_px > 20);
+        assert(blue_glow_px > 30);
+    }
+
+    std::cout << "  -> PASS" << std::endl;
+}
+
 int main() {
     std::cout << "==========================================" << std::endl;
     std::cout << "   Nisaba Sovereign Text Engine Test Suite" << std::endl;
@@ -498,9 +683,10 @@ int main() {
     test_extended_arabic_tashkeel_and_mirroring();
     test_rich_typography_and_layout();
     test_grapheme_word_cursor_and_selection_rects();
+    test_p16_partb_and_p17_text_features();
 
     std::cout << "==========================================" << std::endl;
-    std::cout << "All 11 text test suites passed successfully!" << std::endl;
+    std::cout << "All 12 text test suites passed successfully!" << std::endl;
     std::cout << "==========================================" << std::endl;
     return 0;
 }

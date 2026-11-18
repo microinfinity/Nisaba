@@ -41,6 +41,14 @@ struct CanvasState {
     std::shared_ptr<Mask> clip_mask{};
     std::optional<ScreenIntRect> scissor_clip{};
     const Mask* external_mask{nullptr};
+    bool is_layer{false};
+};
+
+struct CanvasLayerState {
+    Pixmap backing_pixmap{};
+    PixmapMut saved_pixmap{};
+    Paint composite_paint{};
+    std::optional<ScreenIntRect> device_bounds{};
 };
 
 class Canvas : public ICanvas {
@@ -65,21 +73,190 @@ public:
             .transform = current_transform_,
             .clip_mask = active_clip_mask_,
             .scissor_clip = scissor_clip_,
-            .external_mask = external_mask_ptr_
+            .external_mask = external_mask_ptr_,
+            .is_layer = false
         });
     }
 
+    void save_layer(const Paint& paint = Paint(Color::WHITE)) override {
+        push_layer_internal(std::nullopt, paint, false, 0.0f);
+    }
+
+    void save_layer_bounds(const Rect& bounds, const Paint& paint = Paint(Color::WHITE)) override {
+        push_layer_internal(bounds, paint, false, 0.0f);
+    }
+
+    void save_layer_backdrop(
+        std::optional<Rect> bounds = std::nullopt,
+        const Paint& paint = Paint(Color::WHITE),
+        float blur_sigma = 0.0f
+    ) override {
+        push_layer_internal(bounds, paint, true, blur_sigma);
+    }
+
     void restore() override {
-        if (!state_stack_.empty()) {
-            current_transform_ = state_stack_.back().transform;
-            if (active_clip_mask_ && active_clip_mask_.use_count() == 1) {
-                recycled_mask_ = std::move(active_clip_mask_);
-            }
-            active_clip_mask_ = std::move(state_stack_.back().clip_mask);
-            scissor_clip_ = state_stack_.back().scissor_clip;
-            external_mask_ptr_ = state_stack_.back().external_mask;
-            state_stack_.pop_back();
+        if (state_stack_.empty()) return;
+        const bool was_layer = state_stack_.back().is_layer;
+        current_transform_ = state_stack_.back().transform;
+        if (active_clip_mask_ && active_clip_mask_.use_count() == 1) {
+            recycled_mask_ = std::move(active_clip_mask_);
         }
+        active_clip_mask_ = std::move(state_stack_.back().clip_mask);
+        scissor_clip_ = state_stack_.back().scissor_clip;
+        external_mask_ptr_ = state_stack_.back().external_mask;
+        state_stack_.pop_back();
+
+        if (!was_layer || layer_stack_.empty()) return;
+
+        CanvasLayerState layer = std::move(layer_stack_.back());
+        layer_stack_.pop_back();
+        pixmap_ = layer.saved_pixmap;
+
+        if (!layer.device_bounds.has_value()) {
+            return;
+        }
+
+        const ScreenIntRect bounds = *layer.device_bounds;
+        if (layer.composite_paint.has_image_filter()) {
+            const auto& imgf = *layer.composite_paint.image_filter;
+            auto mut_layer = layer.backing_pixmap.as_mut();
+            const size_t bpp = mut_layer.bytes_per_pixel();
+            uint8_t* ptr = mut_layer.row_raw(bounds.y()) + static_cast<size_t>(bounds.x()) * bpp;
+            if (auto sub = PixmapMut::from_raw_parts(
+                    ptr,
+                    bounds.width(),
+                    bounds.height(),
+                    mut_layer.stride_bytes(),
+                    mut_layer.format())) {
+                if (imgf.kind == effects::ImageFilterKind::Blur) {
+                    effects::gaussian_blur_pixmap_xy(*sub, imgf.sigma_x, imgf.sigma_y);
+                } else if (imgf.kind == effects::ImageFilterKind::DropShadow) {
+                    if (auto shadow_pix = Pixmap::allocate(sub->width(), sub->height(), sub->format())) {
+                        auto shadow_mut = shadow_pix->as_mut();
+                        PremultipliedColorU8 sc = imgf.color.premultiply().to_color_u8();
+                        const bool is_bgra = (sub->format() == PixelFormat::BGRA8888);
+                        if (is_bgra) {
+                            sc = PremultipliedColorU8::from_rgba_unchecked(sc.b, sc.g, sc.r, sc.a);
+                        }
+                        const uint32_t sw = sub->width();
+                        const uint32_t sh = sub->height();
+                        if (sub->format() == PixelFormat::RGBA8888 || is_bgra) {
+                            for (uint32_t y = 0; y < sh; ++y) {
+                                const auto* src_row = sub->row(y);
+                                auto* dst_row = shadow_mut.row(y);
+                                for (uint32_t x = 0; x < sw; ++x) {
+                                    uint32_t a = src_row[x].a;
+                                    if (a == 0) continue;
+                                    dst_row[x] = PremultipliedColorU8::from_rgba_unchecked(
+                                        static_cast<uint8_t>((sc.r * a + 128u) / 255u),
+                                        static_cast<uint8_t>((sc.g * a + 128u) / 255u),
+                                        static_cast<uint8_t>((sc.b * a + 128u) / 255u),
+                                        static_cast<uint8_t>((sc.a * a + 128u) / 255u)
+                                    );
+                                }
+                            }
+                        } else {
+                            PremultipliedColorU8 rgba_sc = imgf.color.premultiply().to_color_u8();
+                            for (uint32_t y = 0; y < sh; ++y) {
+                                for (uint32_t x = 0; x < sw; ++x) {
+                                    if (auto px = sub->pixel(x, y)) {
+                                        uint32_t a = px->a;
+                                        if (a == 0) continue;
+                                        shadow_mut.set_pixel(x, y, PremultipliedColorU8::from_rgba_unchecked(
+                                            static_cast<uint8_t>((rgba_sc.r * a + 128u) / 255u),
+                                            static_cast<uint8_t>((rgba_sc.g * a + 128u) / 255u),
+                                            static_cast<uint8_t>((rgba_sc.b * a + 128u) / 255u),
+                                            static_cast<uint8_t>((rgba_sc.a * a + 128u) / 255u)
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
+                        effects::gaussian_blur_pixmap_xy(shadow_mut, imgf.sigma_x, imgf.sigma_y);
+
+                        const int32_t dx_i = static_cast<int32_t>(std::round(imgf.dx));
+                        const int32_t dy_i = static_cast<int32_t>(std::round(imgf.dy));
+                        const int32_t iw = static_cast<int32_t>(sw);
+                        const int32_t ih = static_cast<int32_t>(sh);
+                        if (sub->format() == PixelFormat::RGBA8888 || is_bgra) {
+                            for (int32_t y = 0; y < ih; ++y) {
+                                int32_t sy = y - dy_i;
+                                auto* fg_row = sub->row(static_cast<size_t>(y));
+                                const auto* sh_row = (sy >= 0 && sy < ih) ? shadow_mut.row(static_cast<size_t>(sy)) : nullptr;
+                                for (int32_t x = 0; x < iw; ++x) {
+                                    int32_t sx = x - dx_i;
+                                    PremultipliedColorU8 sp = (sh_row && sx >= 0 && sx < iw)
+                                        ? sh_row[sx]
+                                        : PremultipliedColorU8::TRANSPARENT;
+                                    if (!imgf.shadow_only) {
+                                        PremultipliedColorU8 fg = fg_row[x];
+                                        if (fg.a > 0) {
+                                            simd::blend_source_over_span(&sp, &fg, 1);
+                                        }
+                                    }
+                                    fg_row[x] = sp;
+                                }
+                            }
+                        } else {
+                            for (int32_t y = 0; y < ih; ++y) {
+                                int32_t sy = y - dy_i;
+                                for (int32_t x = 0; x < iw; ++x) {
+                                    int32_t sx = x - dx_i;
+                                    PremultipliedColorU8 sp = PremultipliedColorU8::TRANSPARENT;
+                                    if (sy >= 0 && sy < ih && sx >= 0 && sx < iw) {
+                                        if (auto px = shadow_mut.pixel(static_cast<uint32_t>(sx), static_cast<uint32_t>(sy))) {
+                                            sp = *px;
+                                        }
+                                    }
+                                    if (!imgf.shadow_only) {
+                                        if (auto fg = sub->pixel(static_cast<uint32_t>(x), static_cast<uint32_t>(y))) {
+                                            if (fg->a > 0) {
+                                                simd::blend_source_over_span(&sp, &*fg, 1);
+                                            }
+                                        }
+                                    }
+                                    sub->set_pixel(static_cast<uint32_t>(x), static_cast<uint32_t>(y), sp);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (auto eff_cf = layer.composite_paint.effective_color_effect()) {
+            auto mut_layer = layer.backing_pixmap.as_mut();
+            const size_t bpp = mut_layer.bytes_per_pixel();
+            uint8_t* ptr = mut_layer.row_raw(bounds.y()) + static_cast<size_t>(bounds.x()) * bpp;
+            if (auto sub = PixmapMut::from_raw_parts(
+                    ptr,
+                    bounds.width(),
+                    bounds.height(),
+                    mut_layer.stride_bytes(),
+                    mut_layer.format())) {
+                eff_cf->apply(*sub);
+            }
+        }
+
+        std::optional<ScreenIntRect> composite_clip = bounds;
+        if (scissor_clip_.has_value()) {
+            composite_clip = composite_clip->intersect(*scissor_clip_);
+        }
+        if (!composite_clip.has_value()) {
+            return;
+        }
+
+        PixmapPaint px_paint;
+        px_paint.blend_mode = layer.composite_paint.blend_mode;
+        px_paint.opacity = layer.composite_paint.shader.is_solid_color()
+            ? std::clamp(layer.composite_paint.shader.solid_color().alpha(), 0.0f, 1.0f)
+            : 1.0f;
+
+        painter::draw_pixmap(
+            pixmap_, 0, 0, layer.backing_pixmap.as_ref(), px_paint,
+            Transform(), current_mask(), composite_clip
+        );
     }
 
     void reset_transform() noexcept {
@@ -106,8 +283,12 @@ public:
         current_transform_ = current_transform_.pre_scale(sx, sy);
     }
 
-    void rotate(float degrees) noexcept {
+    void rotate(float degrees) noexcept override {
         current_transform_ = current_transform_.pre_rotate(degrees);
+    }
+
+    void skew(float kx, float ky) noexcept override {
+        current_transform_ = current_transform_.pre_skew(kx, ky);
     }
 
     void concat(const Transform& ts) noexcept override {
@@ -297,61 +478,72 @@ public:
 
     void fill_rect(const Rect& rect, const Paint& paint) override {
         if (!scissor_clip_.has_value()) return;
-        if (linear_blending_ && !paint.is_linear_blending()) {
-            Paint p = paint;
-            p.set_linear_blending(true);
-            painter::fill_rect(pixmap_, rect, p, current_transform_, current_mask(), scissor_clip_);
-        } else {
-            painter::fill_rect(pixmap_, rect, paint, current_transform_, current_mask(), scissor_clip_);
+        if (paint.has_image_filter()) {
+            draw_with_image_filter(rect, paint, 0.0f, [&](const Paint& inner) {
+                painter::fill_rect(pixmap_, rect, inner, current_transform_, current_mask(), scissor_clip_);
+            });
+            return;
         }
+        Paint resolved = resolve_paint(paint);
+        painter::fill_rect(pixmap_, rect, resolved, current_transform_, current_mask(), scissor_clip_);
     }
 
     void fill_path(const Path& path, const Paint& paint, FillRule fill_rule = FillRule::Winding) override {
         if (!scissor_clip_.has_value()) return;
-        if (linear_blending_ && !paint.is_linear_blending()) {
-            Paint p = paint;
-            p.set_linear_blending(true);
-            painter::fill_path(pixmap_, path, p, fill_rule, current_transform_, current_mask(), scissor_clip_);
-        } else {
-            painter::fill_path(pixmap_, path, paint, fill_rule, current_transform_, current_mask(), scissor_clip_);
+        if (paint.has_image_filter()) {
+            draw_with_image_filter(path.bounds(), paint, 0.0f, [&](const Paint& inner) {
+                painter::fill_path(pixmap_, path, inner, fill_rule, current_transform_, current_mask(), scissor_clip_);
+            });
+            return;
         }
+        Paint resolved = resolve_paint(paint);
+        painter::fill_path(pixmap_, path, resolved, fill_rule, current_transform_, current_mask(), scissor_clip_);
     }
 
     void stroke_path(const Path& path, const Paint& paint, const Stroke& stroke) override {
         if (!scissor_clip_.has_value()) return;
-        if (linear_blending_ && !paint.is_linear_blending()) {
-            Paint p = paint;
-            p.set_linear_blending(true);
-            painter::stroke_path(pixmap_, path, p, stroke, current_transform_, current_mask(), scissor_clip_);
-        } else {
-            painter::stroke_path(pixmap_, path, paint, stroke, current_transform_, current_mask(), scissor_clip_);
+        if (paint.has_image_filter()) {
+            const float margin = stroke_filter_margin(stroke);
+            draw_with_image_filter(path.bounds(), paint, margin, [&](const Paint& inner) {
+                painter::stroke_path(pixmap_, path, inner, stroke, current_transform_, current_mask(), scissor_clip_);
+            });
+            return;
         }
+        Paint resolved = resolve_paint(paint);
+        painter::stroke_path(pixmap_, path, resolved, stroke, current_transform_, current_mask(), scissor_clip_);
     }
 
     void stroke_line(Point p0, Point p1, const Paint& paint, const Stroke& stroke) {
         if (!scissor_clip_.has_value()) return;
-        if (linear_blending_ && !paint.is_linear_blending()) {
-            Paint p = paint;
-            p.set_linear_blending(true);
-            painter::stroke_line(pixmap_, p0, p1, p, stroke, current_transform_, current_mask(), scissor_clip_);
-        } else {
-            painter::stroke_line(pixmap_, p0, p1, paint, stroke, current_transform_, current_mask(), scissor_clip_);
+        if (paint.has_image_filter()) {
+            const float x0 = std::min(p0.x, p1.x);
+            const float y0 = std::min(p0.y, p1.y);
+            const float x1 = std::max(p0.x, p1.x);
+            const float y1 = std::max(p0.y, p1.y);
+            auto lb = Rect::from_ltrb(x0, y0, std::max(x1, x0 + 1.0f), std::max(y1, y0 + 1.0f));
+            const float margin = stroke_filter_margin(stroke);
+            draw_with_image_filter(lb, paint, margin, [&](const Paint& inner) {
+                painter::stroke_line(pixmap_, p0, p1, inner, stroke, current_transform_, current_mask(), scissor_clip_);
+            });
+            return;
         }
+        Paint resolved = resolve_paint(paint);
+        painter::stroke_line(pixmap_, p0, p1, resolved, stroke, current_transform_, current_mask(), scissor_clip_);
     }
 
     void stroke_line(float x0, float y0, float x1, float y1, const Paint& paint, const Stroke& stroke) {
-        if (!scissor_clip_.has_value()) return;
-        if (linear_blending_ && !paint.is_linear_blending()) {
-            Paint p = paint;
-            p.set_linear_blending(true);
-            painter::stroke_line(pixmap_, Point::from_xy(x0, y0), Point::from_xy(x1, y1), p, stroke, current_transform_, current_mask(), scissor_clip_);
-        } else {
-            painter::stroke_line(pixmap_, Point::from_xy(x0, y0), Point::from_xy(x1, y1), paint, stroke, current_transform_, current_mask(), scissor_clip_);
-        }
+        stroke_line(Point::from_xy(x0, y0), Point::from_xy(x1, y1), paint, stroke);
     }
 
-    void stroke_rect(const Rect& rect, const Paint& paint, const Stroke& stroke) {
+    void stroke_rect(const Rect& rect, const Paint& paint, const Stroke& stroke) override {
         if (!scissor_clip_.has_value()) return;
+        if (paint.has_image_filter()) {
+            const float margin = stroke_filter_margin(stroke);
+            draw_with_image_filter(rect, paint, margin, [&](const Paint& inner) {
+                stroke_rect(rect, inner, stroke);
+            });
+            return;
+        }
         if (!stroke.dash.has_value() &&
             std::abs(current_transform_.kx) < 1e-5f && std::abs(current_transform_.ky) < 1e-5f &&
             stroke.line_join == LineJoin::Miter) {
@@ -379,26 +571,29 @@ public:
         stroke_path(p, paint, stroke);
     }
 
-    void fill_round_rect(const Rect& rect, float rx, float ry, const Paint& paint) {
+    void fill_round_rect(const Rect& rect, float rx, float ry, const Paint& paint) override {
         if (!scissor_clip_.has_value()) return;
-        if (linear_blending_ && !paint.is_linear_blending()) {
-            Paint p = paint;
-            p.set_linear_blending(true);
-            painter::fill_round_rect(pixmap_, rect, rx, ry, p, current_transform_, current_mask(), scissor_clip_);
-        } else {
-            painter::fill_round_rect(pixmap_, rect, rx, ry, paint, current_transform_, current_mask(), scissor_clip_);
+        if (paint.has_image_filter()) {
+            draw_with_image_filter(rect, paint, 0.0f, [&](const Paint& inner) {
+                painter::fill_round_rect(pixmap_, rect, rx, ry, inner, current_transform_, current_mask(), scissor_clip_);
+            });
+            return;
         }
+        Paint resolved = resolve_paint(paint);
+        painter::fill_round_rect(pixmap_, rect, rx, ry, resolved, current_transform_, current_mask(), scissor_clip_);
     }
 
-    void stroke_round_rect(const Rect& rect, float rx, float ry, const Paint& paint, const Stroke& stroke) {
+    void stroke_round_rect(const Rect& rect, float rx, float ry, const Paint& paint, const Stroke& stroke) override {
         if (!scissor_clip_.has_value()) return;
-        if (linear_blending_ && !paint.is_linear_blending()) {
-            Paint p = paint;
-            p.set_linear_blending(true);
-            painter::stroke_round_rect(pixmap_, rect, rx, ry, p, stroke, current_transform_, current_mask(), scissor_clip_);
-        } else {
-            painter::stroke_round_rect(pixmap_, rect, rx, ry, paint, stroke, current_transform_, current_mask(), scissor_clip_);
+        if (paint.has_image_filter()) {
+            const float margin = stroke_filter_margin(stroke);
+            draw_with_image_filter(rect, paint, margin, [&](const Paint& inner) {
+                painter::stroke_round_rect(pixmap_, rect, rx, ry, inner, stroke, current_transform_, current_mask(), scissor_clip_);
+            });
+            return;
         }
+        Paint resolved = resolve_paint(paint);
+        painter::stroke_round_rect(pixmap_, rect, rx, ry, resolved, stroke, current_transform_, current_mask(), scissor_clip_);
     }
 
     void stroke_circle(float cx, float cy, float radius, const Paint& paint, const Stroke& stroke) {
@@ -464,30 +659,46 @@ public:
             }
         }
 
-        if (linear_blending_ && !paint.is_linear_blending()) {
-            Paint p = paint;
-            p.set_linear_blending(true);
-            painter::stroke_circle(pixmap_, cx, cy, radius, p, stroke, current_transform_, current_mask(), scissor_clip_);
-        } else {
-            painter::stroke_circle(pixmap_, cx, cy, radius, paint, stroke, current_transform_, current_mask(), scissor_clip_);
+        if (paint.has_image_filter()) {
+            auto lb = Rect::from_xywh(cx - radius, cy - radius, radius * 2.0f, radius * 2.0f);
+            const float margin = stroke_filter_margin(stroke);
+            draw_with_image_filter(lb, paint, margin, [&](const Paint& inner) {
+                painter::stroke_circle(pixmap_, cx, cy, radius, inner, stroke, current_transform_, current_mask(), scissor_clip_);
+            });
+            return;
         }
+        Paint resolved = resolve_paint(paint);
+        painter::stroke_circle(pixmap_, cx, cy, radius, resolved, stroke, current_transform_, current_mask(), scissor_clip_);
     }
 
     void fill_circle(float cx, float cy, float radius, const Paint& paint) {
         if (!scissor_clip_.has_value()) return;
-        if (linear_blending_ && !paint.is_linear_blending()) {
-            Paint p = paint;
-            p.set_linear_blending(true);
-            painter::fill_circle(pixmap_, cx, cy, radius, p, current_transform_, current_mask(), scissor_clip_);
-        } else {
-            painter::fill_circle(pixmap_, cx, cy, radius, paint, current_transform_, current_mask(), scissor_clip_);
+        if (paint.has_image_filter()) {
+            auto lb = Rect::from_xywh(cx - radius, cy - radius, radius * 2.0f, radius * 2.0f);
+            draw_with_image_filter(lb, paint, 0.0f, [&](const Paint& inner) {
+                painter::fill_circle(pixmap_, cx, cy, radius, inner, current_transform_, current_mask(), scissor_clip_);
+            });
+            return;
         }
+        Paint resolved = resolve_paint(paint);
+        painter::fill_circle(pixmap_, cx, cy, radius, resolved, current_transform_, current_mask(), scissor_clip_);
     }
 
     void draw_pixmap(int32_t x, int32_t y, const PixmapRef& src, const PixmapPaint& paint = PixmapPaint()) override {
         if (!scissor_clip_.has_value()) return;
         painter::draw_pixmap(pixmap_, x, y, src, paint, current_transform_, current_mask(), scissor_clip_);
     }
+
+    void draw_pixmap_rect(
+        const PixmapRef& src,
+        const Rect& src_rect,
+        const Rect& dst_rect,
+        const PixmapPaint& paint = PixmapPaint()
+    ) override {
+        if (!scissor_clip_.has_value()) return;
+        painter::draw_pixmap_rect(pixmap_, src, src_rect, dst_rect, paint, current_transform_, current_mask(), scissor_clip_);
+    }
+    using ICanvas::draw_pixmap_rect;
 
     /// Renders a source Pixmap mapped onto an arbitrary destination quadrilateral
     /// [p0, p1, p2, p3] with perspective-correct scanline interpolation and bilinear filtering.
@@ -594,7 +805,7 @@ public:
         const Paint& paint,
         const effects::DropShadow& shadow,
         FillRule fill_rule = FillRule::Winding
-    ) {
+    ) override {
         effects::draw_path_shadow(pixmap_, path, shadow, fill_rule, current_transform_, current_mask());
         fill_path(path, paint, fill_rule);
     }
@@ -604,7 +815,7 @@ public:
         const Rect& rect,
         const Paint& paint,
         const effects::DropShadow& shadow
-    ) {
+    ) override {
         effects::draw_rect_shadow(pixmap_, rect, shadow, current_transform_, current_mask());
         fill_rect(rect, paint);
     }
@@ -616,10 +827,31 @@ public:
         float ry,
         const Paint& paint,
         const effects::DropShadow& shadow
-    ) {
+    ) override {
         effects::draw_round_rect_shadow(pixmap_, rect, rx, ry, shadow, current_transform_, current_mask());
-        auto p = PathBuilder::from_rounded_rect(rect, rx, ry);
-        if (p) fill_path(*p, paint);
+        fill_round_rect(rect, rx, ry, paint);
+    }
+
+    /// Draws an asymmetric 4-corner RRect with a drop shadow behind it.
+    void draw_rrect_with_shadow(
+        const RRect& rrect,
+        const Paint& paint,
+        const effects::DropShadow& shadow
+    ) override {
+        effects::draw_rrect_shadow(pixmap_, rrect, shadow, current_transform_, current_mask());
+        fill_rrect(rrect, paint);
+    }
+
+    /// Draws a circle with a drop shadow behind it.
+    void draw_circle_with_shadow(
+        float cx,
+        float cy,
+        float radius,
+        const Paint& paint,
+        const effects::DropShadow& shadow
+    ) override {
+        effects::draw_circle_shadow(pixmap_, cx, cy, radius, shadow, current_transform_, current_mask());
+        fill_circle(cx, cy, radius, paint);
     }
 
     /// Draws a modern frosted glassmorphic panel (Glassmorphism) with backdrop blur,
@@ -843,10 +1075,146 @@ public:
     }
 
 private:
+    static inline float stroke_filter_margin(const Stroke& stroke) noexcept {
+        return std::max(stroke.width, stroke.width * std::max(1.0f, stroke.miter_limit) * 0.5f) + 2.0f;
+    }
+
+    template <typename DrawFn>
+    void draw_with_image_filter(
+        const std::optional<Rect>& local_bounds,
+        const Paint& paint,
+        float extra_margin,
+        DrawFn&& draw_fn
+    ) {
+        if (!paint.image_filter.has_value()) return;
+        const auto& imgf = *paint.image_filter;
+        std::optional<Rect> padded_bounds = std::nullopt;
+        if (local_bounds.has_value()) {
+            const float pad_x = std::ceil(imgf.sigma_x * 3.0f) + 2.0f + std::abs(imgf.dx) + extra_margin;
+            const float pad_y = std::ceil(imgf.sigma_y * 3.0f) + 2.0f + std::abs(imgf.dy) + extra_margin;
+            padded_bounds = Rect::from_xywh(
+                local_bounds->x() - pad_x,
+                local_bounds->y() - pad_y,
+                local_bounds->width() + 2.0f * pad_x,
+                local_bounds->height() + 2.0f * pad_y
+            );
+        }
+        Paint layer_paint(Color::WHITE);
+        layer_paint.blend_mode = paint.blend_mode;
+        layer_paint.image_filter = imgf;
+
+        Paint inner_paint = resolve_paint(paint);
+        inner_paint.blend_mode = BlendMode::SourceOver;
+        inner_paint.image_filter = std::nullopt;
+
+        push_layer_internal(padded_bounds, layer_paint, false, 0.0f);
+        draw_fn(inner_paint);
+        restore();
+    }
+
+    void push_layer_internal(
+        std::optional<Rect> bounds,
+        const Paint& paint,
+        bool with_backdrop,
+        float blur_sigma
+    ) {
+        auto dev_bounds = detail::clip_layer_bounds(
+            bounds, current_transform_, width(), height(), scissor_clip_
+        );
+
+        state_stack_.push_back(CanvasState{
+            .transform = current_transform_,
+            .clip_mask = active_clip_mask_,
+            .scissor_clip = scissor_clip_,
+            .external_mask = external_mask_ptr_,
+            .is_layer = true
+        });
+
+        active_clip_mask_.reset();
+        external_mask_ptr_ = nullptr;
+
+        if (!dev_bounds.has_value()) {
+            auto dummy = Pixmap::allocate(1, 1, pixmap_.format());
+            layer_stack_.push_back(CanvasLayerState{
+                .backing_pixmap = dummy ? std::move(*dummy) : Pixmap{},
+                .saved_pixmap = pixmap_,
+                .composite_paint = paint,
+                .device_bounds = std::nullopt
+            });
+            if (layer_stack_.back().backing_pixmap.width() > 0) {
+                pixmap_ = layer_stack_.back().backing_pixmap.as_mut();
+            }
+            return;
+        }
+
+        auto off = Pixmap::allocate(width(), height(), pixmap_.format());
+        if (!off.has_value()) {
+            layer_stack_.push_back(CanvasLayerState{
+                .backing_pixmap = Pixmap{},
+                .saved_pixmap = pixmap_,
+                .composite_paint = paint,
+                .device_bounds = std::nullopt
+            });
+            return;
+        }
+
+        const ScreenIntRect b = *dev_bounds;
+        if (with_backdrop) {
+            const size_t bpp = pixmap_.bytes_per_pixel();
+            if (blur_sigma > 0.001f) {
+                const int32_t pad = static_cast<int32_t>(std::ceil(blur_sigma * 2.5f)) + 2;
+                const int32_t cw = static_cast<int32_t>(width());
+                const int32_t ch = static_cast<int32_t>(height());
+                const int32_t rx0 = std::max<int32_t>(0, static_cast<int32_t>(b.x()) - pad);
+                const int32_t ry0 = std::max<int32_t>(0, static_cast<int32_t>(b.y()) - pad);
+                const int32_t rx1 = std::min<int32_t>(cw, static_cast<int32_t>(b.right()) + pad);
+                const int32_t ry1 = std::min<int32_t>(ch, static_cast<int32_t>(b.bottom()) + pad);
+                const uint32_t rw = static_cast<uint32_t>(rx1 - rx0);
+                const uint32_t rh = static_cast<uint32_t>(ry1 - ry0);
+                if (auto roi = Pixmap::allocate(rw, rh, pixmap_.format())) {
+                    auto roi_mut = roi->as_mut();
+                    for (uint32_t y = 0; y < rh; ++y) {
+                        const uint8_t* src_row = pixmap_.row_raw(static_cast<size_t>(ry0 + y)) + static_cast<size_t>(rx0) * bpp;
+                        std::memcpy(roi_mut.row_raw(y), src_row, static_cast<size_t>(rw) * bpp);
+                    }
+                    effects::gaussian_blur_pixmap(roi_mut, blur_sigma);
+                    auto off_mut = off->as_mut();
+                    const int32_t ox = static_cast<int32_t>(b.x()) - rx0;
+                    const int32_t oy = static_cast<int32_t>(b.y()) - ry0;
+                    for (uint32_t y = 0; y < b.height(); ++y) {
+                        const uint8_t* src_row = roi_mut.row_raw(static_cast<size_t>(oy + y)) + static_cast<size_t>(ox) * bpp;
+                        uint8_t* dst_row = off_mut.row_raw(b.y() + y) + static_cast<size_t>(b.x()) * bpp;
+                        std::memcpy(dst_row, src_row, static_cast<size_t>(b.width()) * bpp);
+                    }
+                }
+            } else {
+                auto off_mut = off->as_mut();
+                for (uint32_t y = 0; y < b.height(); ++y) {
+                    const uint8_t* src_row = pixmap_.row_raw(b.y() + y) + static_cast<size_t>(b.x()) * bpp;
+                    uint8_t* dst_row = off_mut.row_raw(b.y() + y) + static_cast<size_t>(b.x()) * bpp;
+                    std::memcpy(dst_row, src_row, static_cast<size_t>(b.width()) * bpp);
+                }
+            }
+        }
+
+        scissor_clip_ = b;
+        layer_stack_.push_back(CanvasLayerState{
+            .backing_pixmap = std::move(*off),
+            .saved_pixmap = pixmap_,
+            .composite_paint = paint,
+            .device_bounds = b
+        });
+        pixmap_ = layer_stack_.back().backing_pixmap.as_mut();
+        if (bounds.has_value() && current_transform_.has_skew()) {
+            clip_rect(*bounds, true);
+        }
+    }
+
     PixmapMut pixmap_;
     std::optional<ScreenIntRect> scissor_clip_;
     Transform current_transform_{};
     std::vector<CanvasState> state_stack_{};
+    std::vector<CanvasLayerState> layer_stack_{};
     std::shared_ptr<Mask> active_clip_mask_{};
     std::shared_ptr<Mask> recycled_mask_{};
     const Mask* external_mask_ptr_{nullptr};

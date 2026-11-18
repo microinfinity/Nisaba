@@ -483,13 +483,22 @@ std::optional<StrokeDash> StrokeDash::create(std::vector<float> dash_array, floa
     auto off = FiniteF32::create(dash_offset);
     if (!off) return std::nullopt;
 
-    if (dash_array.size() < 2 || dash_array.size() % 2 != 0) {
+    if (dash_array.empty()) {
         return std::nullopt;
     }
 
     for (float n : dash_array) {
         if (n < 0.0f || !std::isfinite(n)) {
             return std::nullopt;
+        }
+    }
+
+    // Per CSS/SVG/Canvas conventions, odd-length non-empty dash patterns repeat to form even on/off pairs.
+    if (dash_array.size() % 2 != 0) {
+        size_t orig = dash_array.size();
+        dash_array.reserve(orig * 2);
+        for (size_t i = 0; i < orig; ++i) {
+            dash_array.push_back(dash_array[i]);
         }
     }
 

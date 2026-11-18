@@ -1,9 +1,145 @@
 #include "nisaba/effects/color_filter.hpp"
 #include "nisaba/effects/color_matrix.hpp"
+#include "nisaba/color/blend.hpp"
+#include "nisaba/color/color_space_lut.hpp"
 #include <algorithm>
 #include <cmath>
 
 namespace nisaba::effects {
+
+namespace {
+
+inline ColorTransfer combine_transfers(ColorTransfer inner, ColorTransfer outer) noexcept {
+    if (inner == ColorTransfer::None) return outer;
+    if (outer == ColorTransfer::None) return inner;
+    if ((inner == ColorTransfer::SrgbToLinear && outer == ColorTransfer::LinearToSrgb) ||
+        (inner == ColorTransfer::LinearToSrgb && outer == ColorTransfer::SrgbToLinear)) {
+        return ColorTransfer::None;
+    }
+    return outer;
+}
+
+} // namespace
+
+ColorEffect ColorEffect::tint(Color color, float intensity) noexcept {
+    float t = std::clamp(intensity, 0.0f, 1.0f);
+    Color adjusted = Color::from_rgba_unchecked(
+        color.red(),
+        color.green(),
+        color.blue(),
+        color.alpha() * t
+    );
+    return mode(adjusted, BlendMode::SourceAtop);
+}
+
+std::optional<ColorEffect> ColorEffect::compose(const ColorEffect& outer, const ColorEffect& inner) noexcept {
+    if (!inner.is_active()) return outer;
+    if (!outer.is_active()) return inner;
+
+    // Matrix -> Transfer -> Blend cannot losslessly represent Matrix/Transfer applied *after* Blend
+    // unless outer is pure Blend and inner has no Blend (or pure Transfer after Matrix).
+    if (inner.has_blend && (outer.has_matrix || outer.transfer != ColorTransfer::None || outer.has_blend)) {
+        return std::nullopt;
+    }
+    if (inner.transfer != ColorTransfer::None && outer.has_matrix) {
+        return std::nullopt;
+    }
+
+    ColorEffect out;
+    out.has_matrix = inner.has_matrix || outer.has_matrix;
+    if (inner.has_matrix && outer.has_matrix) {
+        out.matrix = outer.matrix.multiply(inner.matrix);
+    } else if (inner.has_matrix) {
+        out.matrix = inner.matrix;
+    } else if (outer.has_matrix) {
+        out.matrix = outer.matrix;
+    }
+
+    out.transfer = combine_transfers(inner.transfer, outer.transfer);
+    out.has_blend = outer.has_blend;
+    out.blend_color = outer.blend_color;
+    out.blend_mode = outer.blend_mode;
+    return out;
+}
+
+PremultipliedColor ColorEffect::transform_premul(PremultipliedColor c) const noexcept {
+    PremultipliedColor pm = c;
+    if (has_matrix) {
+        pm = matrix.transform_premul(pm);
+    }
+    if (transfer != ColorTransfer::None) {
+        Color straight = pm.demultiply();
+        straight = (transfer == ColorTransfer::SrgbToLinear)
+            ? ColorSpaceLut::srgb_to_linear(straight)
+            : ColorSpaceLut::linear_to_srgb(straight);
+        pm = straight.premultiply();
+    }
+    if (has_blend) {
+        pm = blend_colors(blend_color.premultiply(), pm, blend_mode);
+    }
+    return pm;
+}
+
+Color ColorEffect::transform(Color c) const noexcept {
+    if (!is_active()) return c;
+    return transform_premul(c.premultiply()).demultiply();
+}
+
+PremultipliedColorU8 ColorEffect::transform_pixel(PremultipliedColorU8 p) const noexcept {
+    if (!is_active()) return p;
+    if (transfer == ColorTransfer::None && !has_blend && has_matrix) {
+        return matrix.transform_pixel(p);
+    }
+    PremultipliedColor pm(
+        NormalizedF32::from_u8(p.red()),
+        NormalizedF32::from_u8(p.green()),
+        NormalizedF32::from_u8(p.blue()),
+        NormalizedF32::from_u8(p.alpha())
+    );
+    return transform_premul(pm).to_color_u8();
+}
+
+void ColorEffect::apply(PixmapMut& pixmap) const noexcept {
+    if (!is_active()) return;
+    if (has_matrix && transfer == ColorTransfer::None && !has_blend) {
+        matrix.apply(pixmap);
+        return;
+    }
+
+    const uint32_t w = pixmap.width();
+    const uint32_t h = pixmap.height();
+    if (pixmap.format() == PixelFormat::RGBA8888) {
+        for (uint32_t y = 0; y < h; ++y) {
+            PremultipliedColorU8* row = pixmap.row(y);
+            for (uint32_t x = 0; x < w; ++x) {
+                row[x] = transform_pixel(row[x]);
+            }
+        }
+    } else if (pixmap.format() == PixelFormat::BGRA8888) {
+        for (uint32_t y = 0; y < h; ++y) {
+            PremultipliedColorU8* row = pixmap.row(y);
+            for (uint32_t x = 0; x < w; ++x) {
+                const auto bgra = row[x];
+                auto rgba = PremultipliedColorU8::from_rgba_unchecked(bgra.b, bgra.g, bgra.r, bgra.a);
+                auto res = transform_pixel(rgba);
+                row[x] = PremultipliedColorU8::from_rgba_unchecked(res.b, res.g, res.r, res.a);
+            }
+        }
+    } else {
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                if (auto px = pixmap.pixel(x, y)) {
+                    pixmap.set_pixel(x, y, transform_pixel(*px));
+                }
+            }
+        }
+    }
+}
+
+void ColorEffect::apply(Pixmap& pixmap) const noexcept {
+    auto mut = pixmap.as_mut();
+    apply(mut);
+}
 
 void ColorFilter::invert(PixmapMut& pixmap) noexcept {
     int32_t w = static_cast<int32_t>(pixmap.width());

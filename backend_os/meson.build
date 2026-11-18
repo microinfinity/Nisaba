@@ -67,6 +67,7 @@ elif is_wasm
 else
   # Native Linux Platform (X11 / Wayland / DRM / EGL / Linux Native)
   x11_dep    = dependency('x11',     required : false)
+  xext_dep   = dependency('xext',    required : false)
   xrandr_dep = dependency('xrandr',  required : false)
   egl_dep    = dependency('egl',     required : true)
   gl_dep     = dependency('gl',      required : true)
@@ -75,13 +76,20 @@ else
   m_dep      = cpp.find_library('m',  required : false)
 
   backend_os_deps += [egl_dep, gl_dep, thread_dep, dl_dep, m_dep]
+  backend_os_sources += files('src/layer_surface.cpp')
 
   if x11_dep.found()
+    backend_os_args += '-DNISABA_BACKEND_OS_HAS_X11=1'
     backend_os_deps += x11_dep
     backend_os_sources += files(
       'src/x11/x11_platform.cpp',
       'src/x11/x11_window.cpp',
+      'src/x11/x11_layer_surface.cpp',
     )
+    if xext_dep.found()
+      backend_os_deps += xext_dep
+      backend_os_args += '-DNISABA_BACKEND_OS_HAS_XSHAPE=1'
+    endif
   endif
 
   if xrandr_dep.found()

@@ -3,6 +3,10 @@
 
 #include "nisaba/backend_os/x11/x11_platform.hpp"
 #include "nisaba/backend_os/x11/x11_window.hpp"
+#include "nisaba/backend_os/x11/x11_layer_surface.hpp"
+#ifndef None
+#define None 0L
+#endif
 #include "nisaba/backend_os/window.hpp"
 
 #include <X11/keysym.h>
@@ -127,6 +131,21 @@ X11PlatformBackend::~X11PlatformBackend() {
 }
 
 bool X11PlatformBackend::init() {
+    static auto x11_error_handler = [](::Display* dpy, XErrorEvent* ev) -> int {
+        if (!ev) return 0;
+        if (ev->error_code == BadWindow || ev->error_code == BadDrawable ||
+            ev->error_code == BadMatch || ev->error_code == BadAccess) {
+            return 0;
+        }
+        char msg[256]{};
+        if (dpy) XGetErrorText(dpy, ev->error_code, msg, sizeof(msg));
+        std::cerr << "[Nisaba X11] Non-fatal XError: " << msg
+                  << " (req=" << static_cast<int>(ev->request_code)
+                  << " minor=" << static_cast<int>(ev->minor_code) << ")\n";
+        return 0;
+    };
+    XSetErrorHandler(x11_error_handler);
+
     // 1. Connect to X server
     display_ = XOpenDisplay(nullptr);
     if (!display_) {
@@ -389,6 +408,14 @@ bool X11PlatformBackend::pollEvents() {
 
         case ButtonPress: {
             void* win_handle = (void*)(uintptr_t)xev.xbutton.window;
+            for (LayerSurface* ls : layer_surfaces_) {
+                if (ls && ls->getNativeHandle() == win_handle) {
+                    if (auto* x11_ls = static_cast<X11LayerSurface*>(ls->getBackendLayer())) {
+                        x11_ls->handleButtonFocus();
+                    }
+                    break;
+                }
+            }
             float x = (float)xev.xbutton.x, y = (float)xev.xbutton.y;
             int   b = xev.xbutton.button;
             if (b == 4) {
@@ -459,6 +486,22 @@ bool X11PlatformBackend::pollEvents() {
                     break;
                 }
             }
+            for (LayerSurface* ls : layer_surfaces_) {
+                if (ls && (void*)(uintptr_t)xev.xconfigure.window == ls->getNativeHandle()) {
+                    if (auto* x11_ls = static_cast<X11LayerSurface*>(ls->getBackendLayer())) {
+                        x11_ls->handleConfigure(xev.xconfigure.width, xev.xconfigure.height);
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+
+        case LeaveNotify: {
+            if (xev.xcrossing.detail != NotifyInferior) {
+                void* win_handle = (void*)(uintptr_t)xev.xcrossing.window;
+                owner_->onTargetedMouseMove().emit(win_handle, -10000.0f, -10000.0f);
+            }
             break;
         }
 
@@ -508,9 +551,20 @@ void X11PlatformBackend::unregisterWindow(Window* w) {
     if (w) windows_.erase(w);
 }
 
+void X11PlatformBackend::registerLayerSurface(LayerSurface* s) {
+    if (s) layer_surfaces_.insert(s);
+}
+
+void X11PlatformBackend::unregisterLayerSurface(LayerSurface* s) {
+    if (s) layer_surfaces_.erase(s);
+}
+
 bool X11PlatformBackend::isOwnWindow(::Window xid) const {
     for (const Window* w : windows_) {
         if ((::Window)(uintptr_t)w->getNativeHandle() == xid) return true;
+    }
+    for (const LayerSurface* ls : layer_surfaces_) {
+        if (ls && (::Window)(uintptr_t)ls->getNativeHandle() == xid) return true;
     }
     return false;
 }

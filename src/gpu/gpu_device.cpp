@@ -2,12 +2,11 @@
 #include "nisaba/gpu/gl3_renderer.hpp"
 #include "nisaba/gpu/context.hpp"
 #include "nisaba/gpu/vulkan_device.hpp"
-#include <GL/glew.h>
-#include <GL/gl.h>
+#include "gl_headers.hpp"
 #include <iostream>
 #include <cstring>
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #include <dlfcn.h>
 
 #if defined(__has_include)
@@ -21,13 +20,23 @@
 
 namespace nisaba::gpu {
 
+namespace {
+#if defined(NISABA_HAS_EGL)
+void* open_egl_library() noexcept {
+#if defined(__ANDROID__)
+    static void* s_lib_egl = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
+#else
+    static void* s_lib_egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+#endif
+    return s_lib_egl;
+}
+#endif
+} // namespace
+
 GpuDevice::GpuDevice() = default;
 
 void GpuDevice::init_glew() {
-    glewExperimental = GL_TRUE;
-    GLenum err = glewInit();
-    (void)err;
-    while (glGetError() != GL_NO_ERROR) {}
+    detail::ensure_gl_functions_loaded();
 
     const char* rend = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
     if (rend) renderer_name_ = rend;
@@ -36,13 +45,17 @@ void GpuDevice::init_glew() {
     is_valid_ = true;
 
     // Check MSAA support
+#if defined(NISABA_TARGET_GLES)
+    has_msaa_ = true;
+#else
     has_msaa_ = (glRenderbufferStorageMultisample != nullptr && glBlitFramebuffer != nullptr);
+#endif
 }
 
 GpuDevice::~GpuDevice() {
 #if defined(NISABA_HAS_EGL)
     if (egl_display_ && egl_context_) {
-        static void* lib_egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+        void* lib_egl = open_egl_library();
         if (lib_egl) {
             using PFN_eglMakeCurrent = EGLBoolean (*)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
             using PFN_eglDestroySurface = EGLBoolean (*)(EGLDisplay, EGLSurface);
@@ -70,7 +83,7 @@ GpuDevice::~GpuDevice() {
 void GpuDevice::make_current() {
 #if defined(NISABA_HAS_EGL)
     if (egl_display_ && egl_context_) {
-        static void* lib_egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+        void* lib_egl = open_egl_library();
         if (lib_egl) {
             using PFN_eglMakeCurrent = EGLBoolean (*)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
             auto eglMakeCurrent_fn = reinterpret_cast<PFN_eglMakeCurrent>(dlsym(lib_egl, "eglMakeCurrent"));
@@ -142,9 +155,11 @@ std::shared_ptr<GpuDevice> GpuDevice::create_headless(uint32_t width, uint32_t h
     dev->backend_type_ = GpuBackendType::OpenGL;
 
 #if defined(NISABA_HAS_EGL)
-    static void* lib_egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+    void* lib_egl = open_egl_library();
+#if !defined(__ANDROID__)
     static void* lib_gl = dlopen("libGL.so.1", RTLD_NOW | RTLD_GLOBAL);
     (void)lib_gl;
+#endif
 
     if (lib_egl) {
         using PFN_eglGetDisplay = EGLDisplay (*)(EGLNativeDisplayType);
@@ -170,10 +185,17 @@ std::shared_ptr<GpuDevice> GpuDevice::create_headless(uint32_t width, uint32_t h
             if (dpy != (EGLDisplay)0) {
                 EGLint major = 0, minor = 0;
                 if (eglInitialize_fn(dpy, &major, &minor)) {
-                    eglBindAPI_fn(0x30A2 /* EGL_OPENGL_API */);
+#if defined(__ANDROID__)
+                    constexpr EGLenum kEglApi = 0x30A0; // EGL_OPENGL_ES_API
+                    constexpr EGLint  kRenderableBit = 0x0040; // EGL_OPENGL_ES3_BIT
+#else
+                    constexpr EGLenum kEglApi = 0x30A2; // EGL_OPENGL_API
+                    constexpr EGLint  kRenderableBit = 0x0008; // EGL_OPENGL_BIT
+#endif
+                    eglBindAPI_fn(kEglApi);
 
                     const EGLint config_attribs[] = {
-                        0x3040, 0x0008 /* EGL_OPENGL_BIT */,
+                        0x3040, kRenderableBit,
                         0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8,
                         0x3026, 8, // Stencil 8
                         0x3033, 0x0001 /* EGL_PBUFFER_BIT */,
@@ -185,7 +207,7 @@ std::shared_ptr<GpuDevice> GpuDevice::create_headless(uint32_t width, uint32_t h
                     bool has_pbuffer_cfg = eglChooseConfig_fn(dpy, config_attribs, &config, 1, &num_configs) && num_configs > 0;
                     if (!has_pbuffer_cfg) {
                         const EGLint surfaceless_attribs[] = {
-                            0x3040, 0x0008 /* EGL_OPENGL_BIT */,
+                            0x3040, kRenderableBit,
                             0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8,
                             0x3026, 8,
                             0x3038
@@ -428,12 +450,17 @@ void GpuDevice::bind_renderbuffer(uint32_t rb_id) {
 }
 
 void GpuDevice::renderbuffer_storage_multisample(uint32_t samples, uint32_t format, uint32_t width, uint32_t height) {
+#if defined(NISABA_TARGET_GLES)
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, static_cast<GLsizei>(samples),
+                                     format, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+#else
     if (glRenderbufferStorageMultisample) {
         glRenderbufferStorageMultisample(GL_RENDERBUFFER, static_cast<GLsizei>(samples),
                                          format, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
     } else {
         glRenderbufferStorage(GL_RENDERBUFFER, format, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
     }
+#endif
 }
 
 void GpuDevice::attach_renderbuffer_to_framebuffer(uint32_t attachment, uint32_t rb_id) {
@@ -441,7 +468,9 @@ void GpuDevice::attach_renderbuffer_to_framebuffer(uint32_t attachment, uint32_t
 }
 
 void GpuDevice::blit_framebuffer(uint32_t src_fbo, uint32_t dst_fbo, uint32_t width, uint32_t height) {
+#if !defined(NISABA_TARGET_GLES)
     if (!glBlitFramebuffer) return;
+#endif
     glBindFramebuffer(GL_READ_FRAMEBUFFER, src_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst_fbo);
     glBlitFramebuffer(0, 0, static_cast<GLint>(width), static_cast<GLint>(height),
@@ -453,7 +482,9 @@ void GpuDevice::blit_framebuffer(uint32_t src_fbo, uint32_t dst_fbo, uint32_t wi
 void GpuDevice::blit_framebuffer(uint32_t src_fbo, uint32_t dst_fbo,
                                  int32_t src_x0, int32_t src_y0, int32_t src_x1, int32_t src_y1,
                                  int32_t dst_x0, int32_t dst_y0, int32_t dst_x1, int32_t dst_y1) {
+#if !defined(NISABA_TARGET_GLES)
     if (!glBlitFramebuffer) return;
+#endif
     glBindFramebuffer(GL_READ_FRAMEBUFFER, src_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst_fbo);
     glBlitFramebuffer(src_x0, src_y0, src_x1, src_y1,

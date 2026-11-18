@@ -42,6 +42,9 @@ public:
     /// s = 1.0 (identity), s = 0.0 (grayscale luminance), s > 1.0 (hypersaturated).
     static ColorMatrix saturation(float s) noexcept;
 
+    /// Luminance grayscale matrix (equivalent to saturation(0.0f)).
+    static ColorMatrix grayscale() noexcept { return saturation(0.0f); }
+
     /// Hue rotation around luminance axis by specified degrees.
     static ColorMatrix hue_rotate(float degrees) noexcept;
 

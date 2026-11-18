@@ -93,6 +93,7 @@ private:
 	                      float x3, float y3, float x4, float y4,
 	                      int level, uint8_t type);
 	void calculateJoins(float w, LineJoin join, float miterLimit);
+	void finalizeContours();
 
 	float m_distTol{0.01f};
 	float m_tessTol{0.25f};

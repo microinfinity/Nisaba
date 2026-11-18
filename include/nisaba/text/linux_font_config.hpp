@@ -31,6 +31,13 @@ public:
     void set_locale(std::string_view locale);
     [[nodiscard]] std::string_view locale() const noexcept { return locale_; }
 
+    /// Registers an explicit family alias mapping (e.g. "BodyFont" -> "Inter").
+    void register_alias(std::string_view alias_family, std::string_view target_family) {
+        if (!alias_family.empty() && !target_family.empty()) {
+            merge_alias(alias_family, {std::string(target_family)}, {}, {});
+        }
+    }
+
     /// Returns the ordered list of existing font directories discovered from config and XDG environment.
     [[nodiscard]] const std::vector<std::string>& font_directories() const noexcept { return font_dirs_; }
 

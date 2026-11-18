@@ -1,6 +1,7 @@
 #include "nisaba/gpu/context.hpp"
 #include "tessellator.hpp"
 #include "glyph_atlas.hpp"
+#include "shader_uniforms.hpp"
 #include "nisaba/text/bidi.hpp"
 #include "nisaba/image/image_io.hpp"
 
@@ -79,6 +80,7 @@ Context::Context(std::unique_ptr<Renderer> renderer, int flags)
 	// Initialize Sovereign Glyph Atlas & Font Texture (2048x2048 for high throughput)
 	m_atlas = std::make_unique<SovereignGlyphAtlas>(2048, 2048);
 	m_fontTextureId = m_renderer->createTexture(TextureType::Alpha, m_atlas->width(), m_atlas->height(), 0, m_atlas->data());
+	m_atlas->markClean();
 }
 
 Context::~Context() {
@@ -96,7 +98,11 @@ Context::~Context() {
 // Frame Lifecycle
 // -------------------------------------------------------------
 void Context::beginFrame(float windowWidth, float windowHeight, float devicePixelRatio) {
+	if (m_renderer) {
+		m_renderer->cancel();
+	}
 	m_states.clear();
+	m_layerStack.clear();
 	m_states.emplace_back();
 	reset();
 
@@ -112,6 +118,7 @@ void Context::beginFrame(float windowWidth, float windowHeight, float devicePixe
 }
 
 void Context::cancelFrame() {
+	m_layerStack.clear();
 	m_renderer->cancel();
 }
 
@@ -119,16 +126,58 @@ void Context::endFrame() {
 	m_renderer->flush();
 }
 
+void Context::resetState() {
+	if (m_renderer) {
+		m_renderer->resetState();
+	}
+}
+
 // -------------------------------------------------------------
 // State Handling
 // -------------------------------------------------------------
 void Context::save() {
-	if (m_states.size() >= 32) return;
+	if (m_states.empty()) {
+		m_states.emplace_back();
+	}
 	m_states.push_back(m_states.back());
+	m_states.back().isLayer = false;
+}
+
+void Context::pushLayer(const LayerDesc& desc) {
+	if (m_states.empty()) {
+		m_states.emplace_back();
+	}
+	const State parentState = m_states.back();
+	m_states.push_back(parentState);
+	State& layerState = m_states.back();
+	layerState.isLayer = true;
+	layerState.clipDepth = 0;
+	if (desc.hasBounds) {
+		layerState.scissor.xform = Transform2D::identity();
+		const float bw = std::max(0.0f, desc.bounds[2] - desc.bounds[0]);
+		const float bh = std::max(0.0f, desc.bounds[3] - desc.bounds[1]);
+		layerState.scissor.xform[4] = desc.bounds[0] + bw * 0.5f;
+		layerState.scissor.xform[5] = desc.bounds[1] + bh * 0.5f;
+		layerState.scissor.extent[0] = bw * 0.5f;
+		layerState.scissor.extent[1] = bh * 0.5f;
+	}
+	m_layerStack.push_back(LayerEntry{desc, parentState.scissor, parentState.clipDepth});
+	if (m_renderer) {
+		m_renderer->pushLayer(desc, parentState.scissor, parentState.clipDepth);
+	}
 }
 
 void Context::restore() {
 	if (m_states.size() <= 1) return;
+	if (m_states.back().isLayer && !m_layerStack.empty()) {
+		LayerEntry entry = std::move(m_layerStack.back());
+		m_layerStack.pop_back();
+		m_states.pop_back();
+		if (m_renderer) {
+			m_renderer->popLayer(entry.desc, entry.parentScissor, entry.parentClipDepth);
+		}
+		return;
+	}
 	int curDepth = m_states.back().clipDepth;
 	m_states.pop_back();
 	int targetDepth = m_states.back().clipDepth;
@@ -167,6 +216,7 @@ void Context::reset() {
 
 void Context::setPaintColor(Paint& p, Color color) {
 	p.xform = Transform2D::identity();
+	p.gradUnitXform = Transform2D::identity();
 	p.radius = 0.0f;
 	p.feather = 1.0f;
 	p.extent[0] = 0.0f;
@@ -174,6 +224,14 @@ void Context::setPaintColor(Paint& p, Color color) {
 	p.innerColor = color;
 	p.outerColor = color;
 	p.image = 0;
+	p.hasColorMatrix = false;
+	p.colorTransfer = 0;
+	p.hasColorBlend = false;
+	p.gradientKind = GradientKind::None;
+	p.gradientSpread = SpreadKind::Pad;
+	p.gradStopCount = 0;
+	p.gradParams0 = {};
+	p.gradParams1 = {};
 	p.customShader = nullptr;
 }
 
@@ -442,6 +500,10 @@ void Context::globalCompositeOperation(CompositeOperation op) {
 	currentState().compositeOperation = CompositeOperationState::fromCompositeOp(op);
 }
 
+void Context::globalCompositeBlendMode(BlendMode mode) {
+	currentState().compositeOperation = CompositeOperationState::fromBlendMode(mode);
+}
+
 void Context::globalCompositeBlendFunc(BlendFactor sfactor, BlendFactor dfactor) {
 	globalCompositeBlendFuncSeparate(sfactor, dfactor, sfactor, dfactor);
 }
@@ -452,6 +514,15 @@ void Context::globalCompositeBlendFuncSeparate(BlendFactor srcRGB, BlendFactor d
 	s.compositeOperation.dstRGB = dstRGB;
 	s.compositeOperation.srcAlpha = srcAlpha;
 	s.compositeOperation.dstAlpha = dstAlpha;
+	s.compositeOperation.isProgrammableBlend = false;
+}
+
+void Context::setCompositeState(const CompositeOperationState& state) {
+	currentState().compositeOperation = state;
+}
+
+const CompositeOperationState& Context::currentCompositeState() const {
+	return currentState().compositeOperation;
 }
 
 // -------------------------------------------------------------
@@ -479,6 +550,26 @@ int Context::createImageMem(int imageFlags, unsigned char* data, int ndata) {
 
 int Context::createImageRGBA(int w, int h, int imageFlags, const unsigned char* data) {
 	return m_renderer->createTexture(TextureType::RGBA, w, h, imageFlags, data);
+}
+
+int Context::createImageWithFormat(int w, int h, int strideBytes, PixelFormat format, int imageFlags, const unsigned char* data) {
+	if (!m_renderer || w <= 0 || h <= 0 || !data) return 0;
+	switch (format) {
+		case PixelFormat::RGBA8888:
+			return m_renderer->createTextureWithStride(TextureType::RGBA, w, h, strideBytes, imageFlags, data);
+		case PixelFormat::BGRA8888:
+			return m_renderer->createTextureWithStride(TextureType::BGRA, w, h, strideBytes, imageFlags, data);
+		case PixelFormat::Alpha8:
+			return m_renderer->createTextureWithStride(TextureType::Alpha, w, h, strideBytes, imageFlags, data);
+		case PixelFormat::RGB565: {
+			size_t effStride = (strideBytes > 0) ? static_cast<size_t>(strideBytes) : static_cast<size_t>(w) * 2;
+			auto ref = PixmapRef::from_raw_parts(data, static_cast<uint32_t>(w), static_cast<uint32_t>(h), effStride, PixelFormat::RGB565);
+			if (!ref) return 0;
+			Pixmap rgba = ref->to_rgba8888();
+			return m_renderer->createTexture(TextureType::RGBA, w, h, imageFlags | ImageFlags::ImagePremultiplied, rgba.data());
+		}
+	}
+	return 0;
 }
 
 void Context::updateImage(int image, const unsigned char* data) {
@@ -609,12 +700,15 @@ void Context::beginPath() {
 	m_singleVaryingRRect = false;
 }
 
-void Context::path(const nisaba::Path& p) {
+void Context::path(const nisaba::Path& p, Winding defaultWinding) {
 	PathSegmentsIter iter(p);
 	while (auto seg = iter.next()) {
 		switch (seg->type) {
 			case PathSegment::Type::MoveTo:
 				moveTo(seg->p0.x, seg->p0.y);
+				if (defaultWinding != Winding::CounterClockwise) {
+					pathWinding(defaultWinding);
+				}
 				break;
 			case PathSegment::Type::LineTo:
 				lineTo(seg->p0.x, seg->p0.y);
@@ -990,18 +1084,19 @@ void Context::fill() {
 	                      std::abs(s.xform[0] * s.xform[2] + s.xform[1] * s.xform[3]) < 1e-4f &&
 	                      det > 0.0f;
 
-	bool isSolid = (fillPaint.customShader == nullptr && fillPaint.image == 0 && fillPaint.extent[0] == 0.0f && fillPaint.extent[1] == 0.0f &&
+	bool isSolid = (fillPaint.customShader == nullptr && !fillPaint.hasAdvancedGradient() &&
+	                fillPaint.image == 0 && fillPaint.extent[0] == 0.0f && fillPaint.extent[1] == 0.0f &&
 	                fillPaint.radius == 0.0f &&
 	                fillPaint.innerColor.r == fillPaint.outerColor.r &&
 	                fillPaint.innerColor.g == fillPaint.outerColor.g &&
 	                fillPaint.innerColor.b == fillPaint.outerColor.b &&
 	                fillPaint.innerColor.a == fillPaint.outerColor.a);
 
-	bool isRadialGrad = (fillPaint.customShader == nullptr && fillPaint.image == 0 &&
+	bool isRadialGrad = (fillPaint.customShader == nullptr && !fillPaint.hasAdvancedGradient() && fillPaint.image == 0 &&
 	                     fillPaint.radius > 0.0f && fillPaint.extent[0] == fillPaint.radius && fillPaint.extent[1] == fillPaint.radius);
-	bool isLinearGrad = (fillPaint.customShader == nullptr && fillPaint.image == 0 &&
+	bool isLinearGrad = (fillPaint.customShader == nullptr && !fillPaint.hasAdvancedGradient() && fillPaint.image == 0 &&
 	                     fillPaint.radius == 0.0f && fillPaint.extent[0] == 0.0f && fillPaint.extent[1] > 0.0f);
-	bool isImagePat   = (fillPaint.customShader == nullptr && fillPaint.image != 0);
+	bool isImagePat   = (fillPaint.customShader == nullptr && !fillPaint.hasAdvancedGradient() && fillPaint.image != 0);
 
 	Scissor noScissor{};
 	bool hasAxisAlignedScissor = (s.scissor.extent[0] >= 0.0f &&
@@ -1235,9 +1330,7 @@ void Context::fill() {
 			float yB = m_rectY + m_rectH + fy;
 
 			Point p0 = s.xform.transformPoint(xA, yA);
-			Point p1 = s.xform.transformPoint(xB, yA);
 			Point p2 = s.xform.transformPoint(xB, yB);
-			Point p3 = s.xform.transformPoint(xA, yB);
 
 			bool coversViewport = (s.scissor.extent[0] < 0.0f) &&
 			                      (p0.x <= 0.0f && p0.y <= 0.0f && p2.x >= m_windowWidth && p2.y >= m_windowHeight);
@@ -1258,18 +1351,25 @@ void Context::fill() {
 			}
 
 			if (fillPaint.customShader != nullptr) {
+				float x0 = m_rectX * sx + s.xform[4];
+				float y0 = m_rectY * sy + s.xform[5];
+				float x1 = (m_rectX + m_rectW) * sx + s.xform[4];
+				float y1 = (m_rectY + m_rectH) * sy + s.xform[5];
+				float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+				if (!clipAxisAlignedQuadToScissor(x0, y0, x1, y1, u0, v0, u1, v1)) return;
+
 				Vertex quad[6];
-				quad[0] = Vertex(p0.x, p0.y, 0.5f, 1.0f, c);
-				quad[1] = Vertex(p3.x, p3.y, 0.5f, 1.0f, c);
-				quad[2] = Vertex(p2.x, p2.y, 0.5f, 1.0f, c);
-				quad[3] = Vertex(p0.x, p0.y, 0.5f, 1.0f, c);
-				quad[4] = Vertex(p2.x, p2.y, 0.5f, 1.0f, c);
-				quad[5] = Vertex(p1.x, p1.y, 0.5f, 1.0f, c);
-				m_renderer->renderTriangles(fillPaint, s.compositeOperation, s.scissor, quad, 6, m_fringeWidth, -1 /* derive from paint */);
+				quad[0] = Vertex(x0, y0, 0.5f, 1.0f, c);
+				quad[1] = Vertex(x0, y1, 0.5f, 1.0f, c);
+				quad[2] = Vertex(x1, y1, 0.5f, 1.0f, c);
+				quad[3] = Vertex(x0, y0, 0.5f, 1.0f, c);
+				quad[4] = Vertex(x1, y1, 0.5f, 1.0f, c);
+				quad[5] = Vertex(x1, y0, 0.5f, 1.0f, c);
+				m_renderer->renderTriangles(fillPaint, s.compositeOperation, quadScissor, quad, 6, m_fringeWidth, -1 /* derive from paint */);
 				return;
 			}
 
-			if (!isSolid) {
+			if (!isSolid && !fillPaint.hasAdvancedGradient()) {
 				float x0 = m_rectX * sx + s.xform[4];
 				float y0 = m_rectY * sy + s.xform[5];
 				float x1 = (m_rectX + m_rectW) * sx + s.xform[4];
@@ -1303,6 +1403,7 @@ void Context::fill() {
 
 				if (isRadialGrad) {
 					if (fillPaint.outerColor.a == 0.0f &&
+					    !s.compositeOperation.isProgrammableBlend &&
 					    s.compositeOperation.dstRGB != BlendFactor::Zero &&
 					    std::abs(fillPaint.xform[1]) < 1e-4f && std::abs(fillPaint.xform[2]) < 1e-4f &&
 					    std::abs(fillPaint.xform[0] - 1.0f) < 1e-4f && std::abs(fillPaint.xform[3] - 1.0f) < 1e-4f) {
@@ -1348,9 +1449,8 @@ void Context::fill() {
 				}
 
 				if (isImagePat) {
-					float invExtX = (fillPaint.extent[0] > 1e-4f) ? (1.0f / fillPaint.extent[0]) : 1.0f;
-					float invExtY = (fillPaint.extent[1] > 1e-4f) ? (1.0f / fillPaint.extent[1]) : 1.0f;
-					Transform2D uvXform = invxform.multiply(Transform2D::scale(invExtX, invExtY));
+					const bool flipY = (m_renderer->textureFlags(fillPaint.image) & ImageFlags::ImageFlipY) != 0;
+					Transform2D uvXform = computeImageUvTransform(fillPaint.xform, fillPaint.extent[0], fillPaint.extent[1], flipY);
 					Point uv00 = uvXform.transformPoint(x0, y0);
 					Point uv01 = uvXform.transformPoint(x0, y1);
 					Point uv11 = uvXform.transformPoint(x1, y1);
@@ -1523,17 +1623,15 @@ void Context::fill() {
 				float y0 = yA * s.xform[3] + s.xform[5];
 				float x1 = xB * s.xform[0] + s.xform[4];
 				float y1 = yB * s.xform[3] + s.xform[5];
-				if (isAxisAligned && clipAxisAlignedQuadToScissor(x0, y0, x1, y1, u0, v0, u1, v1)) {
+				if (isAxisAligned && std::abs(s.xform[0] - 1.0f) < 1e-4f && std::abs(s.xform[3] - 1.0f) < 1e-4f &&
+				    clipAxisAlignedQuadToScissor(x0, y0, x1, y1, u0, v0, u1, v1)) {
 					float R = m_rrectR;
 					float cx = (m_rrectX + hw) * s.xform[0] + s.xform[4];
 					float cy = (m_rrectY + hh) * s.xform[3] + s.xform[5];
 					// If large rounded rect with small corners (e.g. Suite 64: 880x560, r=20), split interior & 4 corners!
 					if (m_rrectW > 4.0f * R && m_rrectH > 4.0f * R && u0 <= -hw && u1 >= hw && v0 <= -hh && v1 >= hh) {
-						Transform2D invPaint;
-						s.fill.xform.inverse(invPaint);
-						float invExtX = (s.fill.extent[0] > 1e-4f) ? (1.0f / s.fill.extent[0]) : 1.0f;
-						float invExtY = (s.fill.extent[1] > 1e-4f) ? (1.0f / s.fill.extent[1]) : 1.0f;
-						Transform2D uvXform = invPaint.multiply(Transform2D::scale(invExtX, invExtY));
+						const bool flipY = (m_renderer->textureFlags(fillPaint.image) & ImageFlags::ImageFlipY) != 0;
+						Transform2D uvXform = computeImageUvTransform(s.fill.xform, fillPaint.extent[0], fillPaint.extent[1], flipY);
 						auto emitTexQuad = [&](Vertex* dst, float qx0, float qy0, float qx1, float qy1) {
 							Point uv00 = uvXform.transformPoint(qx0, qy0);
 							Point uv01 = uvXform.transformPoint(qx0, qy1);
@@ -1639,7 +1737,8 @@ void Context::stroke() {
 	                            (s.xform[2] * s.xform[2] + s.xform[3] * s.xform[3])) < 1e-4f &&
 	                   std::abs(s.xform[0] * s.xform[2] + s.xform[1] * s.xform[3]) < 1e-4f &&
 	                   (s.xform[0] * s.xform[3] - s.xform[1] * s.xform[2]) > 0.0f;
-	bool isSolid = (strokePaint.customShader == nullptr && strokePaint.image == 0 && strokePaint.extent[0] == 0.0f && strokePaint.extent[1] == 0.0f &&
+	bool isSolid = (strokePaint.customShader == nullptr && !strokePaint.hasAdvancedGradient() &&
+	                strokePaint.image == 0 && strokePaint.extent[0] == 0.0f && strokePaint.extent[1] == 0.0f &&
 	                strokePaint.radius == 0.0f &&
 	                strokePaint.innerColor.r == strokePaint.outerColor.r &&
 	                strokePaint.innerColor.g == strokePaint.outerColor.g &&
@@ -1905,12 +2004,172 @@ void Context::stroke() {
 	                         strokeW, m_renderPaths.data(), static_cast<int>(m_renderPaths.size()));
 }
 
+void Context::drawTriangles(const Paint& paint, const Vertex* verts, int nverts, float fringe, int shaderType) {
+	if (!m_renderer || !verts || nverts <= 0) return;
+
+	const State& s = currentState();
+	Paint p = paint;
+	const bool usesVertexColorOnly = (shaderType == 4 || shaderType == -2 || shaderType == 7 || shaderType == 8 || shaderType == 9 || shaderType == 18);
+	if (!usesVertexColorOnly) {
+		p.innerColor.a *= s.alpha;
+		p.outerColor.a *= s.alpha;
+	}
+
+	const bool identity = s.xform.isIdentity();
+	const bool unitAlpha = s.alpha >= 0.9999f;
+	if (identity && unitAlpha) {
+		m_renderer->renderTriangles(p, s.compositeOperation, s.scissor, verts, nverts, fringe, shaderType);
+		return;
+	}
+
+	auto transformVertices = [&](Vertex* dst) {
+		const bool scaleVerts = usesVertexColorOnly && !unitAlpha;
+		const float alpha = std::clamp(s.alpha, 0.0f, 1.0f);
+		for (int i = 0; i < nverts; ++i) {
+			Vertex v = verts[i];
+			if (!identity) {
+				Point pt = s.xform.transformPoint(v.x, v.y);
+				v.x = pt.x;
+				v.y = pt.y;
+			}
+			if (scaleVerts) {
+				uint32_t c = v.color;
+				uint32_t r = static_cast<uint32_t>(static_cast<float>(c & 0xffu) * alpha + 0.5f);
+				uint32_t g = static_cast<uint32_t>(static_cast<float>((c >> 8) & 0xffu) * alpha + 0.5f);
+				uint32_t b = static_cast<uint32_t>(static_cast<float>((c >> 16) & 0xffu) * alpha + 0.5f);
+				uint32_t a = static_cast<uint32_t>(static_cast<float>((c >> 24) & 0xffu) * alpha + 0.5f);
+				v.color = (a << 24) | (b << 16) | (g << 8) | r;
+			}
+			dst[i] = v;
+		}
+	};
+
+	if (nverts <= 64) {
+		std::array<Vertex, 64> stackVerts{};
+		transformVertices(stackVerts.data());
+		m_renderer->renderTriangles(p, s.compositeOperation, s.scissor, stackVerts.data(), nverts, fringe, shaderType);
+	} else {
+		m_textVertices.resize(static_cast<size_t>(nverts));
+		transformVertices(m_textVertices.data());
+		m_renderer->renderTriangles(p, s.compositeOperation, s.scissor, m_textVertices.data(), nverts, fringe, shaderType);
+	}
+}
+
+void Context::rrectShadow(float x, float y, float w, float h, float rTL, float rTR, float rBR, float rBL, float sigma, Color color, const float* occludedBox) {
+	if (!m_renderer || w <= 0.0f || h <= 0.0f || color.a <= 0.0f) return;
+	const float sig = std::max(0.0f, sigma);
+	const float pad = (sig > 0.01f) ? (std::ceil(sig * 3.0f) + 2.0f) : 1.5f;
+	const float hw = w * 0.5f;
+	const float hh = h * 0.5f;
+	const float cx = x + hw;
+	const float cy = y + hh;
+
+	const float u0 = -hw - pad;
+	const float v0 = -hh - pad;
+	const float u1 =  hw + pad;
+	const float v1 =  hh + pad;
+
+	// Pre-normalize corner radii on CPU once per shadow (avoids 4 branches + 4 divisions per pixel in GLSL!)
+	float cTL = std::max(0.0f, rTL), cTR = std::max(0.0f, rTR);
+	float cBR = std::max(0.0f, rBR), cBL = std::max(0.0f, rBL);
+	float rScale = 1.0f;
+	if (cTL + cTR > w) rScale = std::min(rScale, w / (cTL + cTR));
+	if (cBL + cBR > w) rScale = std::min(rScale, w / (cBL + cBR));
+	if (cTL + cBL > h) rScale = std::min(rScale, h / (cTL + cBL));
+	if (cTR + cBR > h) rScale = std::min(rScale, h / (cTR + cBR));
+	cTL *= rScale; cTR *= rScale; cBR *= rScale; cBL *= rScale;
+
+	Paint sp = Paint::color(color);
+	sp.extent[0] = hw;
+	sp.extent[1] = hh;
+	sp.radius = cTL;
+	sp.feather = cTR;
+	sp.xform[0] = cBR;
+	sp.xform[1] = cBL;
+	sp.gradParams0[0] = sig;
+
+	const uint32_t c = color.premultiplied().toRGBA8();
+
+	auto emitStrip = [&](Vertex* dst, float lu0, float lv0, float lu1, float lv1) {
+		const float px0 = cx + lu0, py0 = cy + lv0;
+		const float px1 = cx + lu1, py1 = cy + lv1;
+		dst[0] = Vertex(px0, py0, lu0, lv0, c);
+		dst[1] = Vertex(px0, py1, lu0, lv1, c);
+		dst[2] = Vertex(px1, py1, lu1, lv1, c);
+		dst[3] = Vertex(px0, py0, lu0, lv0, c);
+		dst[4] = Vertex(px1, py1, lu1, lv1, c);
+		dst[5] = Vertex(px1, py0, lu1, lv0, c);
+	};
+
+	// Fast opaque-card cutout: skip shading pixels strictly occluded by the opaque foreground card!
+	if (occludedBox != nullptr) {
+		const float oL = std::clamp(occludedBox[0] - cx, u0, u1);
+		const float oT = std::clamp(occludedBox[1] - cy, v0, v1);
+		const float oR = std::clamp(occludedBox[2] - cx, u0, u1);
+		const float oB = std::clamp(occludedBox[3] - cy, v0, v1);
+		if (oR > oL + 2.0f && oB > oT + 2.0f) {
+			Vertex strips[24];
+			int nv = 0;
+			if (oT > v0) { emitStrip(strips + nv, u0, v0, u1, oT); nv += 6; }
+			if (v1 > oB) { emitStrip(strips + nv, u0, oB, u1, v1); nv += 6; }
+			if (oL > u0) { emitStrip(strips + nv, u0, oT, oL, oB); nv += 6; }
+			if (u1 > oR) { emitStrip(strips + nv, oR, oT, u1, oB); nv += 6; }
+			if (nv > 0) {
+				drawTriangles(sp, strips, nv, m_fringeWidth, 16);
+			}
+			return;
+		}
+	}
+
+	const float margin = (sig >= 0.1f) ? (3.0f * sig) : 1.5f;
+	const float inL = -hw + std::max(cTL, cBL) + margin;
+	const float inR =  hw - std::max(cTR, cBR) - margin;
+	const float inT = -hh + std::max(cTL, cTR) + margin;
+	const float inB =  hh - std::max(cBL, cBR) - margin;
+
+	if (inR > inL + 2.0f && inB > inT + 2.0f) {
+		const Vertex coreQuad[6] = {
+			Vertex(cx + inL, cy + inT, 0.5f, 1.0f, c),
+			Vertex(cx + inL, cy + inB, 0.5f, 1.0f, c),
+			Vertex(cx + inR, cy + inB, 0.5f, 1.0f, c),
+			Vertex(cx + inL, cy + inT, 0.5f, 1.0f, c),
+			Vertex(cx + inR, cy + inB, 0.5f, 1.0f, c),
+			Vertex(cx + inR, cy + inT, 0.5f, 1.0f, c)
+		};
+		drawTriangles(Paint::color(color), coreQuad, 6, m_fringeWidth, 4 /* ShaderSolid */);
+
+		Vertex strips[24];
+		emitStrip(strips + 0,  u0,  v0,  u1,  inT);
+		emitStrip(strips + 6,  u0,  inB, u1,  v1);
+		emitStrip(strips + 12, u0,  inT, inL, inB);
+		emitStrip(strips + 18, inR, inT, u1,  inB);
+		drawTriangles(sp, strips, 24, m_fringeWidth, 16);
+		return;
+	}
+
+	const Vertex quad[6] = {
+		Vertex(cx + u0, cy + v0, u0, v0, c),
+		Vertex(cx + u0, cy + v1, u0, v1, c),
+		Vertex(cx + u1, cy + v1, u1, v1, c),
+		Vertex(cx + u0, cy + v0, u0, v0, c),
+		Vertex(cx + u1, cy + v1, u1, v1, c),
+		Vertex(cx + u1, cy + v0, u1, v0, c)
+	};
+	drawTriangles(sp, quad, 6, m_fringeWidth, 16);
+}
+
 // -------------------------------------------------------------
 // Typography & Text (Sovereign Nisaba C++20 Engine)
 // -------------------------------------------------------------
 int Context::createFont(const char* name, const char* filename) {
+	return createFontAtIndex(name, filename, 0);
+}
+
+int Context::createFontAtIndex(const char* name, const char* filename, const int fontIndex) {
 	if (!filename) return -1;
-	auto idOpt = m_fontSystem.load_font_file(filename);
+	const uint32_t idx = (fontIndex > 0) ? static_cast<uint32_t>(fontIndex) : 0u;
+	const std::string_view alias = (name != nullptr) ? std::string_view(name) : std::string_view{};
+	auto idOpt = m_fontSystem.load_font_file(filename, idx, alias);
 	if (!idOpt) return -1;
 	int id = static_cast<int>(*idOpt);
 	if (name) {
@@ -1922,14 +2181,15 @@ int Context::createFont(const char* name, const char* filename) {
 	return id;
 }
 
-int Context::createFontAtIndex(const char* name, const char* filename, const int fontIndex) {
-	(void)fontIndex;
-	return createFont(name, filename);
+int Context::createFontMem(const char* name, unsigned char* data, int ndata, int freeData) {
+	return createFontMemAtIndex(name, data, ndata, freeData, 0);
 }
 
-int Context::createFontMem(const char* name, unsigned char* data, int ndata, int freeData) {
+int Context::createFontMemAtIndex(const char* name, unsigned char* data, int ndata, int freeData, const int fontIndex) {
 	if (!data || ndata <= 0) return -1;
-	auto idOpt = m_fontSystem.load_font_data(std::span<const uint8_t>(data, static_cast<size_t>(ndata)));
+	const uint32_t idx = (fontIndex > 0) ? static_cast<uint32_t>(fontIndex) : 0u;
+	const std::string_view alias = (name != nullptr) ? std::string_view(name) : std::string_view{};
+	auto idOpt = m_fontSystem.load_font_data(std::span<const uint8_t>(data, static_cast<size_t>(ndata)), idx, alias);
 	if (freeData && data) {
 		free(data);
 	}
@@ -1942,11 +2202,6 @@ int Context::createFontMem(const char* name, unsigned char* data, int ndata, int
 		currentState().fontId = id;
 	}
 	return id;
-}
-
-int Context::createFontMemAtIndex(const char* name, unsigned char* data, int ndata, int freeData, const int fontIndex) {
-	(void)fontIndex;
-	return createFontMem(name, data, ndata, freeData);
 }
 
 int Context::findFont(const char* name) {
@@ -2267,6 +2522,7 @@ float Context::text(float x, float y, const char* string, const char* end) {
 					m_atlas->resize(2048, 2048);
 					m_glyphCache.clear();
 					m_fontTextureId = m_renderer->createTexture(TextureType::Alpha, m_atlas->width(), m_atlas->height(), 0, m_atlas->data());
+					m_atlas->markClean();
 					inserted = m_atlas->insert(key, cg);
 				} else {
 					m_atlas->reset();
@@ -2408,6 +2664,7 @@ float Context::textWithFont(float x, float y, const text::TtfFont& font, float f
 					m_atlas->resize(2048, 2048);
 					m_glyphCache.clear();
 					m_fontTextureId = m_renderer->createTexture(TextureType::Alpha, m_atlas->width(), m_atlas->height(), 0, m_atlas->data());
+					m_atlas->markClean();
 					inserted = m_atlas->insert(key, cg);
 				} else {
 					m_atlas->reset();
@@ -2465,8 +2722,6 @@ float Context::textWithFont(float x, float y, const text::TtfFont& font, float f
 }
 
 void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontSystem, Point pos, Color defaultColor) {
-	State& s = currentState();
-
 	bool need_shaping = false;
 	for (const auto& line : buffer.lines()) {
 		if (!line.is_shaped()) {
@@ -2481,123 +2736,332 @@ void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontS
 	auto runs = buffer.layout_runs();
 	if (runs.empty()) return;
 
-	float scale = getFontScale(s) * m_devicePixelRatio;
-	float invscale = 1.0f / scale;
-	bool isFlipped = isTransformFlipped(s.xform);
+	const float scale = getFontScale(currentState()) * m_devicePixelRatio;
+	const float invscale = 1.0f / scale;
+	const bool isFlipped = isTransformFlipped(currentState().xform);
 
 	m_textVertices.clear();
 
-	uint32_t defColorRgba = defaultColor.premultiplied().toRGBA8();
+	const uint32_t defColorRgba = defaultColor.premultiplied().toRGBA8();
 
 	auto flushBatch = [&]() {
 		if (!m_textVertices.empty()) {
 			m_atlas->flushToGpu(m_renderer.get(), m_fontTextureId);
+			const State& cur = currentState();
 			Paint p;
 			p.image = m_fontTextureId;
-			p.innerColor = Color(1.0f, 1.0f, 1.0f, s.alpha);
-			p.outerColor = Color(1.0f, 1.0f, 1.0f, s.alpha);
-			m_renderer->renderTriangles(p, s.compositeOperation, s.scissor,
-			                           m_textVertices.data(), static_cast<int>(m_textVertices.size()), m_fringeWidth);
+			p.innerColor = Color(1.0f, 1.0f, 1.0f, cur.alpha);
+			p.outerColor = Color(1.0f, 1.0f, 1.0f, cur.alpha);
+			m_renderer->renderTriangles(p, cur.compositeOperation, cur.scissor,
+			                           m_textVertices.data(), static_cast<int>(m_textVertices.size()), m_fringeWidth, 3);
 			m_textVertices.clear();
 		}
 	};
 
-	for (const auto& run : runs) {
-		float baseline_offset = (run.max_ascent > 0.0f) ? run.max_ascent : buffer.metrics().font_size;
-		float line_baseline = pos.y + run.line_top + baseline_offset;
+	auto appendSolidQuadPts = [&](std::vector<Vertex>& out, Point p0, Point p1, Point p2, Point p3, uint32_t rgba) {
+		out.emplace_back(p0.x, p0.y, 0.5f, 1.0f, rgba);
+		out.emplace_back(p3.x, p3.y, 0.5f, 1.0f, rgba);
+		out.emplace_back(p2.x, p2.y, 0.5f, 1.0f, rgba);
+		out.emplace_back(p0.x, p0.y, 0.5f, 1.0f, rgba);
+		out.emplace_back(p2.x, p2.y, 0.5f, 1.0f, rgba);
+		out.emplace_back(p1.x, p1.y, 0.5f, 1.0f, rgba);
+	};
 
+	auto appendSolidRect = [&](std::vector<Vertex>& out, float rx, float ry, float rw, float rh, uint32_t rgba) {
+		const State& cur = currentState();
+		Point p0 = cur.xform.transformPoint(rx, ry);
+		Point p1 = cur.xform.transformPoint(rx + rw, ry);
+		Point p2 = cur.xform.transformPoint(rx + rw, ry + rh);
+		Point p3 = cur.xform.transformPoint(rx, ry + rh);
+		appendSolidQuadPts(out, p0, p1, p2, p3, rgba);
+	};
+
+	auto flushSolidRects = [&](std::vector<Vertex>& verts) {
+		if (!verts.empty()) {
+			const State& cur = currentState();
+			Paint solidPaint;
+			m_renderer->renderTriangles(solidPaint, cur.compositeOperation, cur.scissor,
+			                           verts.data(), static_cast<int>(verts.size()), m_fringeWidth, 4 /* ShaderSolid */);
+			verts.clear();
+		}
+	};
+
+	auto emitGlyphQuad = [&](const text::TtfFont* font, uint32_t font_id, uint16_t glyph_id, float font_size,
+	                         float glyph_x, float glyph_y, bool synth_bold, bool synth_italic, uint32_t vcolor) {
+		float scaledSize = font_size * scale;
+		uint32_t sizeBits = 0;
+		std::memcpy(&sizeBits, &scaledSize, sizeof(float));
+
+		float targetX = glyph_x * scale;
+		float targetY = glyph_y * scale;
+
+		auto [intX, xBin] = text::compute_subpixel_bin(targetX);
+		auto [intY, yBin] = text::compute_subpixel_bin(targetY);
+
+		uint8_t styleFlags = (synth_bold ? 1 : 0) | (synth_italic ? 2 : 0);
+		text::CacheKey key{font_id, glyph_id, sizeBits, xBin, yBin, styleFlags};
+		const AtlasGlyphEntry* entry = m_atlas->find(key);
+
+		if (!entry) {
+			const text::CachedGlyph* cg = m_glyphCache.get_or_render(
+				*font, font_id, glyph_id, scaledSize, targetX, targetY,
+				synth_bold, synth_italic);
+
+			auto inserted = m_atlas->insert(key, cg);
+			if (!inserted) {
+				flushBatch();
+				if (m_renderer) {
+					m_renderer->flush();
+				}
+				if (m_atlas->width() < 2048 || m_atlas->height() < 2048) {
+					if (m_fontTextureId != 0 && m_renderer) {
+						m_renderer->deleteTexture(m_fontTextureId);
+						m_fontTextureId = 0;
+					}
+					m_atlas->resize(2048, 2048);
+					m_glyphCache.clear();
+					m_fontTextureId = m_renderer->createTexture(TextureType::Alpha, 2048, 2048, 0, m_atlas->data());
+					m_atlas->markClean();
+					inserted = m_atlas->insert(key, cg);
+				} else {
+					m_atlas->reset();
+					m_glyphCache.clear();
+					inserted = m_atlas->insert(key, cg);
+				}
+			}
+			entry = inserted ? &(*inserted) : nullptr;
+		}
+
+		if (!entry || entry->width == 0 || entry->height == 0) return;
+
+		float qx0 = static_cast<float>(intX + entry->offsetX) * invscale;
+		float qy0 = static_cast<float>(intY + entry->offsetY) * invscale;
+		float qx1 = qx0 + static_cast<float>(entry->width) * invscale;
+		float qy1 = qy0 + static_cast<float>(entry->height) * invscale;
+
+		float u0 = entry->u0;
+		float v0 = entry->v0;
+		float u1 = entry->u1;
+		float v1 = entry->v1;
+
+		if (isFlipped) {
+			std::swap(qy0, qy1);
+			std::swap(v0, v1);
+		}
+
+		const State& cur = currentState();
+		Point c0 = cur.xform.transformPoint(qx0, qy0);
+		Point c1 = cur.xform.transformPoint(qx1, qy0);
+		Point c2 = cur.xform.transformPoint(qx1, qy1);
+		Point c3 = cur.xform.transformPoint(qx0, qy1);
+
+		m_textVertices.emplace_back(c0.x, c0.y, u0, v0, vcolor);
+		m_textVertices.emplace_back(c2.x, c2.y, u1, v1, vcolor);
+		m_textVertices.emplace_back(c1.x, c1.y, u1, v0, vcolor);
+
+		m_textVertices.emplace_back(c0.x, c0.y, u0, v0, vcolor);
+		m_textVertices.emplace_back(c3.x, c3.y, u0, v1, vcolor);
+		m_textVertices.emplace_back(c2.x, c2.y, u1, v1, vcolor);
+	};
+
+	std::vector<Vertex> solidVerts;
+	std::vector<text::ColorGlyphLayer> color_layers;
+
+	auto resolveGlyphFont = [&](uint32_t fid) -> const text::TtfFont* {
+		const text::TtfFont* f = fontSystem.get_font(fid);
+		if (!f) {
+			if (auto defId = fontSystem.default_font_id()) {
+				f = fontSystem.get_font(*defId);
+			}
+		}
+		return f;
+	};
+
+	auto emitGlyphWithColor = [&](const text::LayoutGlyph& glyph, const text::TtfFont* font,
+	                              float gx, float gy, uint32_t overrideRgba, bool forceSolid) {
+		if (font->has_color_glyphs() && font->get_color_glyph_layers(glyph.glyph_id, color_layers)) {
+			for (const auto& layer : color_layers) {
+				uint32_t layerRgba = (forceSolid || layer.use_foreground)
+					? overrideRgba
+					: Color(layer.color.to_color()).premultiplied().toRGBA8();
+				emitGlyphQuad(font, glyph.font_id, layer.glyph_id, glyph.font_size,
+				              gx, gy, glyph.synthetic_bold, glyph.synthetic_italic, layerRgba);
+			}
+			return;
+		}
+		emitGlyphQuad(font, glyph.font_id, glyph.glyph_id, glyph.font_size,
+		              gx, gy, glyph.synthetic_bold, glyph.synthetic_italic, overrideRgba);
+	};
+
+	std::vector<float> blur_sigmas;
+	bool has_sharp_shadows = false;
+	for (const auto& run : runs) {
+		for (const auto& glyph : run.glyphs) {
+			for (const auto& sh : glyph.shadows) {
+				if (sh.blur_sigma > 0.1f) {
+					if (std::find_if(blur_sigmas.begin(), blur_sigmas.end(), [&](float s) {
+							return std::abs(s - sh.blur_sigma) < 0.05f;
+						}) == blur_sigmas.end()) {
+						blur_sigmas.push_back(sh.blur_sigma);
+					}
+				} else {
+					has_sharp_shadows = true;
+				}
+			}
+		}
+	}
+
+	for (const auto& run : runs) {
+		const float baseline_offset = (run.max_ascent > 0.0f) ? run.max_ascent : buffer.metrics().font_size;
+		const float line_baseline = pos.y + run.line_top + baseline_offset;
+
+		// Pass 1: Span background highlights
+		if (run.line_height > 0.0f) {
+			const float curAlpha = currentState().alpha;
+			for (const auto& glyph : run.glyphs) {
+				if (glyph.background_color_opt.has_value() && glyph.w > 0.0f) {
+					Color bg = glyph.background_color_opt->to_color();
+					bg.a *= curAlpha;
+					appendSolidRect(solidVerts, pos.x + glyph.x, pos.y + run.line_top,
+					                glyph.w, run.line_height, bg.premultiplied().toRGBA8());
+				}
+			}
+			if (!solidVerts.empty()) {
+				flushBatch();
+				flushSolidRects(solidVerts);
+			}
+		}
+
+		// Pass 1.5a: Sharp TextShadows
+		if (has_sharp_shadows) {
+			for (const auto& glyph : run.glyphs) {
+				if (glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
+				const text::TtfFont* font = resolveGlyphFont(glyph.font_id);
+				if (!font) continue;
+				const float gx = pos.x + glyph.x + glyph.x_offset;
+				const float gy = line_baseline + glyph.y + glyph.y_offset;
+				for (const auto& sh : glyph.shadows) {
+					if (sh.blur_sigma <= 0.1f) {
+						const uint32_t shRgba = Color(sh.color.to_color()).premultiplied().toRGBA8();
+						emitGlyphWithColor(glyph, font, gx + sh.offset_x, gy + sh.offset_y, shRgba, true);
+					}
+				}
+			}
+		}
+
+		// Pass 1.5b: Blurred TextShadows via Gaussian blur offscreen layer
+		for (float sigma : blur_sigmas) {
+			float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+			bool any_for_sigma = false;
+			const Transform2D xf = currentState().xform;
+			for (const auto& glyph : run.glyphs) {
+				if (glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
+				const float gx = pos.x + glyph.x + glyph.x_offset;
+				for (const auto& sh : glyph.shadows) {
+					if (sh.blur_sigma > 0.1f && std::abs(sh.blur_sigma - sigma) < 0.05f) {
+						any_for_sigma = true;
+						const float lx0 = gx + sh.offset_x - glyph.font_size * 0.5f;
+						const float lx1 = gx + sh.offset_x + std::max(glyph.w, glyph.font_size) + glyph.font_size * 0.5f;
+						const float ly0 = pos.y + run.line_top + sh.offset_y - glyph.font_size * 0.5f;
+						const float ly1 = pos.y + run.line_top + run.line_height + sh.offset_y + glyph.font_size * 0.5f;
+						const Point corners[4] = {
+							xf.transformPoint(lx0, ly0),
+							xf.transformPoint(lx1, ly0),
+							xf.transformPoint(lx1, ly1),
+							xf.transformPoint(lx0, ly1)
+						};
+						for (const auto& cp : corners) {
+							minX = std::min(minX, cp.x);
+							minY = std::min(minY, cp.y);
+							maxX = std::max(maxX, cp.x);
+							maxY = std::max(maxY, cp.y);
+						}
+					}
+				}
+			}
+			if (!any_for_sigma) continue;
+
+			flushBatch();
+			const float pad = std::ceil(sigma * 3.0f) + 2.0f;
+			LayerDesc ldesc;
+			ldesc.hasBounds = true;
+			ldesc.bounds[0] = std::floor(minX - pad);
+			ldesc.bounds[1] = std::floor(minY - pad);
+			ldesc.bounds[2] = std::ceil(maxX + pad);
+			ldesc.bounds[3] = std::ceil(maxY + pad);
+			ldesc.postBlurSigmaX = sigma;
+			ldesc.postBlurSigmaY = sigma;
+			ldesc.opacity = 1.0f;
+			ldesc.compOp = currentState().compositeOperation;
+			pushLayer(ldesc);
+
+			for (const auto& glyph : run.glyphs) {
+				if (glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
+				const text::TtfFont* font = resolveGlyphFont(glyph.font_id);
+				if (!font) continue;
+				const float gx = pos.x + glyph.x + glyph.x_offset;
+				const float gy = line_baseline + glyph.y + glyph.y_offset;
+				for (const auto& sh : glyph.shadows) {
+					if (sh.blur_sigma > 0.1f && std::abs(sh.blur_sigma - sigma) < 0.05f) {
+						const uint32_t shRgba = Color(sh.color.to_color()).premultiplied().toRGBA8();
+						emitGlyphWithColor(glyph, font, gx + sh.offset_x, gy + sh.offset_y, shRgba, true);
+					}
+				}
+			}
+			flushBatch();
+			restore();
+		}
+
+		// Pass 2: Glyphs (including COLR/CPAL color layers)
 		for (const auto& glyph : run.glyphs) {
 			if (glyph.glyph_id == 0) continue;
-
-			const text::TtfFont* font = fontSystem.get_font(glyph.font_id);
-			if (!font) {
-				if (auto defId = fontSystem.default_font_id()) {
-					font = fontSystem.get_font(*defId);
-				}
-			}
+			const text::TtfFont* font = resolveGlyphFont(glyph.font_id);
 			if (!font) continue;
 
-			float scaledSize = glyph.font_size * scale;
-			uint32_t sizeBits = 0;
-			std::memcpy(&sizeBits, &scaledSize, sizeof(float));
+			const float glyph_x = pos.x + glyph.x + glyph.x_offset;
+			const float glyph_y = line_baseline + glyph.y + glyph.y_offset;
+			Color fg = glyph.color_opt.has_value() ? Color(glyph.color_opt->to_color()) : defaultColor;
+			uint32_t fgRgba = fg.premultiplied().toRGBA8();
 
-			float glyph_x = pos.x + glyph.x + glyph.x_offset;
-			float glyph_y = line_baseline + glyph.y + glyph.y_offset;
+			emitGlyphWithColor(glyph, font, glyph_x, glyph_y,
+			                   glyph.color_opt.has_value() ? fgRgba : defColorRgba, false);
+		}
 
-			float targetX = glyph_x * scale;
-			float targetY = glyph_y * scale;
-
-			auto [intX, xBin] = text::compute_subpixel_bin(targetX);
-			auto [intY, yBin] = text::compute_subpixel_bin(targetY);
-
-			uint8_t styleFlags = (glyph.synthetic_bold ? 1 : 0) | (glyph.synthetic_italic ? 2 : 0);
-			text::CacheKey key{glyph.font_id, glyph.glyph_id, sizeBits, xBin, yBin, styleFlags};
-			const AtlasGlyphEntry* entry = m_atlas->find(key);
-
-			if (!entry) {
-				const text::CachedGlyph* cg = m_glyphCache.get_or_render(
-					*font, glyph.font_id, glyph.glyph_id, scaledSize, targetX, targetY,
-					glyph.synthetic_bold, glyph.synthetic_italic);
-
-				auto inserted = m_atlas->insert(key, cg);
-				if (!inserted) {
-					flushBatch();
-					if (m_renderer) {
-						m_renderer->flush();
-					}
-					if (m_atlas->width() < 2048 || m_atlas->height() < 2048) {
-						if (m_fontTextureId != 0 && m_renderer) {
-							m_renderer->deleteTexture(m_fontTextureId);
-							m_fontTextureId = 0;
-						}
-						m_atlas->resize(2048, 2048);
-						m_glyphCache.clear();
-						m_fontTextureId = m_renderer->createTexture(TextureType::Alpha, 2048, 2048, 0, m_atlas->data());
-						inserted = m_atlas->insert(key, cg);
-					} else {
-						m_atlas->reset();
-						m_glyphCache.clear();
-						inserted = m_atlas->insert(key, cg);
-					}
-				}
-				entry = inserted ? &(*inserted) : nullptr;
+		// Pass 3: Decorations (underline, strikethrough, overline + all 5 styles)
+		const auto dec = text::build_run_decorations(
+			run, pos.x, pos.y, buffer.metrics().font_size,
+			nisaba::Color::from_rgba_unchecked(defaultColor.r, defaultColor.g, defaultColor.b, defaultColor.a)
+		);
+		const State& cur = currentState();
+		for (const auto& r : dec.rects) {
+			Color dc(r.color);
+			dc.a *= cur.alpha;
+			appendSolidRect(solidVerts, r.x, r.y, r.w, r.h, dc.premultiplied().toRGBA8());
+		}
+		for (const auto& wv : dec.waves) {
+			Color dc(wv.color);
+			dc.a *= cur.alpha;
+			const uint32_t dcRgba = dc.premultiplied().toRGBA8();
+			const float halfW = wv.stroke_width * 0.5f;
+			for (size_t i = 0; i + 1 < wv.points.size(); ++i) {
+				const auto& a = wv.points[i];
+				const auto& b = wv.points[i + 1];
+				const float dx = b.x - a.x;
+				const float dy = b.y - a.y;
+				const float len = std::hypot(dx, dy);
+				if (len <= 1e-4f) continue;
+				const float nx = (-dy / len) * halfW;
+				const float ny = ( dx / len) * halfW;
+				Point p0 = cur.xform.transformPoint(a.x - nx, a.y - ny);
+				Point p1 = cur.xform.transformPoint(b.x - nx, b.y - ny);
+				Point p2 = cur.xform.transformPoint(b.x + nx, b.y + ny);
+				Point p3 = cur.xform.transformPoint(a.x + nx, a.y + ny);
+				appendSolidQuadPts(solidVerts, p0, p1, p2, p3, dcRgba);
 			}
-
-			if (!entry || entry->width == 0 || entry->height == 0) continue;
-
-			float qx0 = static_cast<float>(intX + entry->offsetX) * invscale;
-			float qy0 = static_cast<float>(intY + entry->offsetY) * invscale;
-			float qx1 = qx0 + static_cast<float>(entry->width) * invscale;
-			float qy1 = qy0 + static_cast<float>(entry->height) * invscale;
-
-			float u0 = entry->u0;
-			float v0 = entry->v0;
-			float u1 = entry->u1;
-			float v1 = entry->v1;
-
-			if (isFlipped) {
-				std::swap(qy0, qy1);
-				std::swap(v0, v1);
-			}
-
-			Point c0 = s.xform.transformPoint(qx0, qy0);
-			Point c1 = s.xform.transformPoint(qx1, qy0);
-			Point c2 = s.xform.transformPoint(qx1, qy1);
-			Point c3 = s.xform.transformPoint(qx0, qy1);
-
-			uint32_t vcolor = defColorRgba;
-			if (glyph.color_opt.has_value()) {
-				nisaba::Color c = glyph.color_opt->to_color();
-				vcolor = Color(c).premultiplied().toRGBA8();
-			}
-
-			m_textVertices.emplace_back(c0.x, c0.y, u0, v0, vcolor);
-			m_textVertices.emplace_back(c2.x, c2.y, u1, v1, vcolor);
-			m_textVertices.emplace_back(c1.x, c1.y, u1, v0, vcolor);
-
-			m_textVertices.emplace_back(c0.x, c0.y, u0, v0, vcolor);
-			m_textVertices.emplace_back(c3.x, c3.y, u0, v1, vcolor);
-			m_textVertices.emplace_back(c2.x, c2.y, u1, v1, vcolor);
+		}
+		if (!solidVerts.empty()) {
+			flushBatch();
+			flushSolidRects(solidVerts);
 		}
 	}
 

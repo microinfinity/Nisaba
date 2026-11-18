@@ -66,6 +66,13 @@ uint64_t compute_dirs_fingerprint(const std::vector<std::string>& dirs) noexcept
 }
 
 std::string get_disk_cache_path() {
+#if defined(__EMSCRIPTEN__)
+    return {};
+#elif defined(_WIN32)
+    const char* local_app_data = std::getenv("LOCALAPPDATA");
+    if (!local_app_data || local_app_data[0] == '\0') return {};
+    return std::string(local_app_data) + "\\nisaba\\font_index_v1.bin";
+#else
     const char* xdg = std::getenv("XDG_CACHE_HOME");
     std::string base;
     if (xdg && xdg[0] != '\0') {
@@ -78,6 +85,7 @@ std::string get_disk_cache_path() {
     }
     if (base.empty()) return {};
     return base + "/nisaba/font_index_v1.bin";
+#endif
 }
 
 constexpr uint32_t CACHE_MAGIC = 0x4E534631u; // 'NSF1'
@@ -195,6 +203,17 @@ void FontSystem::rebuild_lookup_tables() {
     family_to_faces_.clear();
     for (size_t i = 0; i < faces_.size(); ++i) {
         family_to_faces_[faces_[i].family_key].push_back(i);
+    }
+    for (const auto& [alias_key, ids] : explicit_aliases_) {
+        auto& vec = family_to_faces_[alias_key];
+        for (uint32_t fid : ids) {
+            if (const FaceRecord* rec = find_face_record(fid)) {
+                size_t fidx = static_cast<size_t>(rec - faces_.data());
+                if (std::find(vec.begin(), vec.end(), fidx) == vec.end()) {
+                    vec.push_back(fidx);
+                }
+            }
+        }
     }
     std::fill(std::begin(fallback_page_cache_), std::end(fallback_page_cache_), FallbackPageSlot{});
 }
@@ -318,19 +337,69 @@ void FontSystem::save_disk_cache(const std::vector<std::string>& dirs) const {
 
 size_t FontSystem::scan_system_fonts(bool use_disk_cache) {
     auto_system_scan_attempted_ = true;
+
+#if defined(__EMSCRIPTEN__)
+    // WebAssembly builds load fonts explicitly via load_font_data / virtual FS; no host OS font tree.
+    (void)use_disk_cache;
+    return 0;
+#else
+    std::vector<std::string> platform_dirs;
+    std::vector<std::string> default_candidates;
+#if defined(_WIN32) || defined(__ANDROID__) || defined(__APPLE__)
+    auto add_existing_dir = [&](const std::string& p) {
+        std::error_code ec;
+        if (!p.empty() && fs::exists(p, ec) && fs::is_directory(p, ec)) {
+            platform_dirs.push_back(p);
+        }
+    };
+#endif
+
+#if defined(_WIN32)
+    const char* windir = std::getenv("WINDIR");
+    add_existing_dir((windir && windir[0] != '\0') ? (std::string(windir) + "\\Fonts") : "C:\\Windows\\Fonts");
+    const char* local_app = std::getenv("LOCALAPPDATA");
+    if (local_app && local_app[0] != '\0') {
+        add_existing_dir(std::string(local_app) + "\\Microsoft\\Windows\\Fonts");
+    }
+    default_candidates = {"Segoe UI", "Arial", "Tahoma"};
+    register_family_alias("sans-serif", "Segoe UI");
+    register_family_alias("serif", "Times New Roman");
+    register_family_alias("monospace", "Consolas");
+#elif defined(__ANDROID__)
+    add_existing_dir("/system/fonts");
+    add_existing_dir("/product/fonts");
+    add_existing_dir("/apex/com.android.runtime/etc/fonts");
+    default_candidates = {"Roboto", "Noto Sans", "Droid Sans"};
+    register_family_alias("sans-serif", "Roboto");
+    register_family_alias("serif", "Noto Serif");
+    register_family_alias("monospace", "Droid Sans Mono");
+#elif defined(__APPLE__)
+    add_existing_dir("/System/Library/Fonts");
+    add_existing_dir("/Library/Fonts");
+    const char* home = std::getenv("HOME");
+    if (home && home[0] != '\0') {
+        add_existing_dir(std::string(home) + "/Library/Fonts");
+    }
+    default_candidates = {"SF Pro", "Helvetica Neue", "Helvetica", "Arial"};
+    register_family_alias("sans-serif", "Helvetica Neue");
+    register_family_alias("serif", "Times New Roman");
+    register_family_alias("monospace", "Menlo");
+#else
     if (!system_config_loaded_) {
         linux_config_.load_system_config(linux_config_.locale());
         system_config_loaded_ = true;
     }
+    platform_dirs = linux_config_.font_directories();
+    default_candidates = linux_config_.resolve_family_candidates(Family::sans_serif());
+#endif
 
-    const auto& dirs = linux_config_.font_directories();
+    const auto& dirs = platform_dirs;
     if (dirs.empty()) return 0;
 
     size_t before_count = faces_.size();
 
     auto select_lazy_default_id = [&]() {
-        auto candidates = linux_config_.resolve_family_candidates(Family::sans_serif());
-        for (const auto& cand_name : candidates) {
+        for (const auto& cand_name : default_candidates) {
             std::string key = LinuxFontConfig::normalize_key(cand_name);
             auto it = family_to_faces_.find(key);
             if (it != family_to_faces_.end() && !it->second.empty()) {
@@ -340,6 +409,11 @@ size_t FontSystem::scan_system_fonts(bool use_disk_cache) {
                 }
             }
         }
+#if !defined(__linux__)
+        if (!default_font_id_.has_value() && !faces_.empty()) {
+            default_font_id_ = faces_.front().id;
+        }
+#endif
     };
 
     if (use_disk_cache && faces_.empty() && try_load_disk_cache(dirs)) {
@@ -358,6 +432,7 @@ size_t FontSystem::scan_system_fonts(bool use_disk_cache) {
     select_lazy_default_id();
 
     return faces_.size() - before_count;
+#endif
 }
 
 void FontSystem::ensure_default_system_fonts() const noexcept {
@@ -448,7 +523,11 @@ size_t FontSystem::scan_font_directory_internal(std::string_view dir_path, bool 
     return added;
 }
 
-std::optional<uint32_t> FontSystem::load_font_file(std::string_view path, uint32_t face_index) {
+std::optional<uint32_t> FontSystem::load_font_file(
+    std::string_view path,
+    uint32_t face_index,
+    std::string_view family_alias
+) {
     auto mapped = MappedFontData::open_file(path);
     if (!mapped || !mapped->is_valid()) {
         return std::nullopt;
@@ -484,6 +563,9 @@ std::optional<uint32_t> FontSystem::load_font_file(std::string_view path, uint32
     has_custom_fonts_ = true;
     uint32_t id = register_probed_face(path_str, info);
     faces_.back().font = std::move(font);
+    if (!family_alias.empty()) {
+        register_family_alias(family_alias, id);
+    }
     return id;
 }
 
@@ -509,7 +591,11 @@ std::vector<uint32_t> FontSystem::load_font_collection(std::string_view path) {
     return ids;
 }
 
-std::optional<uint32_t> FontSystem::load_font_data(std::span<const uint8_t> data, uint32_t face_index) {
+std::optional<uint32_t> FontSystem::load_font_data(
+    std::span<const uint8_t> data,
+    uint32_t face_index,
+    std::string_view family_alias
+) {
     FontFaceHeaderInfo info;
     bool probed = TtfFont::probe_face_header(data, face_index, info);
 
@@ -537,7 +623,34 @@ std::optional<uint32_t> FontSystem::load_font_data(std::span<const uint8_t> data
     has_custom_fonts_ = true;
     uint32_t id = register_probed_face("", info);
     faces_.back().font = std::move(font);
+    if (!family_alias.empty()) {
+        register_family_alias(family_alias, id);
+    }
     return id;
+}
+
+void FontSystem::register_family_alias(std::string_view alias_name, std::string_view target_family) {
+    if (alias_name.empty() || target_family.empty()) return;
+    linux_config_.register_alias(alias_name, target_family);
+    std::fill(std::begin(fallback_page_cache_), std::end(fallback_page_cache_), FallbackPageSlot{});
+}
+
+void FontSystem::register_family_alias(std::string_view alias_name, uint32_t font_id) {
+    if (alias_name.empty()) return;
+    const FaceRecord* rec = find_face_record(font_id);
+    if (!rec) return;
+    std::string key = LinuxFontConfig::normalize_key(alias_name);
+    if (key.empty()) return;
+    auto& id_list = explicit_aliases_[key];
+    if (std::find(id_list.begin(), id_list.end(), font_id) == id_list.end()) {
+        id_list.push_back(font_id);
+    }
+    size_t fidx = static_cast<size_t>(rec - faces_.data());
+    auto& fvec = family_to_faces_[key];
+    if (std::find(fvec.begin(), fvec.end(), fidx) == fvec.end()) {
+        fvec.push_back(fidx);
+    }
+    std::fill(std::begin(fallback_page_cache_), std::end(fallback_page_cache_), FallbackPageSlot{});
 }
 
 const FontSystem::FaceRecord* FontSystem::find_face_record(uint32_t font_id) const noexcept {

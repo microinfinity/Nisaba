@@ -121,6 +121,17 @@ void draw_pixmap(
     std::optional<ScreenIntRect> clip = std::nullopt
 );
 
+void draw_pixmap_rect(
+    PixmapMut& dst,
+    const PixmapRef& src,
+    const Rect& src_rect,
+    const Rect& dst_rect,
+    const PixmapPaint& paint = PixmapPaint(),
+    Transform transform = Transform(),
+    const Mask* mask = nullptr,
+    std::optional<ScreenIntRect> clip = std::nullopt
+);
+
 void apply_mask(
     PixmapMut& dst,
     const Mask& mask

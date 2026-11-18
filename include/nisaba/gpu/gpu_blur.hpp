@@ -90,9 +90,11 @@ private:
 
     bool setup_shaders();
     bool setup_vbo();
+    uint32_t blur_texture_impl(uint32_t srcTexId, int width, int height, const DualKawaseConfig& config);
 
     int base_width_{0};
     int base_height_{0};
+    uint32_t capture_fbo_{0};
     uint32_t capture_tex_{0};
     uint32_t vao_{0};
     uint32_t vbo_{0};

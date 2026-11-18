@@ -67,13 +67,25 @@ std::shared_ptr<GpuTexture> GpuTexture::create_from_pixmap(
     if (tex_id == 0) return nullptr;
 
     device->bind_texture(0, tex_id);
-    device->upload_texture_image_2d(
-        pixmap.width(), pixmap.height(),
-        pixmap.data(),
-        GpuTextureFormat::RGBA8,
-        filter,
-        wrap
-    );
+    size_t tight_stride = static_cast<size_t>(pixmap.width()) * 4;
+    if (pixmap.format() == PixelFormat::RGBA8888 && pixmap.stride_bytes() == tight_stride) {
+        device->upload_texture_image_2d(
+            pixmap.width(), pixmap.height(),
+            pixmap.data(),
+            GpuTextureFormat::RGBA8,
+            filter,
+            wrap
+        );
+    } else {
+        Pixmap owned_rgba = pixmap.to_rgba8888();
+        device->upload_texture_image_2d(
+            pixmap.width(), pixmap.height(),
+            owned_rgba.data(),
+            GpuTextureFormat::RGBA8,
+            filter,
+            wrap
+        );
+    }
 
     return std::shared_ptr<GpuTexture>(new GpuTexture(device, tex_id, pixmap.width(), pixmap.height(), GpuTextureFormat::RGBA8));
 }

@@ -84,6 +84,8 @@ protected:
     uint32_t fbo_id_{0};
     uint32_t resolve_fbo_{0};
     uint32_t msaa_rb_id_{0};
+    uint32_t resolve_ds_rb_{0};
+    uint32_t msaa_ds_rb_{0};
     uint32_t samples_{1};
     uint32_t width_{0};
     uint32_t height_{0};
@@ -91,6 +93,9 @@ protected:
     bool owns_fbo_{true};
     bool needs_resolve_{false};
     bool preserve_contents_{false};
+
+private:
+    void resolve_rect_internal(const ScreenIntRect& damage_rect);
 };
 
 } // namespace nisaba::gpu

@@ -259,9 +259,10 @@ void box_blur_pixmap(PixmapMut& pixmap, int32_t radius) {
     }
 }
 
-void gaussian_blur_pixmap(PixmapMut& pixmap, float sigma) {
-    if (sigma <= 0.0f) return;
-    auto radii = compute_box_blur_radii(sigma);
+void gaussian_blur_pixmap_xy(PixmapMut& pixmap, float sigma_x, float sigma_y) {
+    if (sigma_x <= 0.0f && sigma_y <= 0.0f) return;
+    auto radii_x = compute_box_blur_radii(sigma_x);
+    auto radii_y = compute_box_blur_radii(sigma_y);
     int32_t w = static_cast<int32_t>(pixmap.width());
     int32_t h = static_cast<int32_t>(pixmap.height());
     if (w <= 0 || h <= 0) return;
@@ -274,10 +275,12 @@ void gaussian_blur_pixmap(PixmapMut& pixmap, float sigma) {
         std::copy_n(row_in, static_cast<size_t>(w), flat_src.data() + y * w);
     }
 
-    for (int32_t r : radii) {
-        if (r > 0) {
-            box_blur_1d_h_pixmap(flat_src.data(), tmp.data(), w, h, r);
-            box_blur_1d_v_pixmap(tmp.data(), flat_src.data(), w, h, r);
+    for (size_t i = 0; i < 3; ++i) {
+        int32_t rx = radii_x[i];
+        int32_t ry = radii_y[i];
+        if (rx > 0 || ry > 0) {
+            box_blur_1d_h_pixmap(flat_src.data(), tmp.data(), w, h, rx);
+            box_blur_1d_v_pixmap(tmp.data(), flat_src.data(), w, h, ry);
         }
     }
 
@@ -285,6 +288,10 @@ void gaussian_blur_pixmap(PixmapMut& pixmap, float sigma) {
         auto* row_out = pixmap.row(static_cast<size_t>(y));
         std::copy_n(flat_src.data() + y * w, static_cast<size_t>(w), row_out);
     }
+}
+
+void gaussian_blur_pixmap(PixmapMut& pixmap, float sigma) {
+    gaussian_blur_pixmap_xy(pixmap, sigma, sigma);
 }
 
 Pixmap blur_pixmap(const PixmapRef& src, float sigma) {

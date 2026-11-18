@@ -46,11 +46,21 @@ static int g_tests_failed = 0;
 
 TEST_CASE(test_stroke_dash_validation) {
     EXPECT_FALSE(StrokeDash::create({}, 0.0f).has_value());
-    EXPECT_FALSE(StrokeDash::create({1.0f}, 0.0f).has_value());
-    EXPECT_FALSE(StrokeDash::create({1.0f, 2.0f, 3.0f}, 0.0f).has_value());
+    EXPECT_FALSE(StrokeDash::create({0.0f}, 0.0f).has_value());
     EXPECT_FALSE(StrokeDash::create({1.0f, -2.0f}, 0.0f).has_value());
     EXPECT_FALSE(StrokeDash::create({0.0f, 0.0f}, 0.0f).has_value());
     EXPECT_FALSE(StrokeDash::create({1.0f, 1.0f}, std::numeric_limits<float>::infinity()).has_value());
+
+    // Odd-length dash arrays duplicate automatically (SVG/CSS/Canvas parity)
+    auto single = StrokeDash::create({5.0f}, 0.0f);
+    EXPECT_TRUE(single.has_value());
+    EXPECT_EQ(single->array().size(), 2u);
+    EXPECT_NEAR(single->interval_len().get(), 10.0f, 1e-5f);
+
+    auto triple = StrokeDash::create({1.0f, 2.0f, 3.0f}, 0.0f);
+    EXPECT_TRUE(triple.has_value());
+    EXPECT_EQ(triple->array().size(), 6u);
+    EXPECT_NEAR(triple->interval_len().get(), 12.0f, 1e-5f);
 
     auto d = StrokeDash::create({6.0f, 4.5f}, 0.0f);
     EXPECT_TRUE(d.has_value());

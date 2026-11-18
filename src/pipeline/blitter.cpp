@@ -1,5 +1,6 @@
 #include "nisaba/pipeline/blitter.hpp"
 #include "nisaba/pipeline/simd.hpp"
+#include "nisaba/color/blend.hpp"
 #include "nisaba/color/color_space_lut.hpp"
 #include <algorithm>
 #include <cmath>
@@ -7,177 +8,6 @@
 namespace nisaba {
 
 namespace {
-
-struct BlendResult {
-    float r, g, b, a;
-};
-
-inline BlendResult apply_blend(
-    float sr, float sg, float sb, float sa,
-    float dr, float dg, float db, float da,
-    BlendMode mode
-) noexcept {
-    auto inv = [](float v) noexcept { return 1.0f - v; };
-    auto mad = [](float a, float b, float c) noexcept { return a * b + c; };
-
-    switch (mode) {
-        case BlendMode::Clear:
-            return {0.0f, 0.0f, 0.0f, 0.0f};
-
-        case BlendMode::Source:
-            return {sr, sg, sb, sa};
-
-        case BlendMode::Destination:
-            return {dr, dg, db, da};
-
-        case BlendMode::SourceOver:
-            return {
-                mad(dr, inv(sa), sr),
-                mad(dg, inv(sa), sg),
-                mad(db, inv(sa), sb),
-                mad(da, inv(sa), sa)
-            };
-
-        case BlendMode::DestinationOver:
-            return {
-                mad(sr, inv(da), dr),
-                mad(sg, inv(da), dg),
-                mad(sb, inv(da), db),
-                mad(sa, inv(da), da)
-            };
-
-        case BlendMode::SourceIn:
-            return {sr * da, sg * da, sb * da, sa * da};
-
-        case BlendMode::DestinationIn:
-            return {dr * sa, dg * sa, db * sa, da * sa};
-
-        case BlendMode::SourceOut:
-            return {sr * inv(da), sg * inv(da), sb * inv(da), sa * inv(da)};
-
-        case BlendMode::DestinationOut:
-            return {dr * inv(sa), dg * inv(sa), db * inv(sa), da * inv(sa)};
-
-        case BlendMode::SourceAtop:
-            return {
-                sr * da + dr * inv(sa),
-                sg * da + dg * inv(sa),
-                sb * da + db * inv(sa),
-                da
-            };
-
-        case BlendMode::DestinationAtop:
-            return {
-                dr * sa + sr * inv(da),
-                dg * sa + sg * inv(da),
-                db * sa + sb * inv(da),
-                sa
-            };
-
-        case BlendMode::Xor:
-            return {
-                sr * inv(da) + dr * inv(sa),
-                sg * inv(da) + dg * inv(sa),
-                sb * inv(da) + db * inv(sa),
-                sa * inv(da) + da * inv(sa)
-            };
-
-        case BlendMode::Plus:
-            return {
-                std::min(sr + dr, 1.0f),
-                std::min(sg + dg, 1.0f),
-                std::min(sb + db, 1.0f),
-                std::min(sa + da, 1.0f)
-            };
-
-        case BlendMode::Modulate:
-            return {sr * dr, sg * dg, sb * db, sa * da};
-
-        case BlendMode::Screen:
-            return {
-                sr + dr - sr * dr,
-                sg + dg - sg * dg,
-                sb + db - sb * db,
-                sa + da - sa * da
-            };
-
-        case BlendMode::Multiply:
-            return {
-                sr * inv(da) + dr * inv(sa) + sr * dr,
-                sg * inv(da) + dg * inv(sa) + sg * dg,
-                sb * inv(da) + db * inv(sa) + sb * db,
-                sa * inv(da) + da * inv(sa) + sa * da
-            };
-
-        case BlendMode::Darken:
-            return {
-                sr + dr - std::max(sr * da, dr * sa),
-                sg + dg - std::max(sg * da, dg * sa),
-                sb + db - std::max(sb * da, db * sa),
-                mad(da, inv(sa), sa)
-            };
-
-        case BlendMode::Lighten:
-            return {
-                sr + dr - std::min(sr * da, dr * sa),
-                sg + dg - std::min(sg * da, dg * sa),
-                sb + db - std::min(sb * da, db * sa),
-                mad(da, inv(sa), sa)
-            };
-
-        case BlendMode::Difference:
-            return {
-                sr + dr - 2.0f * std::min(sr * da, dr * sa),
-                sg + dg - 2.0f * std::min(sg * da, dg * sa),
-                sb + db - 2.0f * std::min(sb * da, db * sa),
-                mad(da, inv(sa), sa)
-            };
-
-        case BlendMode::Exclusion:
-            return {
-                sr + dr - 2.0f * sr * dr,
-                sg + dg - 2.0f * sg * dg,
-                sb + db - 2.0f * sb * db,
-                mad(da, inv(sa), sa)
-            };
-
-        case BlendMode::Overlay: {
-            auto ch = [&](float s, float d) noexcept {
-                return (2.0f * d <= da)
-                    ? (2.0f * s * d)
-                    : (sa * da - 2.0f * (da - d) * (sa - s));
-            };
-            return {
-                sr * inv(da) + dr * inv(sa) + ch(sr, dr),
-                sg * inv(da) + dg * inv(sa) + ch(sg, dg),
-                sb * inv(da) + db * inv(sa) + ch(sb, db),
-                mad(da, inv(sa), sa)
-            };
-        }
-
-        case BlendMode::HardLight: {
-            auto ch = [&](float s, float d) noexcept {
-                return (2.0f * s <= sa)
-                    ? (2.0f * s * d)
-                    : (sa * da - 2.0f * (da - d) * (sa - s));
-            };
-            return {
-                sr * inv(da) + dr * inv(sa) + ch(sr, dr),
-                sg * inv(da) + dg * inv(sa) + ch(sg, dg),
-                sb * inv(da) + db * inv(sa) + ch(sb, db),
-                mad(da, inv(sa), sa)
-            };
-        }
-
-        default:
-            return {
-                mad(dr, inv(sa), sr),
-                mad(dg, inv(sa), sg),
-                mad(db, inv(sa), sb),
-                mad(da, inv(sa), sa)
-            };
-    }
-}
 
 inline PremultipliedColorU8 pack_pixel(float r, float g, float b, float a) noexcept {
     float fa = std::clamp(a, 0.0f, 1.0f);
@@ -216,15 +46,15 @@ std::optional<PipelineBlitter> PipelineBlitter::create(
     }
 
     BlendMode blend_mode = paint.blend_mode;
-    if (paint.shader.is_opaque() && blend_mode == BlendMode::SourceOver && !mask.has_value()) {
+    if (paint.shader.is_opaque() && !paint.has_color_filter() && blend_mode == BlendMode::SourceOver && !mask.has_value()) {
         blend_mode = BlendMode::Source;
     }
 
     std::optional<PremultipliedColorU8> memset_color{};
     if (paint.is_solid_color() && blend_mode == BlendMode::Source && !mask.has_value()) {
         Color base_c = paint.shader.solid_color();
-        if (paint.has_color_filter()) {
-            base_c = paint.color_filter->transform(base_c);
+        if (auto cf = paint.effective_color_effect()) {
+            base_c = cf->transform(base_c);
         }
         memset_color = base_c.premultiply().to_color_u8();
     }
@@ -253,8 +83,8 @@ PipelineBlitter::PipelineBlitter(
 {
     if (is_solid_) {
         Color base_c = paint_.shader.solid_color();
-        if (paint_.has_color_filter()) {
-            base_c = paint_.color_filter->transform(base_c);
+        if (auto cf = paint_.effective_color_effect()) {
+            base_c = cf->transform(base_c);
         }
         solid_color_pm_ = base_c.premultiply().to_color_u8();
         if (pixmap_.format == PixelFormat::BGRA8888) {
@@ -389,8 +219,8 @@ void PipelineBlitter::blend_pixel_impl(uint32_t x, uint32_t y, float coverage, b
     }
 
     Color sc = paint_.shader.sample(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
-    if (paint_.has_color_filter()) {
-        sc = paint_.color_filter->transform(sc);
+    if (auto cf = paint_.effective_color_effect()) {
+        sc = cf->transform(sc);
     }
     PremultipliedColorU8 dp = pixmap_.pixel(x, y);
 
@@ -426,8 +256,8 @@ void PipelineBlitter::blend_pixel_impl(uint32_t x, uint32_t y, float coverage, b
         float dg_lin_pm = dg_lin * da;
         float db_lin_pm = db_lin * da;
 
-        BlendResult br = apply_blend(sr_lin_pm, sg_lin_pm, sb_lin_pm, eff_sa,
-                                     dr_lin_pm, dg_lin_pm, db_lin_pm, da, blend_mode_);
+        BlendResult br = blend_components(sr_lin_pm, sg_lin_pm, sb_lin_pm, eff_sa,
+                                          dr_lin_pm, dg_lin_pm, db_lin_pm, da, blend_mode_);
 
         if (!pre_scale_coverage_ && coverage < 1.0f) {
             br.r = dr_lin_pm + (br.r - dr_lin_pm) * coverage;
@@ -470,7 +300,7 @@ void PipelineBlitter::blend_pixel_impl(uint32_t x, uint32_t y, float coverage, b
     float db = static_cast<float>(dp.blue()) / 255.0f;
     float da = static_cast<float>(dp.alpha()) / 255.0f;
 
-    BlendResult br = apply_blend(sr, sg, sb, sa, dr, dg, db, da, blend_mode_);
+    BlendResult br = blend_components(sr, sg, sb, sa, dr, dg, db, da, blend_mode_);
 
     if (!pre_scale_coverage_ && coverage < 1.0f) {
         br.r = dr + (br.r - dr) * coverage;
@@ -619,7 +449,7 @@ void PipelineBlitter::blend_span(uint32_t x, uint32_t y, uint32_t len, float cov
                     processed += cur_chunk;
                 }
                 return;
-            } else {
+            } else if (blend_mode_ == BlendMode::SourceOver) {
                 // Shaded span with mask (e.g. vector clip!)
                 const uint8_t* m_ptr = mask_->data + y * mask_->real_width + x;
                 alignas(16) PremultipliedColorU8 span_buf[512];

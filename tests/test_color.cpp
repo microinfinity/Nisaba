@@ -3,6 +3,10 @@
 #include <cmath>
 #include "nisaba/color/color.hpp"
 #include "nisaba/color/blend_mode.hpp"
+#include "nisaba/color/blend.hpp"
+#include "nisaba/pipeline/simd.hpp"
+#include <array>
+#include <vector>
 #include "nisaba/raster/fixed_point.hpp"
 #include "nisaba/math/screen_int_rect.hpp"
 
@@ -53,6 +57,68 @@ void test_blend_mode() {
     assert(should_pre_scale_coverage(BlendMode::Plus) == true);
     assert(should_pre_scale_coverage(BlendMode::SourceIn) == false);
     assert(should_pre_scale_coverage(BlendMode::Multiply) == false);
+
+    constexpr std::array<BlendMode, 29> kAllModes = {
+        BlendMode::Clear, BlendMode::Source, BlendMode::Destination,
+        BlendMode::SourceOver, BlendMode::DestinationOver, BlendMode::SourceIn,
+        BlendMode::DestinationIn, BlendMode::SourceOut, BlendMode::DestinationOut,
+        BlendMode::SourceAtop, BlendMode::DestinationAtop, BlendMode::Xor,
+        BlendMode::Plus, BlendMode::Modulate, BlendMode::Screen,
+        BlendMode::Overlay, BlendMode::Darken, BlendMode::Lighten,
+        BlendMode::ColorDodge, BlendMode::ColorBurn, BlendMode::HardLight,
+        BlendMode::SoftLight, BlendMode::Difference, BlendMode::Exclusion,
+        BlendMode::Multiply, BlendMode::Hue, BlendMode::Saturation,
+        BlendMode::Color, BlendMode::Luminosity
+    };
+
+    // Verify blend_pixels vs simd::blend_pixel_by_mode vs simd::blend_solid_span_by_mode across all 29 modes
+    const std::array<PremultipliedColorU8, 4> kDstSamples = {
+        ColorU8::from_rgba(64, 180, 210, 170).premultiply(),
+        ColorU8::from_rgba(200, 120, 40, 255).premultiply(),
+        ColorU8::from_rgba(0, 0, 0, 0).premultiply(),
+        ColorU8::from_rgba(255, 255, 255, 128).premultiply()
+    };
+    const std::array<PremultipliedColorU8, 4> kSrcSamples = {
+        ColorU8::from_rgba(220, 90, 45, 190).premultiply(),
+        ColorU8::from_rgba(50, 210, 140, 255).premultiply(),
+        ColorU8::from_rgba(180, 180, 180, 100).premultiply(),
+        ColorU8::from_rgba(0, 0, 0, 0).premultiply()
+    };
+
+    for (BlendMode mode : kAllModes) {
+        for (const auto& dst : kDstSamples) {
+            for (const auto& src : kSrcSamples) {
+                PremultipliedColorU8 ref = blend_pixels(src, dst, mode);
+                PremultipliedColorU8 pix = simd::blend_pixel_by_mode(dst, src, mode);
+                std::vector<PremultipliedColorU8> span(16, dst);
+                simd::blend_solid_span_by_mode(span.data(), src, mode, span.size());
+
+                auto diff = [](uint8_t a, uint8_t b) { return std::abs(int(a) - int(b)); };
+                assert(diff(ref.red(), pix.red()) <= 2);
+                assert(diff(ref.green(), pix.green()) <= 2);
+                assert(diff(ref.blue(), pix.blue()) <= 2);
+                assert(diff(ref.alpha(), pix.alpha()) <= 2);
+
+                for (size_t k = 0; k < span.size(); ++k) {
+                    assert(span[k].red() == pix.red());
+                    assert(span[k].green() == pix.green());
+                    assert(span[k].blue() == pix.blue());
+                    assert(span[k].alpha() == pix.alpha());
+                }
+            }
+        }
+    }
+
+    // Specific regression checks: Modulate != SourceIn when src != white, ColorDodge/ColorBurn with da < 255
+    {
+        auto dst = ColorU8::from_rgba(200, 100, 50, 255).premultiply();
+        auto src = ColorU8::from_rgba(128, 255, 0, 255).premultiply();
+        auto mod = blend_pixels(src, dst, BlendMode::Modulate);
+        auto sin = blend_pixels(src, dst, BlendMode::SourceIn);
+        assert(mod.red() != sin.red() || mod.green() != sin.green());
+        assert(mod.blue() == 0);
+        assert(simd::blend_pixel_by_mode(dst, src, BlendMode::Modulate).blue() == 0);
+    }
 
     std::cout << "[PASS] BlendMode tests passed\n";
 }

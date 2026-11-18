@@ -18,6 +18,7 @@
 
 namespace nisaba::backend_os {
 class Window;
+class LayerSurface;
 }
 
 namespace nisaba::backend_os::x11 {
@@ -46,6 +47,8 @@ public:
 
     void registerWindow(Window* w);
     void unregisterWindow(Window* w);
+    void registerLayerSurface(LayerSurface* s);
+    void unregisterLayerSurface(LayerSurface* s);
     [[nodiscard]] bool isOwnWindow(::Window xid) const;
     [[nodiscard]] const std::unordered_set<Window*>& windows() const { return windows_; }
 
@@ -150,7 +153,8 @@ private:
     Atom atom_xdnd_action_ask_  = None;
     Atom atom_xdnd_action_priv_ = None;
 
-    std::unordered_set<Window*> windows_;
+    std::unordered_set<Window*>       windows_;
+    std::unordered_set<LayerSurface*> layer_surfaces_;
 
     // Local Clipboard buffers
     ClipboardData local_clipboard_;

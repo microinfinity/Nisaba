@@ -62,6 +62,15 @@ public:
     /// Checks if any new glyphs were inserted since last flush.
     bool isDirty() const noexcept { return m_dirty; }
 
+    /// Marks the atlas clean (e.g. immediately after full texture upload).
+    void markClean() noexcept {
+        m_dirty = false;
+        m_dirtyMinX = m_width;
+        m_dirtyMinY = m_height;
+        m_dirtyMaxX = 0;
+        m_dirtyMaxY = 0;
+    }
+
     /// Uploads all dirty regions to the GPU texture via Renderer::updateTexture.
     void flushToGpu(Renderer* renderer, int textureId);
 

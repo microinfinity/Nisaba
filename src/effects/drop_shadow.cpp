@@ -127,4 +127,34 @@ void draw_round_rect_shadow(
     }
 }
 
+void draw_rrect_shadow(
+    PixmapMut& dst,
+    const RRect& rrect,
+    const DropShadow& shadow,
+    Transform transform,
+    const Mask* clip_mask
+) {
+    if (rrect.is_empty()) return;
+    auto p = PathBuilder::from_rrect(rrect.constrained());
+    if (p) {
+        draw_path_shadow(dst, *p, shadow, FillRule::Winding, transform, clip_mask);
+    }
+}
+
+void draw_circle_shadow(
+    PixmapMut& dst,
+    float cx,
+    float cy,
+    float radius,
+    const DropShadow& shadow,
+    Transform transform,
+    const Mask* clip_mask
+) {
+    if (radius <= 0.0f) return;
+    auto p = PathBuilder::from_circle(cx, cy, radius);
+    if (p) {
+        draw_path_shadow(dst, *p, shadow, FillRule::Winding, transform, clip_mask);
+    }
+}
+
 } // namespace nisaba::effects

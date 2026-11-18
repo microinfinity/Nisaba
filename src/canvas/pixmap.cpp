@@ -22,9 +22,39 @@ std::optional<PixmapRef> PixmapRef::from_bytes(
     return PixmapRef(data, len, *size, format);
 }
 
+std::optional<PixmapRef> PixmapRef::from_raw_parts(
+    const uint8_t* data,
+    uint32_t width,
+    uint32_t height,
+    size_t stride_bytes,
+    PixelFormat format,
+    bool is_opaque
+) noexcept {
+    if (!data) return std::nullopt;
+    auto size = IntSize::from_wh(width, height);
+    if (!size) return std::nullopt;
+    size_t min_stride = static_cast<size_t>(width) * nisaba::bytes_per_pixel(format);
+    size_t actual_stride = (stride_bytes != 0) ? stride_bytes : min_stride;
+    if (actual_stride < min_stride) return std::nullopt;
+
+    auto req_len = compute_data_len(*size, actual_stride, format);
+    if (!req_len) return std::nullopt;
+
+    return PixmapRef(data, *req_len, *size, format, is_opaque, actual_stride);
+}
+
 Pixmap PixmapRef::to_owned() const {
+    size_t tight_stride = static_cast<size_t>(width()) * bytes_per_pixel();
     size_t len = data_len_for_size(size_, format_).value_or(0);
-    std::vector<uint8_t> vec(data_, data_ + len);
+    if (len == 0 || !data_) return Pixmap();
+    std::vector<uint8_t> vec(len);
+    if (stride_bytes() == tight_stride) {
+        std::memcpy(vec.data(), data_, len);
+    } else {
+        for (uint32_t y = 0; y < height(); ++y) {
+            std::memcpy(vec.data() + static_cast<size_t>(y) * tight_stride, row_raw(y), tight_stride);
+        }
+    }
     return Pixmap(std::move(vec), size_, format_);
 }
 
@@ -113,15 +143,19 @@ bool PixmapRef::save_ppm(const std::string& path) const {
 
     out << "P6\n" << width() << " " << height() << "\n255\n";
 
-    const auto* px = pixels();
     size_t count = static_cast<size_t>(width()) * static_cast<size_t>(height());
 
     std::vector<uint8_t> rgb_buf(count * 3);
-    for (size_t i = 0; i < count; ++i) {
-        ColorU8 c = px[i].demultiply();
-        rgb_buf[i * 3 + 0] = c.red();
-        rgb_buf[i * 3 + 1] = c.green();
-        rgb_buf[i * 3 + 2] = c.blue();
+    size_t idx = 0;
+    for (uint32_t y = 0; y < height(); ++y) {
+        const auto* px = row(y);
+        for (uint32_t x = 0; x < width(); ++x) {
+            ColorU8 c = px[x].demultiply();
+            rgb_buf[idx * 3 + 0] = c.red();
+            rgb_buf[idx * 3 + 1] = c.green();
+            rgb_buf[idx * 3 + 2] = c.blue();
+            ++idx;
+        }
     }
 
     out.write(reinterpret_cast<const char*>(rgb_buf.data()), rgb_buf.size());
@@ -180,16 +214,18 @@ bool PixmapRef::save_bmp(const std::string& path) const {
     out.write(reinterpret_cast<const char*>(file_hdr), sizeof(file_hdr));
     out.write(reinterpret_cast<const char*>(info_hdr), sizeof(info_hdr));
 
-    const auto* px = pixels();
-    size_t count = static_cast<size_t>(w) * static_cast<size_t>(h);
     std::vector<uint8_t> bgra_buf(image_size);
-
-    for (size_t i = 0; i < count; ++i) {
-        ColorU8 c = px[i].demultiply();
-        bgra_buf[i * 4 + 0] = c.blue();
-        bgra_buf[i * 4 + 1] = c.green();
-        bgra_buf[i * 4 + 2] = c.red();
-        bgra_buf[i * 4 + 3] = c.alpha();
+    size_t idx = 0;
+    for (uint32_t y = 0; y < h; ++y) {
+        const auto* px = row(y);
+        for (uint32_t x = 0; x < w; ++x) {
+            ColorU8 c = px[x].demultiply();
+            bgra_buf[idx * 4 + 0] = c.blue();
+            bgra_buf[idx * 4 + 1] = c.green();
+            bgra_buf[idx * 4 + 2] = c.red();
+            bgra_buf[idx * 4 + 3] = c.alpha();
+            ++idx;
+        }
     }
 
     out.write(reinterpret_cast<const char*>(bgra_buf.data()), bgra_buf.size());

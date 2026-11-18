@@ -23,11 +23,23 @@
 #include "include/core/SkTypeface.h"
 #include "include/core/SkPath.h"
 #include "include/core/SkMaskFilter.h"
+#include "include/core/SkBlurTypes.h"
+#include "include/core/SkColorFilter.h"
+#include "include/core/SkVertices.h"
+#include "include/core/SkM44.h"
+#include "include/core/SkSamplingOptions.h"
 #include "include/effects/SkGradientShader.h"
+#include "include/effects/SkDashPathEffect.h"
+#include "include/effects/SkImageFilters.h"
 #include "include/gpu/GrDirectContext.h"
 #include "include/gpu/GrBackendSurface.h"
 #include "include/gpu/gl/GrGLInterface.h"
 #include "include/gpu/gl/GrGLAssembleInterface.h"
+#ifdef HAVE_SKOTTIE
+#define SkottieProperty_DEFINED
+namespace skottie { class PropertyObserver; }
+#include "modules/skottie/include/Skottie.h"
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
@@ -36,6 +48,15 @@
 
 #include "nisaba/gpu/context.hpp"
 #include "nisaba/gpu/gl3_renderer.hpp"
+#include "nisaba/gpu/gpu_device.hpp"
+#include "nisaba/gpu/gpu_surface.hpp"
+#include "nisaba/gpu/gpu_canvas.hpp"
+#include "nisaba/gpu/gpu_texture.hpp"
+#include "nisaba/lottie/animation.hpp"
+#include "nisaba/svg/svg_document.hpp"
+#include "nisaba/svg/svg_cache.hpp"
+#include "nisaba/path/path_builder.hpp"
+#include "nisaba/mesh/mesh.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -91,15 +112,24 @@ struct GpuMicroStat {
 
 int main(int argc, char** argv) {
 	int iterations = 100;
+	int msaaSamples = 0;
+	int fromSuite = 1;
+	std::string filterSubstr;
 	for (int i = 1; i < argc; ++i) {
 		if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
-			iterations = std::atoi(argv[++i]);
+			iterations = std::max(1, std::atoi(argv[++i]));
+		} else if (std::strcmp(argv[i], "--msaa") == 0 && i + 1 < argc) {
+			msaaSamples = std::max(0, std::atoi(argv[++i]));
+		} else if (std::strcmp(argv[i], "--from") == 0 && i + 1 < argc) {
+			fromSuite = std::max(1, std::atoi(argv[++i]));
+		} else if (std::strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
+			filterSubstr = argv[++i];
 		}
 	}
 
 	std::cout << "=========================================================================================================\n";
-	std::cout << "          NISABA GPU vs GOOGLE SKIA (GANESH GL) — 100-SUITE GRANULAR GPU MICRO-PROFILER                  \n";
-	std::cout << "                       (Strict 1:1 Parity • 1080x720 Framebuffer • 0x MSAA)                             \n";
+	std::cout << "          NISABA GPU vs GOOGLE SKIA (GANESH GL) — 134-SUITE GRANULAR GPU MICRO-PROFILER                  \n";
+	std::cout << "                   (Strict 1:1 Parity • 1080x720 Framebuffer • " << msaaSamples << "x MSAA)                         \n";
 	std::cout << "=========================================================================================================\n\n";
 
 	auto plat_res = nisaba::backend_os::Platform::create();
@@ -137,9 +167,9 @@ int main(int argc, char** argv) {
 	std::cout << "GPU Driver   : " << glGetString(GL_RENDERER) << "\n";
 	std::cout << "OpenGL Core  : " << glGetString(GL_VERSION) << "\n";
 	std::cout << "Iterations   : " << iterations << " runs per benchmark suite\n";
-	std::cout << "Target Size  : " << W << "x" << H << " (0x MSAA)\n\n";
+	std::cout << "Target Size  : " << W << "x" << H << " (" << msaaSamples << "x MSAA)\n\n";
 
-	// 1. Initialize Nisaba GPU Context
+	// 1. Initialize Nisaba GPU Context + High-Level GpuDevice / GpuSurface / GpuCanvas
 	auto nisabaCtx = nisaba::gpu::createContextGL3(nisaba::gpu::CreateFlags::Antialias);
 	if (!nisabaCtx) {
 		std::cerr << "Failed to create Nisaba Context\n";
@@ -148,15 +178,44 @@ int main(int argc, char** argv) {
 	int nisabaFont = nisabaCtx->createFont("sans", resolveFont("Inter-Regular.ttf"));
 	(void)nisabaFont;
 
+	auto gpuDevice = nisaba::gpu::GpuDevice::create(nisaba::gpu::GpuBackendType::OpenGL);
+	if (!gpuDevice) {
+		std::cerr << "Failed to adopt OpenGL context in Nisaba GpuDevice\n";
+		return 1;
+	}
+	std::shared_ptr<nisaba::gpu::GpuSurface> nisabaSurface;
+	if (msaaSamples > 0) {
+		nisabaSurface = nisaba::gpu::GpuSurface::create(gpuDevice, static_cast<uint32_t>(W), static_cast<uint32_t>(H), static_cast<uint32_t>(msaaSamples));
+	} else {
+		nisabaSurface = nisaba::gpu::GpuSurface::from_screen(gpuDevice, static_cast<uint32_t>(W), static_cast<uint32_t>(H), 0);
+	}
+	if (!nisabaSurface) {
+		std::cerr << "Failed to create Nisaba GpuSurface\n";
+		return 1;
+	}
+	auto gpuCanvas = std::make_unique<nisaba::gpu::GpuCanvas>(nisabaSurface);
+	gpuCanvas->create_font("sans", resolveFont("Inter-Regular.ttf"));
+	const GLuint nisabaFbo = nisabaSurface->fbo_id();
+
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	while (glGetError() != GL_NO_ERROR) {}
+
 	// 2. Initialize Skia GrDirectContext & Surface
 	auto glInterface = GrGLMakeAssembledInterface(nullptr, [](void*, const char* name) -> GrGLFuncPtr {
+		using PFN_glXGetProcAddress = void* (*)(const unsigned char*);
+		static void* s_libGL = dlopen("libGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+		static auto s_glXGetProcAddress = s_libGL ? reinterpret_cast<PFN_glXGetProcAddress>(dlsym(s_libGL, "glXGetProcAddressARB")) : nullptr;
+		if (s_glXGetProcAddress) {
+			if (void* proc = s_glXGetProcAddress(reinterpret_cast<const unsigned char*>(name))) {
+				return reinterpret_cast<GrGLFuncPtr>(proc);
+			}
+		}
 		if (void* proc = (void*)eglGetProcAddress(name)) {
 			return reinterpret_cast<GrGLFuncPtr>(proc);
 		}
 		if (void* proc = dlsym(RTLD_DEFAULT, name)) {
 			return reinterpret_cast<GrGLFuncPtr>(proc);
 		}
-		static void* s_libGL = dlopen("libGL.so.1", RTLD_LAZY | RTLD_LOCAL);
 		if (s_libGL) {
 			if (void* proc = dlsym(s_libGL, name)) return reinterpret_cast<GrGLFuncPtr>(proc);
 		}
@@ -182,11 +241,15 @@ int main(int argc, char** argv) {
 	glGetIntegerv(GL_STENCIL_BITS, &stencilBits);
 	if (stencilBits == 0) stencilBits = 8;
 
+	int skiaSamples = msaaSamples;
+	if (skiaSamples > 0) {
+		int maxSkSamples = dContext->maxSurfaceSampleCountForColorType(kRGBA_8888_SkColorType);
+		if (maxSkSamples < skiaSamples) skiaSamples = maxSkSamples;
+	}
 	GrGLFramebufferInfo fbInfo;
-	fbInfo.fFBOID = 0;
+	fbInfo.fFBOID = nisabaFbo;
 	fbInfo.fFormat = GL_RGBA8;
-
-	GrBackendRenderTarget backendRT(W, H, 0, stencilBits, fbInfo);
+	GrBackendRenderTarget backendRT(W, H, skiaSamples, stencilBits, fbInfo);
 	auto skiaSurface = SkSurface::MakeFromBackendRenderTarget(
 		dContext.get(), backendRT, kBottomLeft_GrSurfaceOrigin,
 		kRGBA_8888_SkColorType, nullptr, nullptr);
@@ -218,14 +281,28 @@ int main(int argc, char** argv) {
 
 	std::vector<GpuMicroStat> stats;
 
-	// Generic Benchmark Runner Function
+	auto should_run_suite = [&](const std::string& name) -> bool {
+		int num = std::atoi(name.c_str());
+		if (num > 0 && num < fromSuite) return false;
+		if (!filterSubstr.empty() && name.find(filterSubstr) == std::string::npos) return false;
+		return true;
+	};
+
+	auto clear_skia_target = [&]() {
+		glBindFramebuffer(GL_FRAMEBUFFER, nisabaFbo);
+		glViewport(0, 0, W, H);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+	};
+
+	// Generic Benchmark Runner Function (Low-Level Context — Suites 1-100)
 	auto benchmark_op = [&](const std::string& name, auto op_nisaba, auto op_skia) {
+		if (!should_run_suite(name)) return;
 		std::cout << "Running suite: " << name << "..." << std::flush;
 
-		// -------------------------------------------------------------
 		// Warmup Phase (5 iterations each)
-		// -------------------------------------------------------------
 		for (int i = 0; i < 5; ++i) {
+			glBindFramebuffer(GL_FRAMEBUFFER, nisabaFbo);
+			glViewport(0, 0, W, H);
 			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 			nisabaCtx->beginFrame(static_cast<float>(W), static_cast<float>(H), 1.0f);
 			op_nisaba(*nisabaCtx);
@@ -233,31 +310,29 @@ int main(int argc, char** argv) {
 			glFinish();
 
 			dContext->resetContext();
-			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+			clear_skia_target();
 			op_skia(skiaCanvas);
 			dContext->flush();
 			dContext->submit(false);
 			glFinish();
 		}
 
-		// -------------------------------------------------------------
 		// Measure Nisaba GPU Engine (True CPU vs GPU Separation)
-		// -------------------------------------------------------------
 		double n_cpu_total = 0.0;
 		double n_gpu_total = 0.0;
 		double n_all_total = 0.0;
 
 		for (int i = 0; i < iterations; ++i) {
+			glBindFramebuffer(GL_FRAMEBUFFER, nisabaFbo);
+			glViewport(0, 0, W, H);
 			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
-			// CPU: beginFrame + recording/tessellation + endFrame (batching & GL command submission)
 			auto t0 = std::chrono::high_resolution_clock::now();
 			nisabaCtx->beginFrame(static_cast<float>(W), static_cast<float>(H), 1.0f);
 			op_nisaba(*nisabaCtx);
 			nisabaCtx->endFrame();
 			auto t1 = std::chrono::high_resolution_clock::now();
 
-			// GPU: Driver execution & hardware GPU pipeline completion
 			glFinish();
 			auto t2 = std::chrono::high_resolution_clock::now();
 
@@ -270,9 +345,7 @@ int main(int argc, char** argv) {
 		double nisaba_gpu = n_gpu_total / iterations;
 		double nisaba_all = n_all_total / iterations;
 
-		// -------------------------------------------------------------
 		// Measure Google Skia Ganesh Engine (True CPU vs GPU Separation)
-		// -------------------------------------------------------------
 		double s_cpu_total = 0.0;
 		double s_gpu_total = 0.0;
 		double s_all_total = 0.0;
@@ -280,16 +353,99 @@ int main(int argc, char** argv) {
 		dContext->resetContext();
 
 		for (int i = 0; i < iterations; ++i) {
-			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+			clear_skia_target();
 
-			// CPU: op_skia (recording ops) + flush & submit (batching, shader binding, GL command submission)
 			auto t0 = std::chrono::high_resolution_clock::now();
 			op_skia(skiaCanvas);
 			dContext->flush();
 			dContext->submit(false);
 			auto t1 = std::chrono::high_resolution_clock::now();
 
-			// GPU: Driver execution & hardware GPU pipeline completion
+			glFinish();
+			auto t2 = std::chrono::high_resolution_clock::now();
+
+			s_cpu_total += std::chrono::duration<double, std::micro>(t1 - t0).count();
+			s_gpu_total += std::chrono::duration<double, std::micro>(t2 - t1).count();
+			s_all_total += std::chrono::duration<double, std::micro>(t2 - t0).count();
+		}
+
+		double skia_cpu = s_cpu_total / iterations;
+		double skia_gpu = s_gpu_total / iterations;
+		double skia_all = s_all_total / iterations;
+
+		stats.push_back({name, nisaba_cpu, nisaba_gpu, nisaba_all, skia_cpu, skia_gpu, skia_all});
+		std::cout << " Done. (Nisaba: " << std::fixed << std::setprecision(1) << nisaba_all
+		          << " µs, Skia: " << skia_all << " µs)\n";
+	};
+
+	// High-Level GpuCanvas Benchmark Runner (Suites 101-134: Lottie, SVG, Glass, Shadows, Filters, Gradients, Blends, Clips, Text, 3D, Vertices, Dash, DRRect)
+	auto benchmark_canvas_op = [&](const std::string& name, auto op_nisaba_canvas, auto op_skia) {
+		if (!should_run_suite(name)) return;
+		std::cout << "Running suite: " << name << "..." << std::flush;
+
+		// Warmup Phase (5 iterations each)
+		for (int i = 0; i < 5; ++i) {
+			gpuCanvas->reset_state();
+			nisabaSurface->bind();
+			glViewport(0, 0, W, H);
+			glClearColor(0.08f, 0.10f, 0.14f, 1.0f);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+			op_nisaba_canvas(*gpuCanvas);
+			gpuCanvas->flush();
+			glFinish();
+
+			dContext->resetContext();
+			clear_skia_target();
+			op_skia(skiaCanvas);
+			dContext->flush();
+			dContext->submit(false);
+			glFinish();
+		}
+
+		// Measure Nisaba GpuCanvas Engine
+		double n_cpu_total = 0.0;
+		double n_gpu_total = 0.0;
+		double n_all_total = 0.0;
+
+		gpuCanvas->reset_state();
+		for (int i = 0; i < iterations; ++i) {
+			nisabaSurface->bind();
+			glViewport(0, 0, W, H);
+			glClearColor(0.08f, 0.10f, 0.14f, 1.0f);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+			auto t0 = std::chrono::high_resolution_clock::now();
+			op_nisaba_canvas(*gpuCanvas);
+			gpuCanvas->flush();
+			auto t1 = std::chrono::high_resolution_clock::now();
+
+			glFinish();
+			auto t2 = std::chrono::high_resolution_clock::now();
+
+			n_cpu_total += std::chrono::duration<double, std::micro>(t1 - t0).count();
+			n_gpu_total += std::chrono::duration<double, std::micro>(t2 - t1).count();
+			n_all_total += std::chrono::duration<double, std::micro>(t2 - t0).count();
+		}
+
+		double nisaba_cpu = n_cpu_total / iterations;
+		double nisaba_gpu = n_gpu_total / iterations;
+		double nisaba_all = n_all_total / iterations;
+
+		// Measure Google Skia Ganesh Engine
+		double s_cpu_total = 0.0;
+		double s_gpu_total = 0.0;
+		double s_all_total = 0.0;
+
+		dContext->resetContext();
+		for (int i = 0; i < iterations; ++i) {
+			clear_skia_target();
+
+			auto t0 = std::chrono::high_resolution_clock::now();
+			op_skia(skiaCanvas);
+			dContext->flush();
+			dContext->submit(false);
+			auto t1 = std::chrono::high_resolution_clock::now();
+
 			glFinish();
 			auto t2 = std::chrono::high_resolution_clock::now();
 
@@ -3447,6 +3603,1236 @@ int main(int argc, char** argv) {
 		}
 	);
 
+	// =========================================================================
+	// EXTENDED HIGH-LEVEL GPU SUITES (101–134):
+	// Lottie, SVG, Backdrop Blur/Glass, Shadows, ColorFilters, Advanced Gradients,
+	// Programmable BlendModes, Path Clips/EvenOdd, Rich/RTL Text, Mipmaps/3D/Vertices,
+	// Dashed Strokes & DRRect.
+	// =========================================================================
+
+	// Shared backdrop helper for glass/blend/layer tests
+	auto draw_rich_backdrop_nisaba = [](nisaba::gpu::GpuCanvas& c) {
+		const nisaba::Color cols[6] = {
+			nisaba::Color::from_rgba8(230, 57, 70, 255),
+			nisaba::Color::from_rgba8(241, 162, 8, 255),
+			nisaba::Color::from_rgba8(42, 157, 143, 255),
+			nisaba::Color::from_rgba8(38, 70, 83, 255),
+			nisaba::Color::from_rgba8(131, 56, 236, 255),
+			nisaba::Color::from_rgba8(58, 134, 255, 255),
+		};
+		for (int i = 0; i < 6; ++i) {
+			auto r = nisaba::Rect::from_xywh(i * 180.0f, 0.0f, 180.0f, 720.0f).value();
+			c.fill_rect(r, nisaba::Paint(cols[i]));
+		}
+		for (int i = 0; i < 4; ++i) {
+			c.fill_circle(160.0f + i * 250.0f, 360.0f + ((i % 2) ? 80.0f : -80.0f), 110.0f,
+				nisaba::Paint(nisaba::Color::from_rgba8(255, 255, 255, 110)));
+		}
+	};
+	auto draw_rich_backdrop_skia = [](SkCanvas* c) {
+		const SkColor cols[6] = {
+			SkColorSetARGB(255, 230, 57, 70),
+			SkColorSetARGB(255, 241, 162, 8),
+			SkColorSetARGB(255, 42, 157, 143),
+			SkColorSetARGB(255, 38, 70, 83),
+			SkColorSetARGB(255, 131, 56, 236),
+			SkColorSetARGB(255, 58, 134, 255),
+		};
+		SkPaint p; p.setAntiAlias(true);
+		for (int i = 0; i < 6; ++i) {
+			p.setColor(cols[i]);
+			c->drawRect(SkRect::MakeXYWH(i * 180.0f, 0.0f, 180.0f, 720.0f), p);
+		}
+		p.setColor(SkColorSetARGB(110, 255, 255, 255));
+		for (int i = 0; i < 4; ++i) {
+			c->drawCircle(160.0f + i * 250.0f, 360.0f + ((i % 2) ? 80.0f : -80.0f), 110.0f, p);
+		}
+	};
+
+	// -------------------------------------------------------------------------
+	// Category 1: Lottie GPU (Suites 101–103) — Nisaba Lottie vs Skia Skottie
+	// -------------------------------------------------------------------------
+	const char* kLottieSimpleJson = R"JSON({
+		"v":"5.7.4","fr":60,"ip":0,"op":60,"w":240,"h":240,"nm":"Spinner","ddd":0,"assets":[],
+		"layers":[
+			{"ddd":0,"ind":1,"ty":4,"nm":"Ring","sr":1,
+			 "ks":{"o":{"a":0,"k":100},"r":{"a":1,"k":[{"t":0,"s":[0],"e":[360]},{"t":60,"s":[360]}]},
+			       "p":{"a":0,"k":[120,120,0]},"a":{"a":0,"k":[0,0,0]},"s":{"a":0,"k":[100,100,100]}},
+			 "shapes":[
+				{"ty":"gr","nm":"Arc","it":[
+					{"ty":"el","p":{"a":0,"k":[0,0]},"s":{"a":0,"k":[160,160]}},
+					{"ty":"tm","s":{"a":1,"k":[{"t":0,"s":[0],"e":[65]},{"t":30,"s":[65],"e":[0]},{"t":60,"s":[0]}]},
+					           "e":{"a":1,"k":[{"t":0,"s":[30],"e":[95]},{"t":30,"s":[95],"e":[30]},{"t":60,"s":[30]}]},
+					           "o":{"a":0,"k":0}},
+					{"ty":"st","c":{"a":0,"k":[0.22,0.58,1.0,1.0]},"o":{"a":0,"k":100},"w":{"a":0,"k":14},"lc":2,"lj":2},
+					{"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
+				]}
+			 ],"ip":0,"op":60,"st":0},
+			{"ddd":0,"ind":2,"ty":4,"nm":"Core","sr":1,
+			 "ks":{"o":{"a":0,"k":100},"r":{"a":0,"k":0},"p":{"a":0,"k":[120,120,0]},"a":{"a":0,"k":[0,0,0]},
+			       "s":{"a":1,"k":[{"t":0,"s":[80,80,100],"e":[115,115,100]},{"t":30,"s":[115,115,100],"e":[80,80,100]},{"t":60,"s":[80,80,100]}]}},
+			 "shapes":[
+				{"ty":"gr","nm":"Dot","it":[
+					{"ty":"el","p":{"a":0,"k":[0,0]},"s":{"a":0,"k":[48,48]}},
+					{"ty":"fl","c":{"a":0,"k":[0.95,0.35,0.45,1.0]},"o":{"a":0,"k":100}},
+					{"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
+				]}
+			 ],"ip":0,"op":60,"st":0}
+		]
+	})JSON";
+
+	const char* kLottieComplexJson = R"JSON({
+		"v":"5.7.4","fr":60,"ip":0,"op":60,"w":400,"h":400,"nm":"ComplexScene","ddd":0,"assets":[],
+		"layers":[
+			{"ddd":0,"ind":1,"ty":4,"nm":"BG","sr":1,
+			 "ks":{"o":{"a":0,"k":100},"r":{"a":1,"k":[{"t":0,"s":[0],"e":[90]},{"t":60,"s":[90]}]},
+			       "p":{"a":0,"k":[200,200,0]},"a":{"a":0,"k":[0,0,0]},"s":{"a":0,"k":[100,100,100]}},
+			 "shapes":[
+				{"ty":"gr","nm":"Card","it":[
+					{"ty":"rc","p":{"a":0,"k":[0,0]},"s":{"a":0,"k":[280,280]},"r":{"a":0,"k":36}},
+					{"ty":"fl","c":{"a":0,"k":[0.14,0.18,0.28,1.0]},"o":{"a":0,"k":100}},
+					{"ty":"st","c":{"a":0,"k":[0.35,0.75,1.0,1.0]},"o":{"a":0,"k":85},"w":{"a":0,"k":4},"lc":2,"lj":2},
+					{"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
+				]}
+			 ],"ip":0,"op":60,"st":0},
+			{"ddd":0,"ind":2,"ty":4,"nm":"Star","sr":1,
+			 "ks":{"o":{"a":1,"k":[{"t":0,"s":[100],"e":[40]},{"t":30,"s":[40],"e":[100]},{"t":60,"s":[100]}]},
+			       "r":{"a":1,"k":[{"t":0,"s":[0],"e":[360]},{"t":60,"s":[360]}]},
+			       "p":{"a":0,"k":[200,200,0]},"a":{"a":0,"k":[0,0,0]},"s":{"a":0,"k":[100,100,100]}},
+			 "shapes":[
+				{"ty":"gr","nm":"Poly","it":[
+					{"ty":"sr","sy":1,"pt":{"a":0,"k":6},"p":{"a":0,"k":[0,0]},"r":{"a":0,"k":0},"ir":{"a":0,"k":55},"or":{"a":0,"k":115},"is":{"a":0,"k":0},"os":{"a":0,"k":0}},
+					{"ty":"tm","s":{"a":0,"k":0},"e":{"a":1,"k":[{"t":0,"s":[20],"e":[100]},{"t":30,"s":[100],"e":[20]},{"t":60,"s":[20]}]},"o":{"a":0,"k":0}},
+					{"ty":"fl","c":{"a":0,"k":[0.98,0.62,0.15,1.0]},"o":{"a":0,"k":80}},
+					{"ty":"st","c":{"a":0,"k":[1.0,0.92,0.45,1.0]},"o":{"a":0,"k":100},"w":{"a":0,"k":6},"lc":2,"lj":2},
+					{"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
+				]}
+			 ],"ip":0,"op":60,"st":0},
+			{"ddd":0,"ind":3,"ty":4,"nm":"Orbit1","sr":1,
+			 "ks":{"o":{"a":0,"k":100},"r":{"a":1,"k":[{"t":0,"s":[0],"e":[-360]},{"t":60,"s":[-360]}]},
+			       "p":{"a":0,"k":[200,200,0]},"a":{"a":0,"k":[0,0,0]},"s":{"a":0,"k":[100,100,100]}},
+			 "shapes":[
+				{"ty":"gr","nm":"OrbA","it":[
+					{"ty":"el","p":{"a":0,"k":[130,0]},"s":{"a":0,"k":[44,44]}},
+					{"ty":"fl","c":{"a":0,"k":[0.2,0.9,0.65,1.0]},"o":{"a":0,"k":100}},
+					{"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
+				]},
+				{"ty":"gr","nm":"OrbB","it":[
+					{"ty":"el","p":{"a":0,"k":[-130,0]},"s":{"a":0,"k":[44,44]}},
+					{"ty":"fl","c":{"a":0,"k":[0.92,0.28,0.58,1.0]},"o":{"a":0,"k":100}},
+					{"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
+				]},
+				{"ty":"gr","nm":"OrbC","it":[
+					{"ty":"el","p":{"a":0,"k":[0,130]},"s":{"a":0,"k":[36,36]}},
+					{"ty":"fl","c":{"a":0,"k":[0.55,0.42,1.0,1.0]},"o":{"a":0,"k":100}},
+					{"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
+				]},
+				{"ty":"gr","nm":"OrbD","it":[
+					{"ty":"el","p":{"a":0,"k":[0,-130]},"s":{"a":0,"k":[36,36]}},
+					{"ty":"fl","c":{"a":0,"k":[0.25,0.75,1.0,1.0]},"o":{"a":0,"k":100}},
+					{"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
+				]}
+			 ],"ip":0,"op":60,"st":0},
+			{"ddd":0,"ind":4,"ty":4,"nm":"Wave","sr":1,
+			 "ks":{"o":{"a":0,"k":90},"r":{"a":0,"k":0},"p":{"a":0,"k":[200,200,0]},"a":{"a":0,"k":[0,0,0]},
+			       "s":{"a":1,"k":[{"t":0,"s":[90,90,100],"e":[110,110,100]},{"t":30,"s":[110,110,100],"e":[90,90,100]},{"t":60,"s":[90,90,100]}]}},
+			 "shapes":[
+				{"ty":"gr","nm":"RingOut","it":[
+					{"ty":"el","p":{"a":0,"k":[0,0]},"s":{"a":0,"k":[320,320]}},
+					{"ty":"tm","s":{"a":1,"k":[{"t":0,"s":[0],"e":[40]},{"t":60,"s":[40]}]},
+					           "e":{"a":1,"k":[{"t":0,"s":[55],"e":[95]},{"t":60,"s":[95]}]},"o":{"a":0,"k":0}},
+					{"ty":"st","c":{"a":0,"k":[0.3,0.85,0.95,1.0]},"o":{"a":0,"k":100},"w":{"a":0,"k":8},"lc":2,"lj":2},
+					{"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
+				]}
+			 ],"ip":0,"op":60,"st":0}
+		]
+	})JSON";
+
+	auto nisabaLottieSimple = nisaba::lottie::Animation::load_from_data(kLottieSimpleJson);
+	auto nisabaLottieComplex = nisaba::lottie::Animation::load_from_data(kLottieComplexJson);
+#ifdef HAVE_SKOTTIE
+	auto skiaLottieSimple = skottie::Animation::Make(kLottieSimpleJson, std::strlen(kLottieSimpleJson));
+	auto skiaLottieComplex = skottie::Animation::Make(kLottieComplexJson, std::strlen(kLottieComplexJson));
+	if (nisabaLottieSimple && skiaLottieSimple) {
+		float nFrame = 0.0f, sFrame = 0.0f;
+		const auto nDst = nisaba::Rect::from_xywh(420.0f, 240.0f, 240.0f, 240.0f).value();
+		const SkRect sDst = SkRect::MakeXYWH(420.0f, 240.0f, 240.0f, 240.0f);
+		benchmark_canvas_op("101. Lottie Simple Spinner (GPU Vector)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisabaLottieSimple->render(c, nFrame, nDst);
+				nFrame = std::fmod(nFrame + 1.0f, 60.0f);
+			},
+			[&](SkCanvas* c) {
+				skiaLottieSimple->seekFrame(sFrame);
+				skiaLottieSimple->render(c, &sDst);
+				sFrame = std::fmod(sFrame + 1.0f, 60.0f);
+			}
+		);
+	}
+	if (nisabaLottieComplex && skiaLottieComplex) {
+		float nFrame = 0.0f, sFrame = 0.0f;
+		const auto nDst = nisaba::Rect::from_xywh(340.0f, 160.0f, 400.0f, 400.0f).value();
+		const SkRect sDst = SkRect::MakeXYWH(340.0f, 160.0f, 400.0f, 400.0f);
+		benchmark_canvas_op("102. Lottie Complex Multi-Layer (GPU)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisabaLottieComplex->render(c, nFrame, nDst);
+				nFrame = std::fmod(nFrame + 1.0f, 60.0f);
+			},
+			[&](SkCanvas* c) {
+				skiaLottieComplex->seekFrame(sFrame);
+				skiaLottieComplex->render(c, &sDst);
+				sFrame = std::fmod(sFrame + 1.0f, 60.0f);
+			}
+		);
+		benchmark_canvas_op("103. Lottie 4x Simultaneous Instances",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				for (int i = 0; i < 4; ++i) {
+					float x = 140.0f + (i % 2) * 440.0f;
+					float y = 40.0f + (i / 2) * 340.0f;
+					auto dst = nisaba::Rect::from_xywh(x, y, 300.0f, 300.0f).value();
+					nisabaLottieComplex->render(c, std::fmod(nFrame + i * 15.0f, 60.0f), dst);
+				}
+				nFrame = std::fmod(nFrame + 1.0f, 60.0f);
+			},
+			[&](SkCanvas* c) {
+				for (int i = 0; i < 4; ++i) {
+					float x = 140.0f + (i % 2) * 440.0f;
+					float y = 40.0f + (i / 2) * 340.0f;
+					SkRect dst = SkRect::MakeXYWH(x, y, 300.0f, 300.0f);
+					skiaLottieComplex->seekFrame(std::fmod(sFrame + i * 15.0f, 60.0f));
+					skiaLottieComplex->render(c, &dst);
+				}
+				sFrame = std::fmod(sFrame + 1.0f, 60.0f);
+			}
+		);
+	}
+#endif
+
+	// -------------------------------------------------------------------------
+	// Category 2: SVG GPU (Suites 104–106) — SvgDocument & SvgCache vs Skia
+	// -------------------------------------------------------------------------
+	const char* kSvgIconXml = R"SVG(
+		<svg viewBox="0 0 64 64" width="64" height="64">
+			<rect x="6" y="6" width="52" height="52" rx="12" fill="#2563eb" stroke="#93c5fd" stroke-width="3"/>
+			<circle cx="32" cy="28" r="10" fill="#ffffff"/>
+			<path d="M16 50 C16 40 48 40 48 50" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round"/>
+		</svg>
+	)SVG";
+	const char* kSvgComplexXml = R"SVG(
+		<svg viewBox="0 0 400 300" width="400" height="300">
+			<defs>
+				<linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+					<stop offset="0%" stop-color="#0f172a"/>
+					<stop offset="50%" stop-color="#1e3a8a"/>
+					<stop offset="100%" stop-color="#7c3aed"/>
+				</linearGradient>
+				<radialGradient id="orbGrad" cx="0.5" cy="0.5" r="0.5">
+					<stop offset="0%" stop-color="#fef08a"/>
+					<stop offset="100%" stop-color="#ef4444"/>
+				</radialGradient>
+				<clipPath id="cardClip">
+					<rect x="20" y="20" width="360" height="260" rx="24"/>
+				</clipPath>
+			</defs>
+			<g clip-path="url(#cardClip)">
+				<rect x="20" y="20" width="360" height="260" rx="24" fill="url(#bgGrad)"/>
+				<circle cx="290" cy="110" r="70" fill="url(#orbGrad)" opacity="0.85"/>
+				<g opacity="0.75">
+					<path d="M20 220 C110 140 210 270 380 180 L380 280 L20 280 Z" fill="#38bdf8"/>
+					<path d="M20 245 C140 190 250 290 380 215 L380 280 L20 280 Z" fill="#0284c7"/>
+				</g>
+				<rect x="44" y="48" width="140" height="24" rx="8" fill="#ffffff" opacity="0.9"/>
+				<rect x="44" y="84" width="100" height="14" rx="6" fill="#cbd5e1" opacity="0.7"/>
+			</g>
+		</svg>
+	)SVG";
+
+	auto svgIconDoc = nisaba::svg::SvgDocument::parse(kSvgIconXml);
+	auto svgComplexDoc = nisaba::svg::SvgDocument::parse(kSvgComplexXml);
+	nisaba::svg::SvgCache svgCache(64);
+
+	// Build Skia equivalent icon path + pre-rasterized cached SkImage for Suite 106
+	SkPath skSvgIconArc;
+	skSvgIconArc.moveTo(16.0f, 50.0f);
+	skSvgIconArc.cubicTo(16.0f, 40.0f, 48.0f, 40.0f, 48.0f, 50.0f);
+	auto draw_skia_svg_icon = [&](SkCanvas* c, float x, float y, float sz) {
+		c->save();
+		c->translate(x, y);
+		c->scale(sz / 64.0f, sz / 64.0f);
+		SkPaint pFill; pFill.setAntiAlias(true); pFill.setColor(SkColorSetARGB(255, 37, 99, 235));
+		SkRRect rr = SkRRect::MakeRectXY(SkRect::MakeXYWH(6, 6, 52, 52), 12, 12);
+		c->drawRRect(rr, pFill);
+		SkPaint pStroke; pStroke.setAntiAlias(true); pStroke.setStyle(SkPaint::kStroke_Style);
+		pStroke.setStrokeWidth(3.0f); pStroke.setColor(SkColorSetARGB(255, 147, 197, 253));
+		c->drawRRect(rr, pStroke);
+		pFill.setColor(SK_ColorWHITE);
+		c->drawCircle(32, 28, 10, pFill);
+		pStroke.setColor(SK_ColorWHITE); pStroke.setStrokeWidth(5.0f); pStroke.setStrokeCap(SkPaint::kRound_Cap);
+		c->drawPath(skSvgIconArc, pStroke);
+		c->restore();
+	};
+
+	sk_sp<SkSurface> skIconOff = SkSurface::MakeRasterN32Premul(96, 96);
+	draw_skia_svg_icon(skIconOff->getCanvas(), 0, 0, 96.0f);
+	sk_sp<SkImage> skCachedSvgIcon = skIconOff->makeImageSnapshot()->makeTextureImage(dContext.get());
+
+	if (svgIconDoc) {
+		benchmark_canvas_op("104. SVG Icons Grid 25x (Vector GPU)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				for (int r = 0; r < 5; ++r) {
+					for (int col = 0; col < 5; ++col) {
+						auto dst = nisaba::Rect::from_xywh(140.0f + col * 160.0f, 60.0f + r * 120.0f, 96.0f, 96.0f).value();
+						svgIconDoc->render_gpu(c, &dst);
+					}
+				}
+			},
+			[&](SkCanvas* c) {
+				for (int r = 0; r < 5; ++r) {
+					for (int col = 0; col < 5; ++col) {
+						draw_skia_svg_icon(c, 140.0f + col * 160.0f, 60.0f + r * 120.0f, 96.0f);
+					}
+				}
+			}
+		);
+	}
+
+	if (svgComplexDoc) {
+		SkPath skWave1, skWave2;
+		skWave1.moveTo(20, 220); skWave1.cubicTo(110, 140, 210, 270, 380, 180); skWave1.lineTo(380, 280); skWave1.lineTo(20, 280); skWave1.close();
+		skWave2.moveTo(20, 245); skWave2.cubicTo(140, 190, 250, 290, 380, 215); skWave2.lineTo(380, 280); skWave2.lineTo(20, 280); skWave2.close();
+		SkPoint skGradPts[2] = {{20, 20}, {380, 280}};
+		SkColor skBgCols[3] = {SkColorSetARGB(255, 15, 23, 42), SkColorSetARGB(255, 30, 58, 138), SkColorSetARGB(255, 124, 58, 237)};
+		SkScalar skBgPos[3] = {0.0f, 0.5f, 1.0f};
+		SkColor skOrbCols[2] = {SkColorSetARGB(255, 254, 240, 138), SkColorSetARGB(255, 239, 68, 68)};
+		auto skBgShader = SkGradientShader::MakeLinear(skGradPts, skBgCols, skBgPos, 3, SkTileMode::kClamp);
+		auto skOrbShader = SkGradientShader::MakeRadial({290, 110}, 70, skOrbCols, nullptr, 2, SkTileMode::kClamp);
+		const auto nSceneDst = nisaba::Rect::from_xywh(140.0f, 60.0f, 800.0f, 600.0f).value();
+
+		benchmark_canvas_op("105. SVG Complex Scene (Gradients+Clip)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				svgComplexDoc->render_gpu(c, &nSceneDst);
+			},
+			[&](SkCanvas* c) {
+				c->save();
+				c->translate(140.0f, 60.0f);
+				c->scale(2.0f, 2.0f);
+				SkRRect clipRR = SkRRect::MakeRectXY(SkRect::MakeXYWH(20, 20, 360, 260), 24, 24);
+				c->clipRRect(clipRR, true);
+				SkPaint pBg; pBg.setAntiAlias(true); pBg.setShader(skBgShader);
+				c->drawRRect(clipRR, pBg);
+				SkPaint pOrb; pOrb.setAntiAlias(true); pOrb.setShader(skOrbShader); pOrb.setAlphaf(0.85f);
+				c->drawCircle(290, 110, 70, pOrb);
+				SkPaint pLayer; pLayer.setAlphaf(0.75f);
+				c->saveLayer(nullptr, &pLayer);
+				SkPaint pW; pW.setAntiAlias(true);
+				pW.setColor(SkColorSetARGB(255, 56, 189, 248)); c->drawPath(skWave1, pW);
+				pW.setColor(SkColorSetARGB(255, 2, 132, 199)); c->drawPath(skWave2, pW);
+				c->restore();
+				SkPaint pBar; pBar.setAntiAlias(true);
+				pBar.setColor(SkColorSetARGB(230, 255, 255, 255));
+				c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(44, 48, 140, 24), 8, 8), pBar);
+				pBar.setColor(SkColorSetARGB(179, 203, 213, 225));
+				c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(44, 84, 100, 14), 6, 6), pBar);
+				c->restore();
+			}
+		);
+	}
+
+	if (svgIconDoc && skCachedSvgIcon) {
+		benchmark_canvas_op("106. SVG Cached Icons 25x (SvgCache)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				for (int r = 0; r < 5; ++r) {
+					for (int col = 0; col < 5; ++col) {
+						auto dst = nisaba::Rect::from_xywh(140.0f + col * 160.0f, 60.0f + r * 120.0f, 96.0f, 96.0f).value();
+						svgCache.draw(c, *svgIconDoc, dst);
+					}
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				SkSamplingOptions samp(SkFilterMode::kLinear);
+				for (int r = 0; r < 5; ++r) {
+					for (int col = 0; col < 5; ++col) {
+						SkRect dst = SkRect::MakeXYWH(140.0f + col * 160.0f, 60.0f + r * 120.0f, 96.0f, 96.0f);
+						c->drawImageRect(skCachedSvgIcon, dst, samp, &p);
+					}
+				}
+			}
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Category 3: Backdrop Blur, Frosted Glass & Layers (Suites 107–111)
+	// -------------------------------------------------------------------------
+	{
+		auto skBlur12 = SkImageFilters::Blur(12.0f, 12.0f, SkTileMode::kClamp, nullptr);
+		auto skBlur14 = SkImageFilters::Blur(14.0f, 14.0f, SkTileMode::kClamp, nullptr);
+		auto skBlur10 = SkImageFilters::Blur(10.0f, 10.0f, SkTileMode::kClamp, nullptr);
+		auto skBlur8  = SkImageFilters::Blur(8.0f, 8.0f, SkTileMode::kClamp, nullptr);
+		const auto cardRect = nisaba::Rect::from_xywh(240.0f, 160.0f, 600.0f, 400.0f).value();
+		const auto cardRRect = nisaba::RRect::from_rect_and_radius(cardRect, 24.0f);
+		const SkRect skCardRect = SkRect::MakeXYWH(240.0f, 160.0f, 600.0f, 400.0f);
+		const SkRRect skCardRRect = SkRRect::MakeRectXY(skCardRect, 24.0f, 24.0f);
+
+		benchmark_canvas_op("107. Backdrop Blur Single Card (r=12)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				draw_rich_backdrop_nisaba(c);
+				c.draw_backdrop_blur(cardRRect, 12.0f);
+			},
+			[&](SkCanvas* c) {
+				draw_rich_backdrop_skia(c);
+				c->save();
+				c->clipRRect(skCardRRect, true);
+				SkCanvas::SaveLayerRec rec(&skCardRect, nullptr, skBlur12.get(), 0);
+				c->saveLayer(rec);
+				c->restore();
+				c->restore();
+			}
+		);
+
+		auto glassDark = nisaba::effects::GlassParams::dark();
+		auto draw_skia_glass_card = [&](SkCanvas* c, const SkRect& r, float radius, const sk_sp<SkImageFilter>& blurF) {
+			SkRRect rr = SkRRect::MakeRectXY(r, radius, radius);
+			SkPaint pShad; pShad.setAntiAlias(true); pShad.setColor(SkColorSetARGB(160, 0, 0, 0));
+			pShad.setMaskFilter(SkMaskFilter::MakeBlur(kNormal_SkBlurStyle, 16.0f));
+			c->drawRRect(rr.makeOffset(0, 10), pShad);
+			c->save();
+			c->clipRRect(rr, true);
+			SkCanvas::SaveLayerRec rec(&r, nullptr, blurF.get(), 0);
+			c->saveLayer(rec);
+			SkPaint pTint; pTint.setAntiAlias(true); pTint.setColor(SkColorSetARGB(140, 20, 24, 33));
+			c->drawRect(r, pTint);
+			c->restore();
+			c->restore();
+			SkPaint pBdr; pBdr.setAntiAlias(true); pBdr.setStyle(SkPaint::kStroke_Style);
+			pBdr.setStrokeWidth(1.0f); pBdr.setColor(SkColorSetARGB(40, 255, 255, 255));
+			c->drawRRect(rr, pBdr);
+		};
+
+		benchmark_canvas_op("108. Frosted Glass Panel 1x (Full)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				draw_rich_backdrop_nisaba(c);
+				c.draw_glass_panel(cardRect, 24.0f, 24.0f, glassDark);
+			},
+			[&](SkCanvas* c) {
+				draw_rich_backdrop_skia(c);
+				draw_skia_glass_card(c, skCardRect, 24.0f, skBlur14);
+			}
+		);
+
+		benchmark_canvas_op("109. Frosted Glass 4x Sibling Cards",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				draw_rich_backdrop_nisaba(c);
+				for (int i = 0; i < 4; ++i) {
+					float x = 80.0f + (i % 2) * 480.0f;
+					float y = 70.0f + (i / 2) * 300.0f;
+					auto r = nisaba::Rect::from_xywh(x, y, 440.0f, 260.0f).value();
+					c.draw_glass_panel(r, 20.0f, 20.0f, glassDark);
+				}
+			},
+			[&](SkCanvas* c) {
+				draw_rich_backdrop_skia(c);
+				for (int i = 0; i < 4; ++i) {
+					float x = 80.0f + (i % 2) * 480.0f;
+					float y = 70.0f + (i / 2) * 300.0f;
+					draw_skia_glass_card(c, SkRect::MakeXYWH(x, y, 440.0f, 260.0f), 20.0f, skBlur14);
+				}
+			}
+		);
+
+		benchmark_canvas_op("110. SaveLayer + Blur ImageFilter (r=8)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisaba::Paint lp(nisaba::Color::WHITE);
+				lp.set_image_filter(nisaba::effects::ImageFilter::blur(8.0f));
+				c.save_layer_bounds(cardRect, lp);
+				for (int i = 0; i < 8; ++i) {
+					auto r = nisaba::Rect::from_xywh(270.0f + i * 65.0f, 220.0f + (i % 3) * 60.0f, 90.0f, 90.0f).value();
+					c.fill_round_rect(r, 14.0f, 14.0f, nisaba::Paint(nisaba::Color::from_rgba8(60 + i * 24, 180 - i * 12, 240, 220)));
+				}
+				c.restore();
+			},
+			[&](SkCanvas* c) {
+				SkPaint lp; lp.setImageFilter(skBlur8);
+				c->saveLayer(&skCardRect, &lp);
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 8; ++i) {
+					p.setColor(SkColorSetARGB(220, 60 + i * 24, 180 - i * 12, 240));
+					c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(270.0f + i * 65.0f, 220.0f + (i % 3) * 60.0f, 90.0f, 90.0f), 14.0f, 14.0f), p);
+				}
+				c->restore();
+			}
+		);
+
+		benchmark_canvas_op("111. SaveLayer Backdrop (r=10) + UI",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				draw_rich_backdrop_nisaba(c);
+				c.save_layer_backdrop(cardRect, nisaba::Paint(nisaba::Color::WHITE), 10.0f);
+				c.fill_round_rect(nisaba::Rect::from_xywh(280.0f, 200.0f, 520.0f, 60.0f).value(), 12.0f, 12.0f,
+					nisaba::Paint(nisaba::Color::from_rgba8(255, 255, 255, 200)));
+				c.fill_round_rect(nisaba::Rect::from_xywh(280.0f, 290.0f, 360.0f, 40.0f).value(), 8.0f, 8.0f,
+					nisaba::Paint(nisaba::Color::from_rgba8(255, 255, 255, 140)));
+				c.restore();
+			},
+			[&](SkCanvas* c) {
+				draw_rich_backdrop_skia(c);
+				SkCanvas::SaveLayerRec rec(&skCardRect, nullptr, skBlur10.get(), 0);
+				c->saveLayer(rec);
+				SkPaint p; p.setAntiAlias(true);
+				p.setColor(SkColorSetARGB(200, 255, 255, 255));
+				c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(280.0f, 200.0f, 520.0f, 60.0f), 12.0f, 12.0f), p);
+				p.setColor(SkColorSetARGB(140, 255, 255, 255));
+				c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(280.0f, 290.0f, 360.0f, 40.0f), 8.0f, 8.0f), p);
+				c->restore();
+			}
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Category 4: Analytical Shadows & Color Filters (Suites 112–115)
+	// -------------------------------------------------------------------------
+	{
+		auto shadowCfg = nisaba::effects::DropShadow(0.0f, 10.0f, 14.0f, nisaba::Color::from_rgba8(0, 0, 0, 140));
+		auto skBlurMask = SkMaskFilter::MakeBlur(kNormal_SkBlurStyle, 14.0f);
+		benchmark_canvas_op("112. Elevated RRect Shadows 10x Cards",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisaba::Paint cardP(nisaba::Color::from_rgba8(245, 247, 252, 255));
+				for (int i = 0; i < 10; ++i) {
+					float x = 50.0f + (i % 5) * 200.0f;
+					float y = 80.0f + (i / 5) * 300.0f;
+					auto rr = nisaba::RRect::from_rect_and_radius(nisaba::Rect::from_xywh(x, y, 170.0f, 240.0f).value(), 18.0f);
+					c.draw_rrect_with_shadow(rr, cardP, shadowCfg);
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint pShad; pShad.setAntiAlias(true); pShad.setColor(SkColorSetARGB(140, 0, 0, 0)); pShad.setMaskFilter(skBlurMask);
+				SkPaint pCard; pCard.setAntiAlias(true); pCard.setColor(SkColorSetARGB(255, 245, 247, 252));
+				for (int i = 0; i < 10; ++i) {
+					float x = 50.0f + (i % 5) * 200.0f;
+					float y = 80.0f + (i / 5) * 300.0f;
+					SkRRect rr = SkRRect::MakeRectXY(SkRect::MakeXYWH(x, y, 170.0f, 240.0f), 18.0f, 18.0f);
+					c->drawRRect(rr.makeOffset(0, 10), pShad);
+					c->drawRRect(rr, pCard);
+				}
+			}
+		);
+
+		auto make_star_nisaba = [](float cx, float cy, float rOut, float rIn) {
+			nisaba::PathBuilder pb;
+			for (int k = 0; k < 10; ++k) {
+				float ang = static_cast<float>(k) * static_cast<float>(M_PI) / 5.0f - static_cast<float>(M_PI) * 0.5f;
+				float rad = (k % 2 == 0) ? rOut : rIn;
+				float px = cx + std::cos(ang) * rad;
+				float py = cy + std::sin(ang) * rad;
+				if (k == 0) pb.move_to(px, py); else pb.line_to(px, py);
+			}
+			pb.close();
+			return pb.finish().value();
+		};
+		auto make_star_skia = [](float cx, float cy, float rOut, float rIn) {
+			SkPath p;
+			for (int k = 0; k < 10; ++k) {
+				float ang = static_cast<float>(k) * static_cast<float>(M_PI) / 5.0f - static_cast<float>(M_PI) * 0.5f;
+				float rad = (k % 2 == 0) ? rOut : rIn;
+				float px = cx + std::cos(ang) * rad;
+				float py = cy + std::sin(ang) * rad;
+				if (k == 0) p.moveTo(px, py); else p.lineTo(px, py);
+			}
+			p.close();
+			return p;
+		};
+		std::vector<nisaba::Path> nStars;
+		std::vector<SkPath> sStars;
+		for (int i = 0; i < 5; ++i) {
+			nStars.push_back(make_star_nisaba(140.0f + i * 200.0f, 360.0f, 75.0f, 32.0f));
+			sStars.push_back(make_star_skia(140.0f + i * 200.0f, 360.0f, 75.0f, 32.0f));
+		}
+		auto skDropShadow = SkImageFilters::DropShadow(4.0f, 6.0f, 8.0f, 8.0f, SkColorSetARGB(180, 0, 0, 0), nullptr);
+		benchmark_canvas_op("113. Path DropShadow Filter (5x Stars)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisaba::Paint p(nisaba::Color::from_rgba8(255, 195, 40, 255));
+				p.set_image_filter(nisaba::effects::ImageFilter::drop_shadow(4.0f, 6.0f, 8.0f, nisaba::Color::from_rgba8(0, 0, 0, 180)));
+				for (const auto& st : nStars) c.fill_path(st, p);
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true); p.setColor(SkColorSetARGB(255, 255, 195, 40));
+				p.setImageFilter(skDropShadow);
+				for (const auto& st : sStars) c->drawPath(st, p);
+			}
+		);
+
+		const float sepiaMat[20] = {
+			0.393f, 0.769f, 0.189f, 0.0f, 0.0f,
+			0.349f, 0.686f, 0.168f, 0.0f, 0.0f,
+			0.272f, 0.534f, 0.131f, 0.0f, 0.0f,
+			0.000f, 0.000f, 0.000f, 1.0f, 0.0f
+		};
+		auto skSepiaCF = SkColorFilters::Matrix(sepiaMat);
+		benchmark_canvas_op("114. ColorMatrix Filter (20x Sepia)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				auto sepia = nisaba::effects::ColorMatrix::sepia(1.0f);
+				for (int i = 0; i < 20; ++i) {
+					float x = 40.0f + (i % 5) * 205.0f;
+					float y = 40.0f + (i / 5) * 165.0f;
+					nisaba::Paint p(nisaba::Color::from_rgba8(60 + (i * 19) % 190, 90 + (i * 31) % 160, 220 - i * 8, 255));
+					p.set_color_filter(sepia);
+					c.fill_round_rect(nisaba::Rect::from_xywh(x, y, 180.0f, 140.0f).value(), 14.0f, 14.0f, p);
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true); p.setColorFilter(skSepiaCF);
+				for (int i = 0; i < 20; ++i) {
+					float x = 40.0f + (i % 5) * 205.0f;
+					float y = 40.0f + (i / 5) * 165.0f;
+					p.setColor(SkColorSetARGB(255, 60 + (i * 19) % 190, 90 + (i * 31) % 160, 220 - i * 8));
+					c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(x, y, 180.0f, 140.0f), 14.0f, 14.0f), p);
+				}
+			}
+		);
+
+		auto skBlendCF = SkColorFilters::Blend(SkColorSetARGB(128, 60, 180, 255), SkBlendMode::kSrcATop);
+		benchmark_canvas_op("115. ColorBlend Filter (20x SrcATop)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				auto cf = nisaba::effects::ColorEffect::mode(nisaba::Color::from_rgba8(60, 180, 255, 128), nisaba::BlendMode::SourceAtop);
+				for (int i = 0; i < 20; ++i) {
+					float x = 40.0f + (i % 5) * 205.0f;
+					float y = 40.0f + (i / 5) * 165.0f;
+					nisaba::Paint p(nisaba::Color::from_rgba8(240 - i * 8, 70 + (i * 23) % 170, 90 + (i * 17) % 150, 255));
+					p.set_color_filter(cf);
+					c.fill_round_rect(nisaba::Rect::from_xywh(x, y, 180.0f, 140.0f).value(), 14.0f, 14.0f, p);
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true); p.setColorFilter(skBlendCF);
+				for (int i = 0; i < 20; ++i) {
+					float x = 40.0f + (i % 5) * 205.0f;
+					float y = 40.0f + (i / 5) * 165.0f;
+					p.setColor(SkColorSetARGB(255, 240 - i * 8, 70 + (i * 23) % 170, 90 + (i * 17) % 150));
+					c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(x, y, 180.0f, 140.0f), 14.0f, 14.0f), p);
+				}
+			}
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Category 5: Advanced Gradients (Suites 116–120)
+	// -------------------------------------------------------------------------
+	{
+		std::vector<nisaba::GradientStop> stops6 = {
+			nisaba::GradientStop::create(0.00f, nisaba::Color::from_rgba8(239, 68, 68, 255)),
+			nisaba::GradientStop::create(0.20f, nisaba::Color::from_rgba8(245, 158, 11, 255)),
+			nisaba::GradientStop::create(0.40f, nisaba::Color::from_rgba8(16, 185, 129, 255)),
+			nisaba::GradientStop::create(0.60f, nisaba::Color::from_rgba8(59, 130, 246, 255)),
+			nisaba::GradientStop::create(0.80f, nisaba::Color::from_rgba8(139, 92, 246, 255)),
+			nisaba::GradientStop::create(1.00f, nisaba::Color::from_rgba8(236, 72, 153, 255)),
+		};
+		SkColor skCols6[6] = {
+			SkColorSetARGB(255, 239, 68, 68), SkColorSetARGB(255, 245, 158, 11),
+			SkColorSetARGB(255, 16, 185, 129), SkColorSetARGB(255, 59, 130, 246),
+			SkColorSetARGB(255, 139, 92, 246), SkColorSetARGB(255, 236, 72, 153)
+		};
+		SkScalar skPos6[6] = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f};
+
+		benchmark_canvas_op("116. Multi-Stop Linear Grad (6 Stops)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				for (int i = 0; i < 16; ++i) {
+					float x = 40.0f + (i % 4) * 255.0f;
+					float y = 40.0f + (i / 4) * 165.0f;
+					auto g = nisaba::LinearGradient::create(nisaba::Point::from_xy(x, y), nisaba::Point::from_xy(x + 230.0f, y + 140.0f), stops6).value();
+					c.fill_round_rect(nisaba::Rect::from_xywh(x, y, 230.0f, 140.0f).value(), 16.0f, 16.0f, nisaba::Paint(nisaba::Shader(g)));
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 16; ++i) {
+					float x = 40.0f + (i % 4) * 255.0f;
+					float y = 40.0f + (i / 4) * 165.0f;
+					SkPoint pts[2] = {{x, y}, {x + 230.0f, y + 140.0f}};
+					p.setShader(SkGradientShader::MakeLinear(pts, skCols6, skPos6, 6, SkTileMode::kClamp));
+					c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(x, y, 230.0f, 140.0f), 16.0f, 16.0f), p);
+				}
+			}
+		);
+
+		std::vector<nisaba::GradientStop> stops20;
+		SkColor skCols20[20];
+		SkScalar skPos20[20];
+		for (int k = 0; k < 20; ++k) {
+			float t = static_cast<float>(k) / 19.0f;
+			uint8_t r = static_cast<uint8_t>(127.0f + 127.0f * std::sin(t * 6.28318f));
+			uint8_t g = static_cast<uint8_t>(127.0f + 127.0f * std::sin(t * 6.28318f + 2.094f));
+			uint8_t b = static_cast<uint8_t>(127.0f + 127.0f * std::sin(t * 6.28318f + 4.188f));
+			stops20.push_back(nisaba::GradientStop::create(t, nisaba::Color::from_rgba8(r, g, b, 255)));
+			skCols20[k] = SkColorSetARGB(255, r, g, b);
+			skPos20[k] = t;
+		}
+		benchmark_canvas_op("117. High-Stop LUT Linear Grad (20 St)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				for (int i = 0; i < 8; ++i) {
+					float y = 40.0f + i * 82.0f;
+					auto g = nisaba::LinearGradient::create(nisaba::Point::from_xy(40.0f, y), nisaba::Point::from_xy(1040.0f, y), stops20).value();
+					c.fill_round_rect(nisaba::Rect::from_xywh(40.0f, y, 1000.0f, 68.0f).value(), 10.0f, 10.0f, nisaba::Paint(nisaba::Shader(g)));
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 8; ++i) {
+					float y = 40.0f + i * 82.0f;
+					SkPoint pts[2] = {{40.0f, y}, {1040.0f, y}};
+					p.setShader(SkGradientShader::MakeLinear(pts, skCols20, skPos20, 20, SkTileMode::kClamp));
+					c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(40.0f, y, 1000.0f, 68.0f), 10.0f, 10.0f), p);
+				}
+			}
+		);
+
+		benchmark_canvas_op("118. Sweep (Conic) Gradient (12x Discs)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				for (int i = 0; i < 12; ++i) {
+					float cx = 140.0f + (i % 4) * 265.0f;
+					float cy = 130.0f + (i / 4) * 230.0f;
+					auto g = nisaba::SweepGradient::create(nisaba::Point::from_xy(cx, cy), 0.0f, 360.0f, stops6).value();
+					c.fill_circle(cx, cy, 92.0f, nisaba::Paint(nisaba::Shader(g)));
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 12; ++i) {
+					float cx = 140.0f + (i % 4) * 265.0f;
+					float cy = 130.0f + (i / 4) * 230.0f;
+					p.setShader(SkGradientShader::MakeSweep(cx, cy, skCols6, skPos6, 6));
+					c->drawCircle(cx, cy, 92.0f, p);
+				}
+			}
+		);
+
+		benchmark_canvas_op("119. Two-Point Conical Grad (12x)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				for (int i = 0; i < 12; ++i) {
+					float cx = 140.0f + (i % 4) * 265.0f;
+					float cy = 130.0f + (i / 4) * 230.0f;
+					auto g = nisaba::TwoPointConicalGradient::create(
+						nisaba::Point::from_xy(cx - 25.0f, cy - 25.0f), 12.0f,
+						nisaba::Point::from_xy(cx, cy), 95.0f, stops6).value();
+					c.fill_circle(cx, cy, 92.0f, nisaba::Paint(nisaba::Shader(g)));
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 12; ++i) {
+					float cx = 140.0f + (i % 4) * 265.0f;
+					float cy = 130.0f + (i / 4) * 230.0f;
+					p.setShader(SkGradientShader::MakeTwoPointConical(
+						{cx - 25.0f, cy - 25.0f}, 12.0f, {cx, cy}, 95.0f, skCols6, skPos6, 6, SkTileMode::kClamp));
+					c->drawCircle(cx, cy, 92.0f, p);
+				}
+			}
+		);
+
+		benchmark_canvas_op("120. Repeat & Reflect Gradients (16x)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				for (int i = 0; i < 16; ++i) {
+					float x = 40.0f + (i % 4) * 255.0f;
+					float y = 40.0f + (i / 4) * 165.0f;
+					auto mode = (i % 2 == 0) ? nisaba::SpreadMode::Repeat : nisaba::SpreadMode::Reflect;
+					auto g = nisaba::LinearGradient::create(nisaba::Point::from_xy(x, y), nisaba::Point::from_xy(x + 45.0f, y + 35.0f), stops6, mode).value();
+					c.fill_rect(nisaba::Rect::from_xywh(x, y, 230.0f, 140.0f).value(), nisaba::Paint(nisaba::Shader(g)));
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 16; ++i) {
+					float x = 40.0f + (i % 4) * 255.0f;
+					float y = 40.0f + (i / 4) * 165.0f;
+					SkPoint pts[2] = {{x, y}, {x + 45.0f, y + 35.0f}};
+					SkTileMode tm = (i % 2 == 0) ? SkTileMode::kRepeat : SkTileMode::kMirror;
+					p.setShader(SkGradientShader::MakeLinear(pts, skCols6, skPos6, 6, tm));
+					c->drawRect(SkRect::MakeXYWH(x, y, 230.0f, 140.0f), p);
+				}
+			}
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Category 6: Programmable BlendModes (Suites 121–123)
+	// -------------------------------------------------------------------------
+	{
+		benchmark_canvas_op("121. BlendModes: Multiply+Screen (20x)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				draw_rich_backdrop_nisaba(c);
+				for (int i = 0; i < 20; ++i) {
+					float cx = 100.0f + (i % 5) * 220.0f;
+					float cy = 110.0f + (i / 5) * 165.0f;
+					nisaba::Paint p(nisaba::Color::from_rgba8(220, 120 + (i * 7) % 120, 90 + (i * 11) % 150, 210));
+					p.blend_mode = (i % 2 == 0) ? nisaba::BlendMode::Multiply : nisaba::BlendMode::Screen;
+					c.fill_circle(cx, cy, 80.0f, p);
+				}
+			},
+			[&](SkCanvas* c) {
+				draw_rich_backdrop_skia(c);
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 20; ++i) {
+					float cx = 100.0f + (i % 5) * 220.0f;
+					float cy = 110.0f + (i / 5) * 165.0f;
+					p.setColor(SkColorSetARGB(210, 220, 120 + (i * 7) % 120, 90 + (i * 11) % 150));
+					p.setBlendMode((i % 2 == 0) ? SkBlendMode::kMultiply : SkBlendMode::kScreen);
+					c->drawCircle(cx, cy, 80.0f, p);
+				}
+			}
+		);
+
+		benchmark_canvas_op("122. BlendModes: Overlay+HardLight",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				draw_rich_backdrop_nisaba(c);
+				for (int i = 0; i < 20; ++i) {
+					float x = 40.0f + (i % 5) * 205.0f;
+					float y = 40.0f + (i / 5) * 165.0f;
+					nisaba::Paint p(nisaba::Color::from_rgba8(90 + (i * 13) % 160, 200, 140 + (i * 9) % 100, 220));
+					p.blend_mode = (i % 2 == 0) ? nisaba::BlendMode::Overlay : nisaba::BlendMode::HardLight;
+					c.fill_round_rect(nisaba::Rect::from_xywh(x, y, 180.0f, 140.0f).value(), 16.0f, 16.0f, p);
+				}
+			},
+			[&](SkCanvas* c) {
+				draw_rich_backdrop_skia(c);
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 20; ++i) {
+					float x = 40.0f + (i % 5) * 205.0f;
+					float y = 40.0f + (i / 5) * 165.0f;
+					p.setColor(SkColorSetARGB(220, 90 + (i * 13) % 160, 200, 140 + (i * 9) % 100));
+					p.setBlendMode((i % 2 == 0) ? SkBlendMode::kOverlay : SkBlendMode::kHardLight);
+					c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(x, y, 180.0f, 140.0f), 16.0f, 16.0f), p);
+				}
+			}
+		);
+
+		benchmark_canvas_op("123. BlendModes: Dodge+Diff+Lum (24x)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				draw_rich_backdrop_nisaba(c);
+				const nisaba::BlendMode modes[3] = {nisaba::BlendMode::ColorDodge, nisaba::BlendMode::Difference, nisaba::BlendMode::Luminosity};
+				for (int i = 0; i < 24; ++i) {
+					float cx = 90.0f + (i % 6) * 180.0f;
+					float cy = 100.0f + (i / 6) * 170.0f;
+					nisaba::Paint p(nisaba::Color::from_rgba8(180, 140, 240, 200));
+					p.blend_mode = modes[i % 3];
+					c.fill_circle(cx, cy, 68.0f, p);
+				}
+			},
+			[&](SkCanvas* c) {
+				draw_rich_backdrop_skia(c);
+				const SkBlendMode modes[3] = {SkBlendMode::kColorDodge, SkBlendMode::kDifference, SkBlendMode::kLuminosity};
+				SkPaint p; p.setAntiAlias(true); p.setColor(SkColorSetARGB(200, 180, 140, 240));
+				for (int i = 0; i < 24; ++i) {
+					float cx = 90.0f + (i % 6) * 180.0f;
+					float cy = 100.0f + (i / 6) * 170.0f;
+					p.setBlendMode(modes[i % 3]);
+					c->drawCircle(cx, cy, 68.0f, p);
+				}
+			}
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Category 7: Path / Stencil Clipping & EvenOdd Fill (Suites 124–126)
+	// -------------------------------------------------------------------------
+	{
+		nisaba::PathBuilder pbClip;
+		SkPath skClipStar;
+		for (int k = 0; k < 20; ++k) {
+			float ang = static_cast<float>(k) * static_cast<float>(M_PI) / 10.0f;
+			float rad = (k % 2 == 0) ? 310.0f : 170.0f;
+			float px = 540.0f + std::cos(ang) * rad;
+			float py = 360.0f + std::sin(ang) * rad;
+			if (k == 0) { pbClip.move_to(px, py); skClipStar.moveTo(px, py); }
+			else { pbClip.line_to(px, py); skClipStar.lineTo(px, py); }
+		}
+		pbClip.close(); skClipStar.close();
+		auto nClipStar = pbClip.finish().value();
+
+		benchmark_canvas_op("124. Path Stencil Clip + 20 Shapes",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				c.save();
+				c.clip_path(nClipStar);
+				for (int i = 0; i < 20; ++i) {
+					c.fill_circle(260.0f + (i % 5) * 140.0f, 120.0f + (i / 5) * 150.0f, 95.0f,
+						nisaba::Paint(nisaba::Color::from_rgba8(50 + i * 10, 140 + (i * 7) % 100, 255 - i * 8, 220)));
+				}
+				c.restore();
+			},
+			[&](SkCanvas* c) {
+				c->save();
+				c->clipPath(skClipStar, true);
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 20; ++i) {
+					p.setColor(SkColorSetARGB(220, 50 + i * 10, 140 + (i * 7) % 100, 255 - i * 8));
+					c->drawCircle(260.0f + (i % 5) * 140.0f, 120.0f + (i / 5) * 150.0f, 95.0f, p);
+				}
+				c->restore();
+			}
+		);
+
+		auto nClipRR = nisaba::RRect::from_rect_and_radius(nisaba::Rect::from_xywh(140.0f, 80.0f, 800.0f, 560.0f).value(), 48.0f);
+		auto nClipOval = nisaba::Rect::from_xywh(220.0f, 60.0f, 640.0f, 600.0f).value();
+		SkRRect sClipRR = SkRRect::MakeRectXY(SkRect::MakeXYWH(140.0f, 80.0f, 800.0f, 560.0f), 48.0f, 48.0f);
+		SkPath sClipOval; sClipOval.addOval(SkRect::MakeXYWH(220.0f, 60.0f, 640.0f, 600.0f));
+		benchmark_canvas_op("125. Nested RRect+Oval Clip + 15 Rects",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				c.save();
+				c.clip_rrect(nClipRR);
+				c.clip_oval(nClipOval);
+				for (int i = 0; i < 15; ++i) {
+					auto r = nisaba::Rect::from_xywh(160.0f + i * 50.0f, 90.0f, 42.0f, 540.0f).value();
+					c.fill_rect(r, nisaba::Paint(nisaba::Color::from_rgba8(240 - i * 12, 90 + i * 10, 210, 255)));
+				}
+				c.restore();
+			},
+			[&](SkCanvas* c) {
+				c->save();
+				c->clipRRect(sClipRR, true);
+				c->clipPath(sClipOval, true);
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 15; ++i) {
+					p.setColor(SkColorSetARGB(255, 240 - i * 12, 90 + i * 10, 210));
+					c->drawRect(SkRect::MakeXYWH(160.0f + i * 50.0f, 90.0f, 42.0f, 540.0f), p);
+				}
+				c->restore();
+			}
+		);
+
+		std::vector<nisaba::Path> nEvenOdd;
+		std::vector<SkPath> sEvenOdd;
+		for (int i = 0; i < 10; ++i) {
+			float cx = 130.0f + (i % 5) * 205.0f;
+			float cy = 190.0f + (i / 5) * 340.0f;
+			nisaba::PathBuilder pb;
+			SkPath sp;
+			sp.setFillType(SkPathFillType::kEvenOdd);
+			// Self-intersecting 5-point pentagram + concentric rings
+			const int order[5] = {0, 2, 4, 1, 3};
+			for (int k = 0; k < 5; ++k) {
+				float ang = static_cast<float>(order[k]) * 2.0f * static_cast<float>(M_PI) / 5.0f - static_cast<float>(M_PI) * 0.5f;
+				float px = cx + std::cos(ang) * 80.0f;
+				float py = cy + std::sin(ang) * 80.0f;
+				if (k == 0) { pb.move_to(px, py); sp.moveTo(px, py); }
+				else { pb.line_to(px, py); sp.lineTo(px, py); }
+			}
+			pb.close(); sp.close();
+			pb.push_circle(cx, cy, 85.0f); sp.addCircle(cx, cy, 85.0f);
+			pb.push_circle(cx, cy, 45.0f); sp.addCircle(cx, cy, 45.0f);
+			nEvenOdd.push_back(pb.finish().value());
+			sEvenOdd.push_back(sp);
+		}
+		benchmark_canvas_op("126. EvenOdd Complex Star+Rings (10x)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisaba::Paint p(nisaba::Color::from_rgba8(139, 92, 246, 255));
+				for (const auto& pt : nEvenOdd) c.fill_path(pt, p, nisaba::FillRule::EvenOdd);
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true); p.setColor(SkColorSetARGB(255, 139, 92, 246));
+				for (const auto& pt : sEvenOdd) c->drawPath(pt, p);
+			}
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Category 8: Advanced Text & Arabic/RTL (Suites 127–129)
+	// -------------------------------------------------------------------------
+	{
+		auto* fontSys = gpuCanvas->font_system();
+		const char* arabicFontCandidates[] = {
+			"/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
+			"/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
+			"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+		};
+		const char* arabicFontPath = nullptr;
+		for (const char* cand : arabicFontCandidates) {
+			if (FILE* f = std::fopen(cand, "rb")) { std::fclose(f); arabicFontPath = cand; break; }
+		}
+		if (fontSys && arabicFontPath) {
+			fontSys->load_font_file(arabicFontPath);
+		}
+		sk_sp<SkTypeface> skArabicTf = arabicFontPath ? SkTypeface::MakeFromFile(arabicFontPath) : skiaTypeface;
+
+		nisaba::text::Buffer paraBuf(nisaba::text::Metrics(20.0f, 30.0f));
+		paraBuf.set_size(960.0f, std::nullopt);
+		const char* paraLines[6] = {
+			"Nisaba is a sovereign C++20 hardware-accelerated 2D graphics engine engineered for desktop shells.",
+			"Zero-copy GPU batching, analytical SDF rounded rectangles, and Dual Kawase backdrop blur pipelines.",
+			"Direct comparison against Google Skia Ganesh OpenGL with identical framebuffers and glFinish sync.",
+			"Typography shaping supports kerning, multi-line word wrapping, underline/strikethrough decorations.",
+			"Vector SVG documents and Lottie animations compile cleanly into hardware draw calls per frame.",
+			"Benchmarked continuously across 134 micro-suites covering primitives, layers, blends, and shaders."
+		};
+		std::string paraFull;
+		for (int i = 0; i < 6; ++i) { if (i) paraFull += '\n'; paraFull += paraLines[i]; }
+		paraBuf.set_text(paraFull);
+		if (fontSys) paraBuf.shape_until_scroll(*fontSys);
+
+		benchmark_canvas_op("127. Multi-Line Text Buffer (6 Lines)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				if (fontSys) c.draw_text_buffer(paraBuf, *fontSys, nisaba::Point::from_xy(60.0f, 80.0f), nisaba::Color::WHITE);
+			},
+			[&](SkCanvas* c) {
+				SkFont f(skiaTypeface, 20.0f);
+				SkPaint p; p.setAntiAlias(true); p.setColor(SK_ColorWHITE);
+				for (int i = 0; i < 6; ++i) {
+					c->drawString(paraLines[i], 60.0f, 100.0f + i * 30.0f, f, p);
+				}
+			}
+		);
+
+		nisaba::text::Buffer rtlBuf(nisaba::text::Metrics(26.0f, 44.0f));
+		rtlBuf.set_size(960.0f, std::nullopt);
+		const char* rtlLines[4] = {
+			"مرحبا بكم في محرك الرسوميات نيسابا للعرض السريع على البطاقة الرسومية",
+			"يدعم المحرك النصوص العربية واتجاه القراءة من اليمين إلى اليسار بالكامل",
+			"مقارنة الأداء الفعلي مع محرك Skia Ganesh عبر اختبارات دقيقة ومتكافئة",
+			"Nisaba GPU Engine 2026 — نص عربي مختلط مع English BiDi 12345"
+		};
+		std::string rtlFull;
+		for (int i = 0; i < 4; ++i) { if (i) rtlFull += '\n'; rtlFull += rtlLines[i]; }
+		nisaba::text::Attrs rtlAttrs;
+		rtlAttrs.set_color(nisaba::text::TextColor::rgb(245, 248, 255));
+		rtlBuf.set_text(rtlFull, rtlAttrs);
+		if (fontSys) rtlBuf.shape_until_scroll(*fontSys);
+
+		benchmark_canvas_op("128. Arabic / RTL BiDi Text (4x Lines)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				if (fontSys) c.draw_text_buffer(rtlBuf, *fontSys, nisaba::Point::from_xy(60.0f, 140.0f), nisaba::Color::WHITE);
+			},
+			[&](SkCanvas* c) {
+				SkFont f(skArabicTf ? skArabicTf : skiaTypeface, 26.0f);
+				SkPaint p; p.setAntiAlias(true); p.setColor(SkColorSetARGB(255, 245, 248, 255));
+				for (int i = 0; i < 4; ++i) {
+					c->drawString(rtlLines[i], 60.0f, 170.0f + i * 44.0f, f, p);
+				}
+			}
+		);
+
+		std::vector<nisaba::text::Buffer> styledBufs;
+		const float fontSizes[8] = {12.0f, 16.0f, 20.0f, 24.0f, 28.0f, 32.0f, 36.0f, 42.0f};
+		for (int i = 0; i < 8; ++i) {
+			nisaba::text::Buffer b(nisaba::text::Metrics(fontSizes[i], fontSizes[i] * 1.3f));
+			nisaba::text::Attrs a;
+			a.underline = (i % 2 == 0);
+			a.strikethrough = (i % 3 == 0);
+			a.set_color(nisaba::text::TextColor::rgb(120 + i * 16, 220 - i * 10, 255));
+			b.set_text("Styled GPU GlyphAtlas Telemetry Sample 0123456789", a);
+			if (fontSys) b.shape_until_scroll(*fontSys);
+			styledBufs.push_back(std::move(b));
+		}
+		benchmark_canvas_op("129. Styled Text + Multi-Size Atlas",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				if (!fontSys) return;
+				float y = 40.0f;
+				for (int i = 0; i < 8; ++i) {
+					c.draw_text_buffer(styledBufs[i], *fontSys, nisaba::Point::from_xy(60.0f, y), nisaba::Color::WHITE);
+					y += fontSizes[i] * 1.8f;
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				SkPaint pLine; pLine.setAntiAlias(true); pLine.setStrokeWidth(1.5f);
+				float y = 40.0f;
+				for (int i = 0; i < 8; ++i) {
+					SkColor col = SkColorSetARGB(255, 120 + i * 16, 220 - i * 10, 255);
+					p.setColor(col); pLine.setColor(col);
+					SkFont f(skiaTypeface, fontSizes[i]);
+					float base = y + fontSizes[i];
+					c->drawString("Styled GPU GlyphAtlas Telemetry Sample 0123456789", 60.0f, base, f, p);
+					if (i % 2 == 0) c->drawLine(60.0f, base + 3.0f, 700.0f, base + 3.0f, pLine);
+					if (i % 3 == 0) c->drawLine(60.0f, base - fontSizes[i] * 0.35f, 700.0f, base - fontSizes[i] * 0.35f, pLine);
+					y += fontSizes[i] * 1.8f;
+				}
+			}
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Category 9: Advanced Images, Mipmaps, 3D Perspective & Vertices (130–132)
+	// -------------------------------------------------------------------------
+	{
+		auto pix512 = nisaba::Pixmap::create(512, 512).value();
+		uint8_t* pdata = pix512.data_mut();
+		for (int y = 0; y < 512; ++y) {
+			for (int x = 0; x < 512; ++x) {
+				bool chk = ((x / 8) + (y / 8)) % 2 == 0;
+				size_t idx = (static_cast<size_t>(y) * 512 + x) * 4;
+				pdata[idx + 0] = chk ? static_cast<uint8_t>((x * 255) / 512) : 30;
+				pdata[idx + 1] = chk ? static_cast<uint8_t>((y * 255) / 512) : 200;
+				pdata[idx + 2] = chk ? 240 : 120;
+				pdata[idx + 3] = 255;
+			}
+		}
+		auto nTex512 = nisaba::gpu::GpuTexture::create_from_pixmap(gpuDevice, pix512.as_ref());
+		SkImageInfo info512 = SkImageInfo::Make(512, 512, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
+		SkPixmap skPm512(info512, pix512.data(), 512 * 4);
+		sk_sp<SkImage> skImg512 = SkImage::MakeRasterCopy(skPm512)->makeTextureImage(dContext.get(), GrMipmapped::kYes);
+
+		const auto src512 = nisaba::Rect::from_xywh(0.0f, 0.0f, 512.0f, 512.0f).value();
+		benchmark_canvas_op("130. Heavy Downscale Mipmaps (16x)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisaba::PixmapPaint pp;
+				pp.quality = nisaba::FilterQuality::Bilinear;
+				for (int i = 0; i < 16; ++i) {
+					float x = 80.0f + (i % 8) * 115.0f;
+					float y = 200.0f + (i / 8) * 180.0f;
+					auto dst = nisaba::Rect::from_xywh(x, y, 32.0f, 32.0f).value();
+					c.draw_pixmap_rect(pix512.as_ref(), src512, dst, pp);
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				SkSamplingOptions samp(SkFilterMode::kLinear, SkMipmapMode::kLinear);
+				for (int i = 0; i < 16; ++i) {
+					float x = 80.0f + (i % 8) * 115.0f;
+					float y = 200.0f + (i / 8) * 180.0f;
+					c->drawImageRect(skImg512, SkRect::MakeXYWH(x, y, 32.0f, 32.0f), samp, &p);
+				}
+			}
+		);
+
+		benchmark_canvas_op("131. 3D Perspective Quads (8x Cards)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				for (int i = 0; i < 8; ++i) {
+					float px = 160.0f + (i % 4) * 240.0f;
+					float py = 200.0f + (i / 4) * 300.0f;
+					auto t3d = nisaba::Transform4x4::from_camera_orbit(px, py, 22.0f, -28.0f + i * 8.0f, 4.0f, 650.0f)
+						* nisaba::Transform4x4::from_translate(px - 80.0f, py - 80.0f, 0.0f)
+						* nisaba::Transform4x4::from_scale(160.0f / 512.0f, 160.0f / 512.0f, 1.0f);
+					c.draw_pixmap_3d(pix512.as_ref(), t3d, 1.0f, nisaba::BlendMode::SourceOver);
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				SkSamplingOptions samp(SkFilterMode::kLinear, SkMipmapMode::kLinear);
+				for (int i = 0; i < 8; ++i) {
+					float px = 160.0f + (i % 4) * 240.0f;
+					float py = 200.0f + (i / 4) * 300.0f;
+					auto t3d = nisaba::Transform4x4::from_camera_orbit(px, py, 22.0f, -28.0f + i * 8.0f, 4.0f, 650.0f)
+						* nisaba::Transform4x4::from_translate(px - 80.0f, py - 80.0f, 0.0f)
+						* nisaba::Transform4x4::from_scale(160.0f / 512.0f, 160.0f / 512.0f, 1.0f);
+					SkM44 m44 = SkM44::RowMajor(t3d.m.data());
+					c->save();
+					c->concat(m44);
+					c->drawImageRect(skImg512, SkRect::MakeXYWH(0, 0, 512, 512), samp, &p);
+					c->restore();
+				}
+			}
+		);
+
+		// Build 16x8 grid (256 triangles) Gouraud + textured mesh
+		const uint32_t gCols = 17, gRows = 9;
+		std::vector<nisaba::Point> nPts, nUvs;
+		std::vector<nisaba::Color> nCols;
+		std::vector<SkPoint> sPts, sUvs;
+		std::vector<SkColor> sCols;
+		for (uint32_t r = 0; r < gRows; ++r) {
+			for (uint32_t col = 0; col < gCols; ++col) {
+				float u = static_cast<float>(col) / (gCols - 1);
+				float v = static_cast<float>(r) / (gRows - 1);
+				float x = 80.0f + u * 920.0f;
+				float y = 80.0f + v * 560.0f + std::sin(u * 6.28318f + v * 3.14f) * 18.0f;
+				nPts.push_back(nisaba::Point::from_xy(x, y));
+				nUvs.push_back(nisaba::Point::from_xy(u, v));
+				uint8_t cr = static_cast<uint8_t>(u * 255.0f);
+				uint8_t cg = static_cast<uint8_t>(v * 255.0f);
+				uint8_t cb = static_cast<uint8_t>((1.0f - u) * 255.0f);
+				nCols.push_back(nisaba::Color::from_rgba8(cr, cg, cb, 255));
+				sPts.push_back({x, y});
+				sUvs.push_back({u * 512.0f, v * 512.0f});
+				sCols.push_back(SkColorSetARGB(255, cr, cg, cb));
+			}
+		}
+		auto nVertsColor = nisaba::Vertices::create_grid(gCols, gRows, nPts, &nCols, nullptr);
+		auto nVertsTex = nisaba::Vertices::create_grid(gCols, gRows, nPts, nullptr, &nUvs);
+		std::vector<uint16_t> sIdx;
+		sIdx.reserve(nVertsColor.indices.size());
+		for (uint32_t idx : nVertsColor.indices) sIdx.push_back(static_cast<uint16_t>(idx));
+		auto skVertsColor = SkVertices::MakeCopy(SkVertices::kTriangles_VertexMode, static_cast<int>(sPts.size()),
+			sPts.data(), nullptr, sCols.data(), static_cast<int>(sIdx.size()), sIdx.data());
+		auto skVertsTex = SkVertices::MakeCopy(SkVertices::kTriangles_VertexMode, static_cast<int>(sPts.size()),
+			sPts.data(), sUvs.data(), nullptr, static_cast<int>(sIdx.size()), sIdx.data());
+		auto skTexShader = skImg512->makeShader(SkSamplingOptions(SkFilterMode::kLinear));
+
+		benchmark_canvas_op("132. Vertex Mesh Gouraud+Tex (256 Tri)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				c.draw_vertices(nVertsColor);
+				c.draw_textured_vertices(nVertsTex, nTex512, nisaba::BlendMode::SourceOver, 0.5f);
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				c->drawVertices(skVertsColor, SkBlendMode::kDst, p);
+				p.setShader(skTexShader); p.setAlphaf(0.5f);
+				c->drawVertices(skVertsTex, SkBlendMode::kModulate, p);
+			}
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Category 10: Dashed Strokes & DRRect (Suites 133–134)
+	// -------------------------------------------------------------------------
+	{
+		std::vector<nisaba::Path> nDashPaths;
+		std::vector<SkPath> sDashPaths;
+		for (int i = 0; i < 8; ++i) {
+			float y = 60.0f + i * 80.0f;
+			nisaba::PathBuilder pb;
+			SkPath sp;
+			pb.move_to(60.0f, y); sp.moveTo(60.0f, y);
+			pb.cubic_to(320.0f, y - 55.0f, 740.0f, y + 55.0f, 1020.0f, y);
+			sp.cubicTo(320.0f, y - 55.0f, 740.0f, y + 55.0f, 1020.0f, y);
+			nDashPaths.push_back(pb.finish().value());
+			sDashPaths.push_back(sp);
+		}
+		nisaba::Stroke nDashStroke(4.0f);
+		nDashStroke.line_cap = nisaba::LineCap::Round;
+		nDashStroke.dash = nisaba::StrokeDash::create({14.0f, 8.0f, 4.0f, 8.0f}, 0.0f);
+		const SkScalar skDashIntervals[4] = {14.0f, 8.0f, 4.0f, 8.0f};
+		auto skDashEff = SkDashPathEffect::Make(skDashIntervals, 4, 0.0f);
+
+		benchmark_canvas_op("133. Dashed Strokes (8x Cubic+8x Rect)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisaba::Paint p(nisaba::Color::from_rgba8(56, 189, 248, 255));
+				for (const auto& pt : nDashPaths) c.stroke_path(pt, p, nDashStroke);
+				for (int i = 0; i < 8; ++i) {
+					auto r = nisaba::Rect::from_xywh(80.0f + i * 118.0f, 260.0f, 95.0f, 200.0f).value();
+					c.stroke_round_rect(r, 12.0f, 12.0f, p, nDashStroke);
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true); p.setStyle(SkPaint::kStroke_Style);
+				p.setStrokeWidth(4.0f); p.setStrokeCap(SkPaint::kRound_Cap);
+				p.setColor(SkColorSetARGB(255, 56, 189, 248));
+				p.setPathEffect(skDashEff);
+				for (const auto& pt : sDashPaths) c->drawPath(pt, p);
+				for (int i = 0; i < 8; ++i) {
+					c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(80.0f + i * 118.0f, 260.0f, 95.0f, 200.0f), 12.0f, 12.0f), p);
+				}
+			}
+		);
+
+		benchmark_canvas_op("134. Nested DRRect Frames (25x)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				for (int i = 0; i < 25; ++i) {
+					float x = 50.0f + (i % 5) * 200.0f;
+					float y = 30.0f + (i / 5) * 135.0f;
+					auto outer = nisaba::RRect::from_rect_and_radius(nisaba::Rect::from_xywh(x, y, 175.0f, 115.0f).value(), 22.0f);
+					auto inner = nisaba::RRect::from_rect_and_radius(nisaba::Rect::from_xywh(x + 14.0f, y + 14.0f, 147.0f, 87.0f).value(), 12.0f);
+					c.fill_drrect(outer, inner, nisaba::Paint(nisaba::Color::from_rgba8(80 + i * 6, 180, 255 - i * 5, 255)));
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 25; ++i) {
+					float x = 50.0f + (i % 5) * 200.0f;
+					float y = 30.0f + (i / 5) * 135.0f;
+					SkRRect outer = SkRRect::MakeRectXY(SkRect::MakeXYWH(x, y, 175.0f, 115.0f), 22.0f, 22.0f);
+					SkRRect inner = SkRRect::MakeRectXY(SkRect::MakeXYWH(x + 14.0f, y + 14.0f, 147.0f, 87.0f), 12.0f, 12.0f);
+					p.setColor(SkColorSetARGB(255, 80 + i * 6, 180, 255 - i * 5));
+					c->drawDRRect(outer, inner, p);
+				}
+			}
+		);
+	}
+
 	// Detailed Statistical Reporting & Speedup Analysis
 	// =========================================================================
 	std::cout << "\n\n";
@@ -3563,7 +4949,13 @@ int main(int argc, char** argv) {
 	std::cout << "         Overall CPU Command Submission:       " << ss_tot_cpu.str() << "\n";
 	std::cout << "===================================================================================================================================================\n\n";
 
-		nisabaCtx->deleteImage(nisabaTex);
+	nisabaCtx->deleteImage(nisabaTex);
+	gpuCanvas.reset();
+	nisabaSurface.reset();
+	gpuDevice.reset();
+	nisabaCtx.reset();
+	skiaSurface.reset();
+	dContext.reset();
 	window.reset();
 	platform.reset();
 	return 0;

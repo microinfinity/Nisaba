@@ -166,6 +166,57 @@ void test_mask_and_pattern() {
     std::cout << "PASSED (Saved test_mask_pattern.bmp)" << std::endl;
 }
 
+void test_save_layer() {
+    std::cout << "Testing save_layer / save_layer_bounds / save_layer_backdrop... ";
+
+    // 1. Opacity isolation + nested layer + bounded Clear confinement + ColorFilter
+    auto pm = Pixmap::allocate(160, 160);
+    assert(pm.has_value());
+    Canvas canvas(*pm);
+    canvas.clear(Color::from_rgba8(20, 40, 80, 255));
+
+    // Overlapping rects inside 0.5-alpha layer:
+    // If NOT isolated: dst gets (R over bg) then (G over that) -> green mixes with bg + red.
+    // With isolated layer: green opaque rect covers red inside layer -> layer pixel at overlap is pure green (0,255,0,255),
+    // then layer composites at 0.5 over bg (20, 40, 80) -> ~(10, 148, 40)!
+    canvas.save_layer_alpha(0.5f);
+    canvas.fill_rect(*Rect::from_xywh(10, 10, 80, 80), Paint(Color::from_rgba8(255, 0, 0, 255)));
+    canvas.fill_rect(*Rect::from_xywh(30, 30, 80, 80), Paint(Color::from_rgba8(0, 255, 0, 255)));
+    canvas.restore();
+
+    auto overlap = pm->pixel(40, 40);
+    assert(overlap.has_value());
+    assert(overlap->red() < 20);
+    assert(overlap->green() > 135 && overlap->green() < 160);
+    assert(overlap->blue() > 30 && overlap->blue() < 50);
+
+    // 2. Bounded Clear + ColorMatrix on layer
+    {
+        Paint layer_p(Color::from_rgba8(255, 255, 255, 255));
+        layer_p.set_color_filter(effects::ColorMatrix::invert());
+        canvas.save_layer_bounds(*Rect::from_xywh(100, 100, 40, 40), layer_p);
+        canvas.fill_rect(*Rect::from_xywh(90, 90, 60, 60), Paint(Color::from_rgba8(255, 255, 0, 255)));
+        canvas.restore();
+    }
+    auto in_b = pm->pixel(110, 110);
+    auto out_b = pm->pixel(145, 145);
+    assert(in_b.has_value() && out_b.has_value());
+    // Invert yellow (255, 255, 0) -> blue (0, 0, 255)
+    assert(in_b->red() < 5 && in_b->green() < 5 && in_b->blue() > 250);
+    // Outside bounds [100..140] at (145,145) (still inside [90..150] draw rect): untouched background (20, 40, 80)
+    assert(out_b->red() == 20 && out_b->green() == 40 && out_b->blue() == 80);
+
+    // 3. Backdrop blur
+    canvas.save_layer_backdrop(*Rect::from_xywh(25, 110, 60, 40), Paint(Color::WHITE), 4.0f);
+    canvas.fill_rect(*Rect::from_xywh(35, 120, 10, 10), Paint(Color::from_rgba8(255, 0, 255, 255)));
+    canvas.restore();
+    auto bd_edge = pm->pixel(35, 111);
+    assert(bd_edge.has_value());
+    assert(bd_edge->green() > 60 && bd_edge->green() < 120); // Blurred green/bg bleed across y=110 edge into backdrop
+
+    std::cout << "PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Nisaba Canvas, Shaders & Pipeline Tests ===" << std::endl;
 
@@ -173,6 +224,7 @@ int main() {
     test_radial_gradient();
     test_canvas_transform_and_stroke();
     test_mask_and_pattern();
+    test_save_layer();
 
     std::cout << "All Canvas & Pipeline Tests Passed Successfully!" << std::endl;
     return 0;

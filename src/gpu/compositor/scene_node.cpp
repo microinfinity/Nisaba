@@ -37,7 +37,7 @@ void SceneRect::render(
 
     RectI box{parentOffset.x + m_x, parentOffset.y + m_y, m_width, m_height};
     if (m_cornerRadius > 0.5f) {
-        if (auto* rp = dynamic_cast<RenderPass*>(&pass)) {
+        if (auto* rp = pass.asRenderPass()) {
             rp->renderRoundedRect(box, m_color, m_cornerRadius, m_roundingPower, damage);
             return;
         }
@@ -109,7 +109,7 @@ void SceneBuffer::render(
     if (!m_enabled || !m_texture || m_width <= 0 || m_height <= 0) return;
 
     RectI box{parentOffset.x + m_x, parentOffset.y + m_y, m_width, m_height};
-    if (auto* rp = dynamic_cast<RenderPass*>(&pass)) {
+    if (auto* rp = pass.asRenderPass()) {
         if (m_cornerRadius > 0.5f || !m_imageDesc.isStandardSrgb() || !m_decorations.empty()) {
             m_decorations.enqueueLayer(*rp, DecorationLayer::Bottom, box, m_alpha);
             m_decorations.enqueueLayer(*rp, DecorationLayer::Under, box, m_alpha);

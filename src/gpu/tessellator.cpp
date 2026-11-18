@@ -365,8 +365,15 @@ void Tessellator::flattenCommands(std::span<const PathCommand> commands) {
 		}
 	}
 
+	finalizeContours();
+}
+
+void Tessellator::finalizeContours() {
 	m_bounds[0] = m_bounds[1] = 1e6f;
 	m_bounds[2] = m_bounds[3] = -1e6f;
+
+	float maxPreserveAbsArea = -1.0f;
+	float dominantPreserveArea = 0.0f;
 
 	for (size_t j = 0; j < m_contours.size(); ++j) {
 		PathContour& contour = m_contours[j];
@@ -381,12 +388,36 @@ void Tessellator::flattenCommands(std::span<const PathCommand> commands) {
 			}
 		}
 
+		if (contour.count > 2 && contour.winding == Winding::Preserve) {
+			const float area = polygonSignedArea(pts, contour.count);
+			const float absArea = std::abs(area);
+			if (absArea > maxPreserveAbsArea) {
+				maxPreserveAbsArea = absArea;
+				dominantPreserveArea = area;
+			}
+		}
+	}
+
+	// Ensure dominant outer contour in Preserve paths is CCW so AA fringe points outward,
+	// while flipping all Preserve contours uniformly to maintain outer-vs-hole contrast.
+	const bool flipAllPreserve = (maxPreserveAbsArea > 0.0f && dominantPreserveArea < 0.0f);
+
+	for (size_t j = 0; j < m_contours.size(); ++j) {
+		PathContour& contour = m_contours[j];
+		ContourPoint* pts = &m_points[contour.first];
+
 		if (contour.count > 2) {
-			float area = polygonSignedArea(pts, contour.count);
-			if (contour.winding == Winding::CounterClockwise && area < 0.0f)
-				reverseContourPoints(pts, contour.count);
-			if (contour.winding == Winding::Clockwise && area > 0.0f)
-				reverseContourPoints(pts, contour.count);
+			if (contour.winding == Winding::Preserve) {
+				if (flipAllPreserve) {
+					reverseContourPoints(pts, contour.count);
+				}
+			} else {
+				float area = polygonSignedArea(pts, contour.count);
+				if ((contour.winding == Winding::CounterClockwise || contour.winding == Winding::EvenOdd) && area < 0.0f)
+					reverseContourPoints(pts, contour.count);
+				if (contour.winding == Winding::Clockwise && area > 0.0f)
+					reverseContourPoints(pts, contour.count);
+			}
 		}
 
 		for (int k = 0; k < contour.count; ++k) {
@@ -454,44 +485,7 @@ void Tessellator::flattenPath(const nisaba::Path& path, const Transform2D& xform
 		}
 	}
 
-	m_bounds[0] = m_bounds[1] = 1e6f;
-	m_bounds[2] = m_bounds[3] = -1e6f;
-
-	for (size_t j = 0; j < m_contours.size(); ++j) {
-		PathContour& contour = m_contours[j];
-		ContourPoint* pts = &m_points[contour.first];
-
-		if (contour.count > 1) {
-			ContourPoint* p0 = &pts[contour.count - 1];
-			ContourPoint* p1 = &pts[0];
-			if (pointEquals(p0->x, p0->y, p1->x, p1->y, m_distTol)) {
-				contour.count--;
-				contour.closed = true;
-			}
-		}
-
-		if (contour.count > 2) {
-			float area = polygonSignedArea(pts, contour.count);
-			if (contour.winding == Winding::CounterClockwise && area < 0.0f)
-				reverseContourPoints(pts, contour.count);
-			if (contour.winding == Winding::Clockwise && area > 0.0f)
-				reverseContourPoints(pts, contour.count);
-		}
-
-		for (int k = 0; k < contour.count; ++k) {
-			ContourPoint* p0 = &pts[k];
-			ContourPoint* p1 = (k + 1 < contour.count) ? &pts[k + 1] : &pts[0];
-
-			p0->dx = p1->x - p0->x;
-			p0->dy = p1->y - p0->y;
-			p0->len = normalizeVector(&p0->dx, &p0->dy);
-
-			m_bounds[0] = std::min(m_bounds[0], p0->x);
-			m_bounds[1] = std::min(m_bounds[1], p0->y);
-			m_bounds[2] = std::max(m_bounds[2], p0->x);
-			m_bounds[3] = std::max(m_bounds[3], p0->y);
-		}
-	}
+	finalizeContours();
 }
 
 void Tessellator::calculateJoins(float w, LineJoin join, float miterLimit) {

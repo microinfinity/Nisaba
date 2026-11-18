@@ -2,6 +2,7 @@
 
 #include "nisaba/gpu/types.hpp"
 #include "nisaba/gpu/gpu_types.hpp"
+#include <cstring>
 #include <span>
 #include <vector>
 
@@ -42,7 +43,8 @@ using Path = RenderPath;
 
 enum class TextureType {
 	Alpha,
-	RGBA
+	RGBA,
+	BGRA
 };
 
 // -------------------------------------------------------------
@@ -55,12 +57,49 @@ public:
 	virtual bool init() = 0;
 	virtual void shutdown() = 0;
 
+	/// Invalidates all cached GL/backend state assumptions when sharing a GPU context with an external host.
+	virtual void resetState() {}
+
 	virtual bool edgeAntiAlias() const = 0;
 
 	virtual int createTexture(TextureType type, int width, int height, int imageFlags, const unsigned char* data) = 0;
+	virtual int createTextureWithStride(TextureType type, int width, int height, int strideBytes, int imageFlags, const unsigned char* data) {
+		if (width <= 0 || height <= 0) return 0;
+		int bpp = (type == TextureType::Alpha) ? 1 : 4;
+		int tightStride = width * bpp;
+		int effectiveStride = (strideBytes > 0) ? strideBytes : tightStride;
+		if (!data || (effectiveStride == tightStride && type != TextureType::BGRA)) {
+			return createTexture(type == TextureType::BGRA ? TextureType::RGBA : type, width, height, imageFlags, data);
+		}
+		if (effectiveStride < tightStride) return 0;
+		std::vector<unsigned char> packed(static_cast<size_t>(height) * static_cast<size_t>(tightStride));
+		if (type == TextureType::BGRA) {
+			for (int y = 0; y < height; ++y) {
+				const unsigned char* s = data + static_cast<size_t>(y) * static_cast<size_t>(effectiveStride);
+				unsigned char* d = packed.data() + static_cast<size_t>(y) * static_cast<size_t>(tightStride);
+				for (int x = 0; x < width; ++x) {
+					d[x * 4 + 0] = s[x * 4 + 2];
+					d[x * 4 + 1] = s[x * 4 + 1];
+					d[x * 4 + 2] = s[x * 4 + 0];
+					d[x * 4 + 3] = s[x * 4 + 3];
+				}
+			}
+			return createTexture(TextureType::RGBA, width, height, imageFlags, packed.data());
+		}
+		for (int y = 0; y < height; ++y) {
+			std::memcpy(packed.data() + static_cast<size_t>(y) * static_cast<size_t>(tightStride),
+			            data + static_cast<size_t>(y) * static_cast<size_t>(effectiveStride),
+			            static_cast<size_t>(tightStride));
+		}
+		return createTexture(type, width, height, imageFlags, packed.data());
+	}
 	virtual bool deleteTexture(int image) = 0;
 	virtual bool updateTexture(int image, int x, int y, int width, int height, const unsigned char* data) = 0;
 	virtual bool getTextureSize(int image, int& outWidth, int& outHeight) = 0;
+	virtual int textureFlags(int image) const {
+		(void)image;
+		return 0;
+	}
 	virtual int createTextureFromNativeHandle(uint64_t handle, int w, int h, int imageFlags) {
 		(void)handle; (void)w; (void)h; (void)imageFlags;
 		return 0;
@@ -96,6 +135,16 @@ public:
 
 	virtual void resetClip() {
 	}
+
+	virtual void pushLayer(const LayerDesc& desc, const Scissor& parentScissor, int parentClipDepth) {
+		(void)desc; (void)parentScissor; (void)parentClipDepth;
+	}
+
+	virtual void popLayer(const LayerDesc& desc, const Scissor& parentScissor, int parentClipDepth) {
+		(void)desc; (void)parentScissor; (void)parentClipDepth;
+	}
+
+	virtual bool supportsDRRectShader() const noexcept { return false; }
 };
 
 } // namespace nisaba::gpu

@@ -9,51 +9,63 @@ namespace nisaba::gpu {
 CompositeOperationState CompositeOperationState::fromCompositeOp(CompositeOperation op) {
 	BlendFactor sfactor = BlendFactor::One;
 	BlendFactor dfactor = BlendFactor::Zero;
+	BlendMode mode = BlendMode::SourceOver;
 
 	switch (op) {
 		case CompositeOperation::SourceOver:
 			sfactor = BlendFactor::One;
 			dfactor = BlendFactor::OneMinusSrcAlpha;
+			mode = BlendMode::SourceOver;
 			break;
 		case CompositeOperation::SourceIn:
 			sfactor = BlendFactor::DstAlpha;
 			dfactor = BlendFactor::Zero;
+			mode = BlendMode::SourceIn;
 			break;
 		case CompositeOperation::SourceOut:
 			sfactor = BlendFactor::OneMinusDstAlpha;
 			dfactor = BlendFactor::Zero;
+			mode = BlendMode::SourceOut;
 			break;
 		case CompositeOperation::Atop:
 			sfactor = BlendFactor::DstAlpha;
 			dfactor = BlendFactor::OneMinusSrcAlpha;
+			mode = BlendMode::SourceAtop;
 			break;
 		case CompositeOperation::DestinationOver:
 			sfactor = BlendFactor::OneMinusDstAlpha;
 			dfactor = BlendFactor::One;
+			mode = BlendMode::DestinationOver;
 			break;
 		case CompositeOperation::DestinationIn:
 			sfactor = BlendFactor::Zero;
 			dfactor = BlendFactor::SrcAlpha;
+			mode = BlendMode::DestinationIn;
 			break;
 		case CompositeOperation::DestinationOut:
 			sfactor = BlendFactor::Zero;
 			dfactor = BlendFactor::OneMinusSrcAlpha;
+			mode = BlendMode::DestinationOut;
 			break;
 		case CompositeOperation::DestinationAtop:
 			sfactor = BlendFactor::OneMinusDstAlpha;
 			dfactor = BlendFactor::SrcAlpha;
+			mode = BlendMode::DestinationAtop;
 			break;
 		case CompositeOperation::Lighter:
 			sfactor = BlendFactor::One;
 			dfactor = BlendFactor::One;
+			mode = BlendMode::Plus;
 			break;
 		case CompositeOperation::Copy:
 			sfactor = BlendFactor::One;
 			dfactor = BlendFactor::Zero;
+			mode = BlendMode::Source;
 			break;
 		case CompositeOperation::Xor:
 			sfactor = BlendFactor::OneMinusDstAlpha;
 			dfactor = BlendFactor::OneMinusSrcAlpha;
+			mode = BlendMode::Xor;
 			break;
 	}
 
@@ -62,7 +74,56 @@ CompositeOperationState CompositeOperationState::fromCompositeOp(CompositeOperat
 	state.dstRGB = dfactor;
 	state.srcAlpha = sfactor;
 	state.dstAlpha = dfactor;
+	state.blendMode = mode;
+	state.isProgrammableBlend = false;
 	return state;
+}
+
+CompositeOperationState CompositeOperationState::fromBlendMode(BlendMode mode) noexcept {
+	CompositeOperationState state;
+	state.blendMode = mode;
+	switch (mode) {
+		case BlendMode::Destination:
+			state.srcRGB = state.srcAlpha = BlendFactor::Zero;
+			state.dstRGB = state.dstAlpha = BlendFactor::One;
+			return state;
+		case BlendMode::SourceOver:
+			state.srcRGB = state.srcAlpha = BlendFactor::One;
+			state.dstRGB = state.dstAlpha = BlendFactor::OneMinusSrcAlpha;
+			return state;
+		case BlendMode::DestinationOver:
+			state.srcRGB = state.srcAlpha = BlendFactor::OneMinusDstAlpha;
+			state.dstRGB = state.dstAlpha = BlendFactor::One;
+			return state;
+		case BlendMode::Plus:
+			state.srcRGB = state.srcAlpha = BlendFactor::One;
+			state.dstRGB = state.dstAlpha = BlendFactor::One;
+			return state;
+		case BlendMode::DestinationOut:
+			state.srcRGB = state.srcAlpha = BlendFactor::Zero;
+			state.dstRGB = state.dstAlpha = BlendFactor::OneMinusSrcAlpha;
+			return state;
+		case BlendMode::SourceAtop:
+			state.srcRGB = state.srcAlpha = BlendFactor::DstAlpha;
+			state.dstRGB = state.dstAlpha = BlendFactor::OneMinusSrcAlpha;
+			return state;
+		case BlendMode::Xor:
+			state.srcRGB = state.srcAlpha = BlendFactor::OneMinusDstAlpha;
+			state.dstRGB = state.dstAlpha = BlendFactor::OneMinusSrcAlpha;
+			return state;
+		case BlendMode::Screen:
+			state.srcRGB = BlendFactor::One;
+			state.dstRGB = BlendFactor::OneMinusSrcColor;
+			state.srcAlpha = BlendFactor::One;
+			state.dstAlpha = BlendFactor::OneMinusSrcAlpha;
+			return state;
+		default:
+			// Remaining Porter-Duff (coverage != pre-scaled) & all advanced modes
+			state.srcRGB = state.srcAlpha = BlendFactor::One;
+			state.dstRGB = state.dstAlpha = BlendFactor::Zero;
+			state.isProgrammableBlend = true;
+			return state;
+	}
 }
 
 // -------------------------------------------------------------

@@ -4,6 +4,7 @@
 #include <optional>
 #include "nisaba/color/color.hpp"
 #include "nisaba/math/rect.hpp"
+#include "nisaba/math/rrect.hpp"
 #include "nisaba/math/point.hpp"
 #include "nisaba/math/transform.hpp"
 #include "nisaba/canvas/pixmap.hpp"
@@ -79,6 +80,26 @@ void draw_round_rect_shadow(
     const Rect& rect,
     float rx,
     float ry,
+    const DropShadow& shadow,
+    Transform transform = Transform(),
+    const Mask* clip_mask = nullptr
+);
+
+/// Renders a blurred drop shadow for an asymmetric 4-corner RRect.
+void draw_rrect_shadow(
+    PixmapMut& dst,
+    const RRect& rrect,
+    const DropShadow& shadow,
+    Transform transform = Transform(),
+    const Mask* clip_mask = nullptr
+);
+
+/// Renders a blurred drop shadow for a circle.
+void draw_circle_shadow(
+    PixmapMut& dst,
+    float cx,
+    float cy,
+    float radius,
     const DropShadow& shadow,
     Transform transform = Transform(),
     const Mask* clip_mask = nullptr

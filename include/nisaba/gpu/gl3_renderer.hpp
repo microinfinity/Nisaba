@@ -18,13 +18,16 @@ public:
 
 	bool init() override;
 	void shutdown() override;
+	void resetState() override;
 
 	bool edgeAntiAlias() const override;
 
 	int createTexture(TextureType type, int width, int height, int imageFlags, const unsigned char* data) override;
+	int createTextureWithStride(TextureType type, int width, int height, int strideBytes, int imageFlags, const unsigned char* data) override;
 	bool deleteTexture(int image) override;
 	bool updateTexture(int image, int x, int y, int width, int height, const unsigned char* data) override;
 	bool getTextureSize(int image, int& outWidth, int& outHeight) override;
+	int textureFlags(int image) const override;
 
 	void viewport(float width, float height, float devicePixelRatio) override;
 	void cancel() override;
@@ -46,6 +49,9 @@ public:
 	                const Scissor& scissor, const float* bounds) override;
 	void restoreClip(int targetDepth) override;
 	void resetClip() override;
+	void pushLayer(const LayerDesc& desc, const Scissor& parentScissor, int parentClipDepth) override;
+	void popLayer(const LayerDesc& desc, const Scissor& parentScissor, int parentClipDepth) override;
+	bool supportsDRRectShader() const noexcept override { return true; }
 
 	// OpenGL specific utilities
 	int createTextureFromNativeHandle(uint64_t handle, int w, int h, int imageFlags) override;

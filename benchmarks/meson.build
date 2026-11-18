@@ -30,11 +30,6 @@ if cairo_dep.found()
   profiler_c_args = []
   profiler_inc = []
 
-  if blend2d_lib.found()
-    profiler_deps += [blend2d_lib, threads_dep, rt_dep]
-    profiler_c_args += ['-DHAVE_BLEND2D=1']
-    profiler_inc += include_directories('../third_party/blend2d', is_system : true)
-  endif
 
   skia_lib = cpp_comp.find_library('skia', dirs : [meson.project_source_root() / 'third_party/skia/out/Release-x64'], required : false)
   fontconfig_dep = dependency('fontconfig', required : false)
@@ -74,9 +69,31 @@ if cairo_dep.found()
     )
   endif
   if skia_lib.found()
+    skia_dir = meson.project_source_root() / 'third_party/skia/out/Release-x64'
+    skottie_lib = cpp_comp.find_library('skottie', dirs : [skia_dir], required : false)
+    sksg_lib = cpp_comp.find_library('sksg', dirs : [skia_dir], required : false)
+    skresources_lib = cpp_comp.find_library('skresources', dirs : [skia_dir], required : false)
+    skshaper_lib = cpp_comp.find_library('skshaper', dirs : [skia_dir], required : false)
+    skunicode_lib = cpp_comp.find_library('skunicode', dirs : [skia_dir], required : false)
+    sk_harfbuzz_lib = cpp_comp.find_library('harfbuzz', dirs : [skia_dir], required : false)
+    sk_icu_lib = cpp_comp.find_library('icu', dirs : [skia_dir], required : false)
+    gpu_prof_deps = [nisaba_dep]
+    gpu_prof_cpp_args = []
+    if skottie_lib.found() and sksg_lib.found() and skresources_lib.found() and skshaper_lib.found() and skunicode_lib.found()
+      gpu_prof_deps += [skottie_lib, sksg_lib, skresources_lib, skshaper_lib, skunicode_lib]
+      if sk_harfbuzz_lib.found()
+        gpu_prof_deps += [sk_harfbuzz_lib]
+      endif
+      if sk_icu_lib.found()
+        gpu_prof_deps += [sk_icu_lib]
+      endif
+      gpu_prof_cpp_args += ['-DHAVE_SKOTTIE=1']
+    endif
+    gpu_prof_deps += [skia_lib, fontconfig_dep, gl_dep, zlib_dep, nisaba_backend_os_dep, egl_dep, dl_dep]
     gpu_micro_profiler_exe = executable('gpu_micro_profiler',
       'gpu_micro_profiler.cpp',
-      dependencies : [nisaba_dep, skia_lib, fontconfig_dep, gl_dep, zlib_dep, nisaba_backend_os_dep, egl_dep, dl_dep],
+      dependencies : gpu_prof_deps,
+      cpp_args : gpu_prof_cpp_args,
       include_directories : skia_inc
     )
     benchmark_runtime_shaders_exe = executable('benchmark_runtime_shaders',

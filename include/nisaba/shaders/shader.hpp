@@ -93,6 +93,7 @@ protected:
     std::array<PremultipliedColorU8, RAMP_SIZE> ramp_{};
 
     void update_inv() noexcept;
+    void update_alpha_flags() noexcept;
     void bake_ramp() noexcept;
 };
 
@@ -161,8 +162,13 @@ public:
     void shade_span(float x, float y, uint32_t count, PremultipliedColorU8* dst) const noexcept;
 
     [[nodiscard]] bool is_simple_radial() const noexcept { return !is_2point_; }
+    [[nodiscard]] bool is_2point() const noexcept { return is_2point_; }
     [[nodiscard]] float radius() const noexcept { return radius_; }
     [[nodiscard]] Point center() const noexcept { return center_; }
+    [[nodiscard]] Point start() const noexcept { return start_; }
+    [[nodiscard]] float start_radius() const noexcept { return start_radius_; }
+    [[nodiscard]] Point end() const noexcept { return end_; }
+    [[nodiscard]] float end_radius() const noexcept { return end_radius_; }
     [[nodiscard]] PremultipliedColorU8 pad_color() const noexcept { return pad_color_; }
     [[nodiscard]] static constexpr size_t ramp_sq_size() noexcept { return RAMP_SQ_SIZE; }
     [[nodiscard]] const std::array<PremultipliedColorU8, 1024>& ramp_sq() const noexcept { return ramp_sq_; }
@@ -198,6 +204,10 @@ public:
     [[nodiscard]] Color sample(float x, float y) const noexcept;
     [[nodiscard]] PremultipliedColor sample_premul(float x, float y) const noexcept;
 
+    [[nodiscard]] Point center() const noexcept { return center_; }
+    [[nodiscard]] float start_angle_rad() const noexcept { return start_angle_rad_; }
+    [[nodiscard]] float inv_angle_range() const noexcept { return inv_angle_range_; }
+
 private:
     Point center_{};
     float start_angle_rad_{0.0f};
@@ -210,7 +220,7 @@ public:
     Pattern(
         PixmapRef pixmap,
         SpreadMode mode = SpreadMode::Pad,
-        FilterQuality quality = FilterQuality::Nearest,
+        FilterQuality quality = FilterQuality::Bilinear,
         float opacity = 1.0f,
         Transform transform = Transform()
     ) noexcept;
@@ -233,15 +243,15 @@ public:
 
 private:
     PixmapRef pixmap_{};
+    std::shared_ptr<const Pixmap> rgba_storage_{};
     SpreadMode mode_{SpreadMode::Pad};
-    FilterQuality quality_{FilterQuality::Nearest};
+    FilterQuality quality_{FilterQuality::Bilinear};
     float opacity_{1.0f};
     bool is_opaque_{false};
     Transform transform_{};
     std::optional<Transform> inv_ts_{};
 
     void update_inv() noexcept;
-    [[nodiscard]] float map_coord(float v, uint32_t length) const noexcept;
 };
 
 class TwoPointConicalGradient : public Gradient {
@@ -347,6 +357,7 @@ public:
 
     [[nodiscard]] const LinearGradient& linear_gradient() const noexcept;
     [[nodiscard]] const RadialGradient& radial_gradient() const noexcept;
+    [[nodiscard]] const SweepGradient& sweep_gradient() const noexcept;
     [[nodiscard]] const TwoPointConicalGradient& conical_gradient() const noexcept;
     [[nodiscard]] const Pattern& pattern() const noexcept;
     [[nodiscard]] const ComposeShader& compose_shader() const noexcept;

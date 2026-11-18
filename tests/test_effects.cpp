@@ -166,6 +166,71 @@ void test_glass_panel() {
     std::cout << "  Glassmorphism panel verified." << std::endl;
 }
 
+void test_color_effect_and_image_filter() {
+    std::cout << "[Test] ColorEffect, anisotropic blur, and RRect/Circle shadows..." << std::endl;
+
+    // 1. ColorEffect modes, transfers, and composition
+    const Color src = Color::from_rgba8(120, 180, 60, 255);
+    const auto atop = ColorEffect::mode(Color::from_rgba8(200, 40, 40, 128), BlendMode::SourceAtop);
+    const Color c_atop = atop.transform(src);
+    assert(c_atop.alpha() > 0.99f && c_atop.red() > src.red() && c_atop.green() < src.green());
+
+    const auto mult = ColorEffect::mode(Color::from_rgba8(128, 255, 128, 255), BlendMode::Multiply);
+    const Color c_mult = mult.transform(src);
+    assert(c_mult.red() < src.red() && std::abs(c_mult.green() - src.green()) < 0.02f);
+
+    const auto to_lin = ColorEffect::srgb_to_linear();
+    const auto to_srgb = ColorEffect::linear_to_srgb();
+    const Color lin = to_lin.transform(Color::from_rgba8(128, 128, 128, 255));
+    assert(lin.red() < 0.30f && lin.red() > 0.15f);
+    const Color rt = to_srgb.transform(lin);
+    assert(std::abs(rt.red() - (128.0f / 255.0f)) < 0.02f);
+
+    auto comp = ColorEffect::compose(atop, ColorEffect::grayscale());
+    assert(comp.has_value() && comp->has_matrix && comp->has_blend);
+
+    // 2. Anisotropic gaussian_blur_pixmap_xy
+    auto blur_pm = Pixmap::allocate(64, 64);
+    assert(blur_pm.has_value());
+    blur_pm->fill(Color::TRANSPARENT);
+    {
+        Canvas c(*blur_pm);
+        Paint wp(Color::WHITE);
+        c.fill_rect(*Rect::from_xywh(28.0f, 28.0f, 8.0f, 8.0f), wp);
+    }
+    auto bmut = blur_pm->as_mut();
+    gaussian_blur_pixmap_xy(bmut, 5.0f, 0.5f);
+    // Horizontal blur spreads further at (20, 32) than vertical blur at (32, 20)
+    auto px_horiz = blur_pm->as_ref().pixel(20, 32);
+    auto px_vert  = blur_pm->as_ref().pixel(32, 20);
+    assert(px_horiz.has_value() && px_vert.has_value());
+    assert(px_horiz->alpha() > px_vert->alpha());
+
+    // 3. Asymmetric RRect shadow and Circle shadow via Canvas
+    auto sh_pm = Pixmap::allocate(120, 120);
+    assert(sh_pm.has_value());
+    sh_pm->fill(Color::WHITE);
+    {
+        Canvas c(*sh_pm);
+        auto rr = RRect::from_xywh(20.0f, 20.0f, 60.0f, 50.0f, BorderRadius::only(22.0f, 0.0f, 14.0f, 4.0f));
+        assert(rr.has_value());
+        DropShadow ds(6.0f, 8.0f, 3.5f, Color::from_rgba8(0, 0, 0, 180));
+        c.draw_rrect_with_shadow(*rr, Paint(Color::from_rgba8(40, 100, 220, 255)), ds);
+        c.draw_circle_with_shadow(90.0f, 90.0f, 12.0f, Paint(Color::from_rgba8(220, 80, 40, 255)), ds);
+    }
+    // Rounded TL (22px) -> pixel (22, 22) is outside rounded corner and should remain light/white-ish;
+    // sharp TR (0px) -> pixel (78, 22) is inside blue rrect fill!
+    auto p_tl = sh_pm->as_ref().pixel(22, 22);
+    auto p_tr = sh_pm->as_ref().pixel(78, 22);
+    auto p_sh = sh_pm->as_ref().pixel(50, 76);
+    assert(p_tl.has_value() && p_tr.has_value() && p_sh.has_value());
+    assert(p_tr->blue() > 180 && p_tr->red() < 80);
+    assert(p_tl->red() > 200);
+    assert(p_sh->red() < 250);
+
+    std::cout << "  ColorEffect, anisotropic blur, and RRect/Circle shadows passed." << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Nisaba Effects & Shadows Unit Tests ===" << std::endl;
     test_box_blur_radii();
@@ -174,6 +239,7 @@ int main() {
     test_color_filters();
     test_drop_shadow();
     test_glass_panel();
+    test_color_effect_and_image_filter();
     std::cout << "All visual effects tests passed successfully!" << std::endl;
     return 0;
 }

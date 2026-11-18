@@ -142,6 +142,14 @@ struct Transform {
         return post_concat(from_scale(sx_, sy_));
     }
 
+    Transform pre_skew(float kx, float ky) const noexcept {
+        return pre_concat(from_skew(kx, ky));
+    }
+
+    Transform post_skew(float kx, float ky) const noexcept {
+        return post_concat(from_skew(kx, ky));
+    }
+
     Transform pre_translate(float tx_, float ty_) const noexcept {
         return pre_concat(from_translate(tx_, ty_));
     }

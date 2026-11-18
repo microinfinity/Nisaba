@@ -11,9 +11,8 @@
 
 #include "nisaba/gpu/gl3_renderer.hpp"
 #include "nisaba/gpu/runtime_effect.hpp"
-
-#include <GL/glew.h>
-#include <GL/gl.h>
+#include "gl_headers.hpp"
+#include "shader_uniforms.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -30,24 +29,9 @@ namespace {
 enum UniformLoc {
 	LocViewSize = 0,
 	LocTex      = 1,
-	LocParams   = 2,
-	MaxLocs     = 3
-};
-
-enum ShaderType {
-	ShaderFillGrad      = 0,
-	ShaderFillImg       = 1,
-	ShaderSimple        = 2,
-	ShaderImg           = 3,
-	ShaderSolid         = 4,
-	ShaderLinearGrad    = 5,
-	ShaderRadialGrad    = 6,
-	ShaderCircle        = 7,
-	ShaderRect          = 8,
-	ShaderRRect         = 9,
-	ShaderRing          = 10,
-	ShaderRRectGradient = 11,
-	MaxShaders          = 12
+	LocDstTex   = 2,
+	LocParams   = 3,
+	MaxLocs     = 4
 };
 
 constexpr int ParamsBinding = 0;
@@ -56,7 +40,7 @@ struct GLShader {
 	GLuint prog{0};
 	GLuint frag{0};
 	GLuint vert{0};
-	GLint loc[MaxLocs]{0, 0, 0};
+	GLint loc[MaxLocs]{0, 0, 0, 0};
 };
 
 struct Texture {
@@ -82,22 +66,52 @@ enum class CallType {
 	Stroke,
 	Triangles,
 	Clip,
-	RestoreClip
+	RestoreClip,
+	PushLayer,
+	PopLayer
+};
+
+enum class ShaderBucket : uint8_t {
+	FastCore = 0,
+	SimpleColor,
+	RRectFast,
+	DRRectFast,
+	ImgFast,
+	RingFast,
+	LinearGradFast,
+	RadialGradFast,
+	MultiGradLutFast,
+	MultiGradFast,
+	ShadowFast,
+	PerspectiveImgFast,
+	BlendFast,
+	EffectsFull,
+	ZeroUboSolid,
+	ZeroUboCircle,
+	ZeroUboRect
 };
 
 struct Call {
 	CallType type{CallType::None};
+	ShaderBucket bucket{ShaderBucket::FastCore};
 	int image{0};
 	int pathOffset{0};
 	int pathCount{0};
 	int triangleOffset{0};
 	int triangleCount{0};
-	int uniformOffset{0};
+	int uniformOffset{-1};
+	int uniformStride{0};
+	int layerIndex{-1};
 	Blend blendFunc;
+	bool programmableBlend{false};
 	bool useStencil{false};
+	bool evenOdd{false};
+	bool hasCallBounds{false};
 	int scissorRect[4]{-1, -1, -1, -1};
+	float callBounds[4]{0.0f, 0.0f, 0.0f, 0.0f};
 	int clipDepth{0};
 	Winding winding{Winding::CounterClockwise};
+	Transform2D paintXform{Transform2D::identity()};
 	std::shared_ptr<nisaba::gpu::Shader> customShader{nullptr};
 };
 
@@ -107,25 +121,6 @@ struct GLPath {
 	int strokeOffset{0};
 	int strokeCount{0};
 };
-
-// std140 layout matching GLSL layout(std140) uniform NisabaShaderParams
-struct NisabaShaderUniforms {
-	float scissorMat[12]; // 3 x vec4
-	float paintMat[12];   // 3 x vec4
-	Color innerCol;       // 4 floats (premultiplied)
-	Color outerCol;       // 4 floats (premultiplied)
-	float scissorExt[2];
-	float scissorScale[2];
-	float extent[2];
-	float radius;
-	float feather;
-	float strokeMult;
-	float strokeThr;
-	int texType;
-	int type;
-};
-
-using FragUniforms = NisabaShaderUniforms;
 
 static void dumpShaderError(GLuint shader, const char* name, const char* type) {
 	GLchar str[512 + 1];
@@ -223,11 +218,8 @@ static void deleteShader(GLShader& shader) {
 static void getUniforms(GLShader& shader) {
 	shader.loc[LocViewSize] = glGetUniformLocation(shader.prog, "viewSize");
 	shader.loc[LocTex]      = glGetUniformLocation(shader.prog, "tex");
+	shader.loc[LocDstTex]   = glGetUniformLocation(shader.prog, "dstTex");
 	shader.loc[LocParams]   = glGetUniformBlockIndex(shader.prog, "NisabaShaderParams");
-}
-
-static void xformToMat3x4(float* m3, const Transform2D& t) {
-	t.toMat3x4(m3);
 }
 
 static GLenum convertBlendFactor(BlendFactor factor) {
@@ -271,8 +263,22 @@ static Blend convertBlend(const CompositeOperationState& op) {
 struct GL3Renderer::Impl {
 	int flags{0};
 	GLShader shader;
+	GLShader rrectShader;
+	GLShader drrectShader;
+	GLShader imgShader;
+	GLShader ringShader;
+	GLShader linearGradShader;
+	GLShader radialGradShader;
+	GLShader multiGradLutShader;
+	GLShader multiGradShader;
+	GLShader shadowShader;
+	GLShader perspectiveImgShader;
+	GLShader blendFastShader;
+	GLShader effectsShader;
 	GLShader stencilStrokeShader;
+	GLShader stencilEffectsShader;
 	GLShader simpleShader;
+	GLShader simpleColorShader;
 	GLShader solidVertShader;
 	GLShader circleVertShader;
 	GLShader rectVertShader;
@@ -287,6 +293,7 @@ struct GL3Renderer::Impl {
 	GLuint vertBuf{0};
 	GLuint fragBuf{0};
 	int fragSize{0};
+	int fragFastSize{0};
 
 	// Per-frame batches
 	std::vector<Call> calls;
@@ -302,6 +309,7 @@ struct GL3Renderer::Impl {
 	GLuint stencilFuncMaskVal{0xffffffff};
 	Blend blendState;
 	int boundUniformOffset{-1};
+	size_t boundUniformSize{0};
 	int lastTextureId{0};
 	Texture* lastTexturePtr{nullptr};
 	size_t fragBufCap{0};
@@ -312,9 +320,399 @@ struct GL3Renderer::Impl {
 	int baseUboOffset{0};
 	bool scissorEnabled{false};
 	bool stencilEnabled{false};
+	bool isGLES{false};
+	bool hasSamplerObjects{false};
+	GLuint samplerCache[2][3]{{0, 0, 0}, {0, 0, 0}}; // [0=nearest, 1=linear][0=clamp, 1=repeat, 2=mirror]
+	GLuint boundSampler{0};
 	int currentScissor[4]{-1, -1, -1, -1};
 	int lastUniformOffset{-1};
+	size_t lastUniformUboBytes{0};
 	int currentClipDepth{0};
+	int flushedClipDepth{0};
+	bool flushedTargetQueried{false};
+	GLuint baseDrawFbo{0};
+	GLuint baseReadFbo{0};
+	GLint baseViewport[4]{0, 0, 0, 0};
+	GLuint dstSnapFbo{0};
+	GLuint dstSnapTex{0};
+	int dstSnapW{0};
+	int dstSnapH{0};
+
+	struct LayerFbo {
+		GLuint fbo{0};
+		GLuint colorTex{0};
+		GLuint depthStencilRb{0};
+		int w{0};
+		int h{0};
+		bool inUse{false};
+	};
+	struct RuntimeLayer {
+		GLuint parentFbo{0};
+		int parentClipDepth{0};
+		int poolIndex{-1};
+	};
+	std::vector<LayerDesc> layerDescs;
+	std::vector<LayerFbo> layerPool;
+	std::vector<RuntimeLayer> activeLayers;
+
+	GLShader blurShader;
+	GLint locBlurTex{-1};
+	GLint locBlurTexelOffset{-1};
+	GLint locBlurRadius{-1};
+	GLint locBlurSigma{-1};
+	GLint locBlurUvBounds{-1};
+	GLuint blurTierFbo[3][2]{{0, 0}, {0, 0}, {0, 0}};
+	GLuint blurTierTex[3][2]{{0, 0}, {0, 0}, {0, 0}};
+	int blurTierW[3]{0, 0, 0};
+	int blurTierH[3]{0, 0, 0};
+
+	struct BlurResult {
+		GLuint fbo{0};
+		GLuint tex{0};
+		int scale{1};
+		int bw{0};
+		int bh{0};
+	};
+
+	void ensureBlurTier(int tier, int bw, int bh) {
+		if (blurTierW[tier] == bw && blurTierH[tier] == bh &&
+		    blurTierFbo[tier][0] != 0 && blurTierFbo[tier][1] != 0) {
+			return;
+		}
+		for (int k = 0; k < 2; ++k) {
+			if (blurTierFbo[tier][k] == 0) glGenFramebuffers(1, &blurTierFbo[tier][k]);
+			if (blurTierTex[tier][k] == 0) glGenTextures(1, &blurTierTex[tier][k]);
+			glBindTexture(GL_TEXTURE_2D, blurTierTex[tier][k]);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, bw, bh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			glBindFramebuffer(GL_FRAMEBUFFER, blurTierFbo[tier][k]);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, blurTierTex[tier][k], 0);
+		}
+		blurTierW[tier] = bw;
+		blurTierH[tier] = bh;
+	}
+
+	int acquireLayerFbo(int w, int h) {
+		for (size_t i = 0; i < layerPool.size(); ++i) {
+			if (!layerPool[i].inUse && layerPool[i].w == w && layerPool[i].h == h) {
+				layerPool[i].inUse = true;
+				return static_cast<int>(i);
+			}
+		}
+		LayerFbo lf;
+		lf.w = w;
+		lf.h = h;
+		lf.inUse = true;
+		glGenTextures(1, &lf.colorTex);
+		glBindTexture(GL_TEXTURE_2D, lf.colorTex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+		glGenRenderbuffers(1, &lf.depthStencilRb);
+		glBindRenderbuffer(GL_RENDERBUFFER, lf.depthStencilRb);
+		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+
+		glGenFramebuffers(1, &lf.fbo);
+		glBindFramebuffer(GL_FRAMEBUFFER, lf.fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, lf.colorTex, 0);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, lf.depthStencilRb);
+
+		glBindTexture(GL_TEXTURE_2D, boundTexture);
+		layerPool.push_back(lf);
+		return static_cast<int>(layerPool.size()) - 1;
+	}
+
+	BlurResult gaussianBlurToFbo(GLuint srcFbo, GLuint srcTex, int w, int h,
+	                             float sigmaX, float sigmaY,
+	                             bool hasRoi = false,
+	                             int roiX0 = 0, int roiY0 = 0, int roiX1 = 0, int roiY1 = 0) {
+		BlurResult res{};
+		if (blurShader.prog == 0 || srcTex == 0 || w <= 0 || h <= 0) return res;
+
+		int ox0 = hasRoi ? std::clamp(roiX0, 0, w) : 0;
+		int oy0 = hasRoi ? std::clamp(roiY0, 0, h) : 0;
+		int ox1 = hasRoi ? std::clamp(roiX1, 0, w) : w;
+		int oy1 = hasRoi ? std::clamp(roiY1, 0, h) : h;
+		if (ox1 <= ox0 || oy1 <= oy0) {
+			ox0 = 0; oy0 = 0; ox1 = w; oy1 = h;
+		}
+
+		int ds = 1;
+		int tier = 0;
+		if (srcFbo != 0 && sigmaX >= 9.0f && sigmaY >= 9.0f &&
+		    (w % 4 == 0) && (h % 4 == 0) && w >= 64 && h >= 64) {
+			ds = 4;
+			tier = 2;
+		} else if (srcFbo != 0 && sigmaX >= 3.5f && sigmaY >= 3.5f &&
+		           (w % 2 == 0) && (h % 2 == 0) && w >= 32 && h >= 32) {
+			ds = 2;
+			tier = 1;
+		}
+
+		const int bw = w / ds;
+		const int bh = h / ds;
+		if (ds == 4) {
+			ensureBlurTier(1, w / 2, h / 2);
+		}
+		ensureBlurTier(tier, bw, bh);
+
+		const int padX = (sigmaX > 0.001f) ? (static_cast<int>(std::ceil(sigmaX * 3.0f)) + 4) : 2;
+		const int padY = (sigmaY > 0.001f) ? (static_cast<int>(std::ceil(sigmaY * 3.0f)) + 4) : 2;
+		int sx0 = std::clamp(ox0 - padX, 0, w);
+		int sy0 = std::clamp(oy0 - padY, 0, h);
+		int sx1 = std::clamp(ox1 + padX, 0, w);
+		int sy1 = std::clamp(oy1 + padY, 0, h);
+		if (ds > 1) {
+			sx0 = (sx0 / ds) * ds;
+			sy0 = (sy0 / ds) * ds;
+			sx1 = std::min(w, ((sx1 + ds - 1) / ds) * ds);
+			sy1 = std::min(h, ((sy1 + ds - 1) / ds) * ds);
+		}
+
+		GLint prevVp[4]{0, 0, w, h};
+		glGetIntegerv(GL_VIEWPORT, prevVp);
+		glDisable(GL_SCISSOR_TEST);
+		if (stencilEnabled) glDisable(GL_STENCIL_TEST);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_BLEND);
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+		GLuint pass1InputTex = srcTex;
+		if (ds == 2) {
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, srcFbo);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blurTierFbo[1][1]);
+			glBlitFramebuffer(sx0, sy0, sx1, sy1, sx0 / 2, sy0 / 2, sx1 / 2, sy1 / 2, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+			pass1InputTex = blurTierTex[1][1];
+		} else if (ds == 4) {
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, srcFbo);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blurTierFbo[1][1]);
+			glBlitFramebuffer(sx0, sy0, sx1, sy1, sx0 / 2, sy0 / 2, sx1 / 2, sy1 / 2, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, blurTierFbo[1][1]);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blurTierFbo[2][1]);
+			glBlitFramebuffer(sx0 / 2, sy0 / 2, sx1 / 2, sy1 / 2, sx0 / 4, sy0 / 4, sx1 / 4, sy1 / 4, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+			pass1InputTex = blurTierTex[2][1];
+		}
+
+		useProgramCached(blurShader.prog);
+		glUniform1i(locBlurTex, 0);
+		glActiveTexture(GL_TEXTURE0);
+		if (hasSamplerObjects && boundSampler != 0) {
+			glBindSampler(0, 0);
+			boundSampler = 0;
+		}
+		glViewport(0, 0, bw, bh);
+
+		const int dx0 = std::clamp(ox0 / ds - 1, 0, bw);
+		const int dy0 = std::clamp(oy0 / ds - 1, 0, bh);
+		const int dx1 = std::clamp((ox1 + ds - 1) / ds + 1, 0, bw);
+		const int dy1 = std::clamp((oy1 + ds - 1) / ds + 1, 0, bh);
+		const int p1y0 = std::clamp(sy0 / ds, 0, bh);
+		const int p1y1 = std::clamp((sy1 + ds - 1) / ds, 0, bh);
+		const int srcDx0 = sx0 / ds;
+		const int srcDx1 = (sx1 + ds - 1) / ds;
+
+		const float invBw = 1.0f / static_cast<float>(bw);
+		const float invBh = 1.0f / static_cast<float>(bh);
+		const float esx = sigmaX / static_cast<float>(ds);
+		const float esy = sigmaY / static_cast<float>(ds);
+
+		auto runPass = [&](GLuint inTex, GLuint dstFbo, float offX, float offY, float sigma,
+		                   int scX0, int scY0, int scX1, int scY1,
+		                   float uvMinX, float uvMinY, float uvMaxX, float uvMaxY) {
+			if (scX1 <= scX0 || scY1 <= scY0) return;
+			int rad = 0;
+			float step = 1.0f;
+			float effSigma = sigma;
+			if (sigma > 0.001f) {
+				float idealRad = std::ceil(sigma * 2.5f);
+				if (idealRad <= 32.0f) {
+					rad = static_cast<int>(idealRad);
+				} else {
+					rad = 32;
+					step = idealRad / 32.0f;
+					effSigma = sigma / step;
+				}
+			}
+			glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(scX0, scY0, scX1 - scX0, scY1 - scY0);
+			glBindTexture(GL_TEXTURE_2D, inTex);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glUniform2f(locBlurTexelOffset, offX * step, offY * step);
+			glUniform1i(locBlurRadius, rad);
+			glUniform1f(locBlurSigma, effSigma);
+			if (locBlurUvBounds >= 0) {
+				glUniform4f(locBlurUvBounds, uvMinX, uvMinY, uvMaxX, uvMaxY);
+			}
+			glDrawArrays(GL_TRIANGLES, 0, 3);
+		};
+
+		// Pass 1: Horizontal pass1InputTex -> blurTierFbo[tier][0]
+		runPass(pass1InputTex, blurTierFbo[tier][0], invBw, 0.0f, esx,
+		        dx0, p1y0, dx1, p1y1,
+		        (static_cast<float>(srcDx0) + 0.5f) * invBw,
+		        (static_cast<float>(p1y0) + 0.5f) * invBh,
+		        (static_cast<float>(srcDx1) - 0.5f) * invBw,
+		        (static_cast<float>(p1y1) - 0.5f) * invBh);
+
+		// Pass 2: Vertical blurTierTex[tier][0] -> blurTierFbo[tier][1]
+		runPass(blurTierTex[tier][0], blurTierFbo[tier][1], 0.0f, invBh, esy,
+		        dx0, dy0, dx1, dy1,
+		        (static_cast<float>(dx0) + 0.5f) * invBw,
+		        (static_cast<float>(p1y0) + 0.5f) * invBh,
+		        (static_cast<float>(dx1) - 0.5f) * invBw,
+		        (static_cast<float>(p1y1) - 0.5f) * invBh);
+
+		glViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
+		glEnable(GL_BLEND);
+		glEnable(GL_CULL_FACE);
+		if (scissorEnabled) {
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(currentScissor[0], currentScissor[1], currentScissor[2], currentScissor[3]);
+		} else {
+			glDisable(GL_SCISSOR_TEST);
+		}
+		if (stencilEnabled) glEnable(GL_STENCIL_TEST);
+		boundTexture = 0;
+		res.fbo = blurTierFbo[tier][1];
+		res.tex = blurTierTex[tier][1];
+		res.scale = ds;
+		res.bw = bw;
+		res.bh = bh;
+		return res;
+	}
+
+	void ensureBaseTargetInfo() {
+		if (flushedTargetQueried) return;
+		GLint drawFbo = 0;
+		GLint readFbo = 0;
+		glGetIntegerv(GL_VIEWPORT, baseViewport);
+		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
+		glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
+		baseDrawFbo = static_cast<GLuint>(drawFbo);
+		baseReadFbo = static_cast<GLuint>(readFbo);
+		flushedTargetQueried = true;
+	}
+
+	void captureDstSnapshot(bool hasBounds, const float* bounds, const int* scissor) {
+		ensureBaseTargetInfo();
+		const bool inLayer = !activeLayers.empty();
+		const int vpX = inLayer ? 0 : baseViewport[0];
+		const int vpY = inLayer ? 0 : baseViewport[1];
+		const int vpW = inLayer ? layerPool[activeLayers.back().poolIndex].w
+		                        : ((baseViewport[2] > 0) ? baseViewport[2] : std::max(1, static_cast<int>(view[0])));
+		const int vpH = inLayer ? layerPool[activeLayers.back().poolIndex].h
+		                        : ((baseViewport[3] > 0) ? baseViewport[3] : std::max(1, static_cast<int>(view[1])));
+		const int snapW = std::max(1, vpX + vpW);
+		const int snapH = std::max(1, vpY + vpH);
+		const GLuint curDrawFbo = inLayer ? layerPool[activeLayers.back().poolIndex].fbo : baseDrawFbo;
+
+		if (dstSnapFbo == 0 || dstSnapTex == 0 || dstSnapW != snapW || dstSnapH != snapH) {
+			if (dstSnapFbo == 0) glGenFramebuffers(1, &dstSnapFbo);
+			if (dstSnapTex == 0) glGenTextures(1, &dstSnapTex);
+			glActiveTexture(GL_TEXTURE1);
+			glBindTexture(GL_TEXTURE_2D, dstSnapTex);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, snapW, snapH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			glBindFramebuffer(GL_FRAMEBUFFER, dstSnapFbo);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstSnapTex, 0);
+			dstSnapW = snapW;
+			dstSnapH = snapH;
+			glActiveTexture(GL_TEXTURE0);
+		}
+
+		int px0 = 0;
+		int py0 = 0;
+		int px1 = snapW;
+		int py1 = snapH;
+		if (hasBounds && bounds != nullptr && view[0] > 0.0f && view[1] > 0.0f) {
+			const float sx = static_cast<float>(vpW) / view[0];
+			const float sy = static_cast<float>(vpH) / view[1];
+			px0 = std::clamp(vpX + static_cast<int>(std::floor(bounds[0] * sx)) - 2, 0, snapW);
+			px1 = std::clamp(vpX + static_cast<int>(std::ceil(bounds[2] * sx)) + 2, 0, snapW);
+			const int topY = vpY + vpH - static_cast<int>(std::ceil(bounds[3] * sy)) - 2;
+			const int botY = vpY + vpH - static_cast<int>(std::floor(bounds[1] * sy)) + 2;
+			py0 = std::clamp(topY, 0, snapH);
+			py1 = std::clamp(botY, 0, snapH);
+		}
+		if (scissor != nullptr && scissor[0] >= 0) {
+			px0 = std::max(px0, scissor[0]);
+			py0 = std::max(py0, scissor[1]);
+			px1 = std::min(px1, scissor[0] + scissor[2]);
+			py1 = std::min(py1, scissor[1] + scissor[3]);
+		}
+
+		if (px1 > px0 && py1 > py0) {
+			if (scissorEnabled) {
+				glDisable(GL_SCISSOR_TEST);
+			}
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, curDrawFbo);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dstSnapFbo);
+			glBlitFramebuffer(px0, py0, px1, py1, px0, py0, px1, py1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, baseReadFbo);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, curDrawFbo);
+			if (scissorEnabled) {
+				glEnable(GL_SCISSOR_TEST);
+			}
+		} else {
+			glBindFramebuffer(GL_FRAMEBUFFER, curDrawFbo);
+		}
+
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, dstSnapTex);
+		if (hasSamplerObjects) glBindSampler(1, 0);
+		glActiveTexture(GL_TEXTURE0);
+	}
+
+	void captureDstSnapshotForCall(const Call& call) {
+		captureDstSnapshot(call.hasCallBounds, call.callBounds, call.scissorRect);
+	}
+
+	void resetCachedGLState() {
+		activeProg = 0;
+		boundTexture = 0;
+		boundSampler = 0;
+		lastTextureId = 0;
+		lastTexturePtr = nullptr;
+		stencilEnabled = false;
+		stencilMaskVal = 0xffffffff;
+		stencilFuncMode = GL_ALWAYS;
+		stencilFuncRefVal = 0;
+		stencilFuncMaskVal = 0xffffffff;
+		blendState = Blend{};
+		boundUniformOffset = -1;
+		boundUniformSize = 0;
+		lastUniformOffset = -1;
+		lastUniformUboBytes = 0;
+		flushedTargetQueried = false;
+		scissorEnabled = false;
+		currentScissor[0] = -1;
+		currentScissor[1] = -1;
+		currentScissor[2] = -1;
+		currentScissor[3] = -1;
+	}
+
+	void clearBatchBuffers() {
+		verts.clear();
+		paths.clear();
+		calls.clear();
+		uniforms.clear();
+		layerDescs.clear();
+		boundUniformOffset = -1;
+		boundUniformSize = 0;
+		lastUniformOffset = -1;
+		lastUniformUboBytes = 0;
+	}
 
 	void useProgramCached(GLuint prog) {
 		if (activeProg != prog) {
@@ -408,66 +806,275 @@ struct GL3Renderer::Impl {
 		return false;
 	}
 
-	int allocFragUniforms(int n) {
+	static constexpr bool bucketUsesZeroUbo(ShaderBucket b) noexcept {
+		return b == ShaderBucket::ZeroUboSolid ||
+		       b == ShaderBucket::ZeroUboCircle ||
+		       b == ShaderBucket::ZeroUboRect;
+	}
+
+	static constexpr bool bucketNeedsFullUbo(ShaderBucket b) noexcept {
+		return b == ShaderBucket::MultiGradLutFast ||
+		       b == ShaderBucket::MultiGradFast ||
+		       b == ShaderBucket::ShadowFast ||
+		       b == ShaderBucket::PerspectiveImgFast ||
+		       b == ShaderBucket::BlendFast ||
+		       b == ShaderBucket::EffectsFull;
+	}
+
+	ShaderBucket classifyPaintBucket(const FragUniforms& f, int image, bool hasCustomShader, bool allowZeroUbo = true) const noexcept {
+		if (hasCustomShader) {
+			return ShaderBucket::EffectsFull;
+		}
+		if (f.type == ShaderPerspectiveImg) {
+			if (f.blendMode == 0 && f.hasColorMatrix == 0 && f.colorTransfer == 0 && f.colorBlendEnabled == 0) {
+				return ShaderBucket::PerspectiveImgFast;
+			}
+			return ShaderBucket::EffectsFull;
+		}
+		if (f.blendMode != 0) {
+			if (f.hasColorMatrix == 0 && f.colorTransfer == 0 && f.colorBlendEnabled == 0 &&
+			    (f.type == ShaderSolid || f.type == ShaderSimple || f.type == ShaderCircle ||
+			     f.type == ShaderRect || f.type == ShaderRRect || f.type == ShaderImg)) {
+				return ShaderBucket::BlendFast;
+			}
+			return ShaderBucket::EffectsFull;
+		}
+		if (uniformUsesFullEffectsShader(f)) {
+			return ShaderBucket::EffectsFull;
+		}
+		if (f.type == ShaderMultiGrad) {
+			return (f.gradStopCount < 0) ? ShaderBucket::MultiGradLutFast : ShaderBucket::MultiGradFast;
+		}
+		if (f.type == ShaderRRectShadow) return ShaderBucket::ShadowFast;
+		if (allowZeroUbo && image == 0 && f.scissorExt[0] < 0.0f) {
+			if (f.type == ShaderSolid && f.strokeMult == 1.0f && solidVertShader.prog != 0) return ShaderBucket::ZeroUboSolid;
+			if (f.type == ShaderCircle && circleVertShader.prog != 0) return ShaderBucket::ZeroUboCircle;
+			if (f.type == ShaderRect && rectVertShader.prog != 0) return ShaderBucket::ZeroUboRect;
+		}
+		if (f.type == ShaderSimple) return ShaderBucket::SimpleColor;
+		if (f.type == ShaderRRect) return ShaderBucket::RRectFast;
+		if (f.type == ShaderDRRect) return ShaderBucket::DRRectFast;
+		if (f.type == ShaderImg) return ShaderBucket::ImgFast;
+		if (f.type == ShaderRing) return ShaderBucket::RingFast;
+		if (f.type == ShaderLinearGrad) return ShaderBucket::LinearGradFast;
+		if (f.type == ShaderRadialGrad) return ShaderBucket::RadialGradFast;
+		return ShaderBucket::FastCore;
+	}
+
+	int bucketStride(ShaderBucket b) const noexcept {
+		if (bucketUsesZeroUbo(b)) return 0;
+		return bucketNeedsFullUbo(b) ? fragSize : fragFastSize;
+	}
+
+	int allocFragUniforms(int n, int stride) {
 		int ret = static_cast<int>(uniforms.size());
-		uniforms.resize(ret + n * fragSize, 0);
+		uniforms.resize(ret + n * stride, 0);
 		return ret;
+	}
+
+	int allocFragUniforms(int n) {
+		return allocFragUniforms(n, fragSize);
 	}
 
 	FragUniforms* fragUniformPtr(int offset) {
 		return reinterpret_cast<FragUniforms*>(&uniforms[offset]);
 	}
 
+	int storeOrReuseUniform(const FragUniforms& src, ShaderBucket bucket) {
+		const size_t copyBytes = bucketNeedsFullUbo(bucket) ? sizeof(FragUniforms) : kFastUniformBytes;
+		const int stride = bucketNeedsFullUbo(bucket) ? fragSize : fragFastSize;
+		if (lastUniformOffset >= 0 && lastUniformUboBytes == copyBytes && !uniforms.empty() &&
+		    std::memcmp(fragUniformPtr(lastUniformOffset), &src, copyBytes) == 0) {
+			return lastUniformOffset;
+		}
+		int off = allocFragUniforms(1, stride);
+		std::memcpy(&uniforms[off], &src, copyBytes);
+		lastUniformOffset = off;
+		lastUniformUboBytes = copyBytes;
+		return off;
+	}
+
 	Texture* dummyTexPtr{nullptr};
 
-	void setUniforms(int uniformOffset, int image) {
-		const FragUniforms* f = fragUniformPtr(uniformOffset);
-		if (image == 0 && f->scissorExt[0] < 0.0f) {
-			if (f->type == ShaderSolid && f->strokeMult == 1.0f && solidVertShader.prog != 0) {
-				useProgramCached(solidVertShader.prog);
-				return;
-			}
-			if (f->type == ShaderCircle && circleVertShader.prog != 0) {
-				useProgramCached(circleVertShader.prog);
-				return;
-			}
-			if (f->type == ShaderRect && rectVertShader.prog != 0) {
-				useProgramCached(rectVertShader.prog);
-				return;
-			}
-		}
-		useProgramCached(shader.prog);
-
+	void bindUboSlice(int uniformOffset, size_t byteSize) {
 		int actualOffset = baseUboOffset + uniformOffset;
-		if (boundUniformOffset != actualOffset) {
+		if (boundUniformOffset != actualOffset || boundUniformSize < byteSize) {
 			boundUniformOffset = actualOffset;
-			glBindBufferRange(GL_UNIFORM_BUFFER, ParamsBinding, fragBuf, actualOffset, sizeof(NisabaShaderUniforms));
-		}
-
-		if (image != 0) {
-			Texture* tex = findTexture(image);
-			bindTexture(tex != nullptr ? tex->tex : (dummyTexPtr != nullptr ? dummyTexPtr->tex : 0));
-			checkGLError(flags, "tex paint tex");
+			boundUniformSize = byteSize;
+			glBindBufferRange(GL_UNIFORM_BUFFER, ParamsBinding, fragBuf, actualOffset, byteSize);
 		}
 	}
 
-	void bindCallShader(const Call& call, int uniformOffset, int image) {
-		if (call.customShader) {
-			auto rts = std::dynamic_pointer_cast<RuntimeShader>(call.customShader);
-			if (rts) {
-				activeProg = 0;
-				rts->bind(view);
-				return;
+	void bindImageTexture(int image) {
+		if (image == 0) return;
+		Texture* tex = findTexture(image);
+		bindTexture(tex != nullptr ? tex->tex : (dummyTexPtr != nullptr ? dummyTexPtr->tex : 0));
+		if (hasSamplerObjects) {
+			GLuint wantSampler = 0;
+			if (tex != nullptr) {
+				int filterIdx = -1;
+				if ((tex->flags & ImageFlags::ImageForceNearest) != 0) filterIdx = 0;
+				else if ((tex->flags & ImageFlags::ImageForceBilinear) != 0) filterIdx = 1;
+				if (filterIdx >= 0) {
+					int wrapIdx = (tex->flags & ImageFlags::ImageMirrorX) ? 2
+					            : ((tex->flags & ImageFlags::ImageRepeatX) ? 1 : 0);
+					wantSampler = samplerCache[filterIdx][wrapIdx];
+				}
+			}
+			if (boundSampler != wantSampler) {
+				glBindSampler(0, wantSampler);
+				boundSampler = wantSampler;
 			}
 		}
-		setUniforms(uniformOffset, image);
+		checkGLError(flags, "tex paint tex");
+	}
+
+	void setUniforms(ShaderBucket bucket, int uniformOffset, int image) {
+		switch (bucket) {
+			case ShaderBucket::ZeroUboSolid:
+				useProgramCached(solidVertShader.prog);
+				return;
+			case ShaderBucket::ZeroUboCircle:
+				useProgramCached(circleVertShader.prog);
+				return;
+			case ShaderBucket::ZeroUboRect:
+				useProgramCached(rectVertShader.prog);
+				return;
+			default:
+				break;
+		}
+		bool fullUbo = bucketNeedsFullUbo(bucket);
+		GLuint targetProg = 0;
+		switch (bucket) {
+			case ShaderBucket::SimpleColor:
+				targetProg = (simpleColorShader.prog != 0) ? simpleColorShader.prog : shader.prog;
+				break;
+			case ShaderBucket::RRectFast:
+				targetProg = (rrectShader.prog != 0) ? rrectShader.prog : shader.prog;
+				break;
+			case ShaderBucket::DRRectFast:
+				targetProg = (drrectShader.prog != 0) ? drrectShader.prog : shader.prog;
+				break;
+			case ShaderBucket::ImgFast:
+				targetProg = (imgShader.prog != 0) ? imgShader.prog : shader.prog;
+				break;
+			case ShaderBucket::RingFast:
+				targetProg = (ringShader.prog != 0) ? ringShader.prog : shader.prog;
+				break;
+			case ShaderBucket::LinearGradFast:
+				targetProg = (linearGradShader.prog != 0) ? linearGradShader.prog : shader.prog;
+				break;
+			case ShaderBucket::RadialGradFast:
+				targetProg = (radialGradShader.prog != 0) ? radialGradShader.prog : shader.prog;
+				break;
+			case ShaderBucket::MultiGradLutFast:
+				targetProg = (multiGradLutShader.prog != 0) ? multiGradLutShader.prog : effectsShader.prog;
+				break;
+			case ShaderBucket::MultiGradFast:
+				targetProg = (multiGradShader.prog != 0) ? multiGradShader.prog : effectsShader.prog;
+				break;
+			case ShaderBucket::ShadowFast:
+				targetProg = (shadowShader.prog != 0) ? shadowShader.prog : effectsShader.prog;
+				break;
+			case ShaderBucket::PerspectiveImgFast:
+				targetProg = (perspectiveImgShader.prog != 0) ? perspectiveImgShader.prog : effectsShader.prog;
+				break;
+			case ShaderBucket::BlendFast:
+				targetProg = (blendFastShader.prog != 0) ? blendFastShader.prog : effectsShader.prog;
+				break;
+			case ShaderBucket::EffectsFull:
+				targetProg = effectsShader.prog;
+				break;
+			case ShaderBucket::FastCore:
+			default:
+				targetProg = shader.prog;
+				break;
+		}
+		if (targetProg == 0) {
+			targetProg = effectsShader.prog;
+			fullUbo = true;
+		}
+		useProgramCached(targetProg);
+		bindUboSlice(uniformOffset, fullUbo ? sizeof(NisabaShaderUniforms) : kFastUniformBytes);
+		bindImageTexture(image);
+	}
+
+	void bindCallShader(const Call& call, int uniformOffset, int image) {
+		if (call.customShader && call.customShader->shader_kind() == ShaderKind::Runtime) {
+			activeProg = 0;
+			call.customShader->bind_shader(view, call.paintXform);
+			return;
+		}
+		setUniforms(call.bucket, uniformOffset, image);
 	}
 
 	void unbindCallShader(const Call& call) {
 		if (call.customShader) {
 			useProgramCached(shader.prog);
 			boundUniformOffset = -1;
+			boundUniformSize = 0;
 		}
+	}
+
+	Call* findCoalescableTrianglesCall(ShaderBucket bucket,
+	                                   int image,
+	                                   const std::shared_ptr<nisaba::gpu::Shader>& customShader,
+	                                   const Transform2D& paintXform,
+	                                   const Blend& blend,
+	                                   bool hasHwScissor,
+	                                   const int hwScissor[4],
+	                                   bool programmableBlend,
+	                                   const FragUniforms& tempFrag) {
+		if (programmableBlend || calls.empty()) return nullptr;
+		Call& last = calls.back();
+		if (last.type != CallType::Triangles || last.bucket != bucket ||
+		    last.programmableBlend || last.image != image || last.customShader != customShader ||
+		    last.blendFunc.srcRGB != blend.srcRGB || last.blendFunc.dstRGB != blend.dstRGB ||
+		    last.blendFunc.srcAlpha != blend.srcAlpha || last.blendFunc.dstAlpha != blend.dstAlpha ||
+		    last.scissorRect[0] != (hasHwScissor ? hwScissor[0] : -1) ||
+		    last.scissorRect[1] != (hasHwScissor ? hwScissor[1] : -1) ||
+		    last.scissorRect[2] != (hasHwScissor ? hwScissor[2] : -1) ||
+		    last.scissorRect[3] != (hasHwScissor ? hwScissor[3] : -1) ||
+		    last.clipDepth != currentClipDepth) {
+			return nullptr;
+		}
+		if (bucketUsesZeroUbo(bucket)) {
+			return &last;
+		}
+		if (customShader != nullptr) {
+			const bool xformMatch = std::memcmp(last.paintXform.m.data(), paintXform.m.data(), sizeof(paintXform.m)) == 0;
+			return xformMatch ? &last : nullptr;
+		}
+		if (last.uniformOffset < 0) return nullptr;
+		const size_t cmpBytes = bucketNeedsFullUbo(bucket) ? sizeof(FragUniforms) : kFastUniformBytes;
+		return (std::memcmp(fragUniformPtr(last.uniformOffset), &tempFrag, cmpBytes) == 0) ? &last : nullptr;
+	}
+
+	void assignCallUniforms(Call& call, const FragUniforms& tempFrag) {
+		if (bucketUsesZeroUbo(call.bucket)) {
+			call.uniformOffset = -1;
+			call.uniformStride = 0;
+		} else {
+			call.uniformStride = bucketStride(call.bucket);
+			call.uniformOffset = storeOrReuseUniform(tempFrag, call.bucket);
+		}
+	}
+
+	static void setCallBoundsFromVerts(Call& call, const Vertex* verts, int nverts, float pad) {
+		if (!verts || nverts <= 0) return;
+		float minX = verts[0].x, maxX = verts[0].x;
+		float minY = verts[0].y, maxY = verts[0].y;
+		for (int i = 1; i < nverts; ++i) {
+			minX = std::min(minX, verts[i].x);
+			maxX = std::max(maxX, verts[i].x);
+			minY = std::min(minY, verts[i].y);
+			maxY = std::max(maxY, verts[i].y);
+		}
+		call.hasCallBounds = true;
+		call.callBounds[0] = minX - pad;
+		call.callBounds[1] = minY - pad;
+		call.callBounds[2] = maxX + pad;
+		call.callBounds[3] = maxY + pad;
 	}
 
 	std::vector<GLint> fanFirst;
@@ -515,95 +1122,18 @@ struct GL3Renderer::Impl {
 		return true;
 	}
 
+	std::optional<TextureUniformInfo> lookupTextureInfo(int imageId) {
+		Texture* tex = findTexture(imageId);
+		if (!tex) return std::nullopt;
+		return TextureUniformInfo{tex->type, tex->flags};
+	}
+
 	bool convertPaint(FragUniforms* frag, const Paint& paint, const Scissor& scissor,
-	                  float width, float fringe, float strokeThr, bool hasHwScissor = false) {
-		*frag = FragUniforms{};
-
-		frag->innerCol = paint.innerColor.premultiplied();
-		frag->outerCol = paint.outerColor.premultiplied();
-
-		if (hasHwScissor || scissor.extent[0] < -0.5f || scissor.extent[1] < -0.5f) {
-			std::memset(frag->scissorMat, 0, sizeof(frag->scissorMat));
-			frag->scissorExt[0] = -1.0f;
-			frag->scissorExt[1] = -1.0f;
-			frag->scissorScale[0] = 1.0f;
-			frag->scissorScale[1] = 1.0f;
-		} else {
-			Transform2D invxform;
-			scissor.xform.inverse(invxform);
-			xformToMat3x4(frag->scissorMat, invxform);
-			frag->scissorExt[0] = scissor.extent[0];
-			frag->scissorExt[1] = scissor.extent[1];
-			float effFringe = (fringe > 1e-4f) ? fringe : 1.0f;
-			frag->scissorScale[0] = std::sqrt(scissor.xform[0] * scissor.xform[0] + scissor.xform[2] * scissor.xform[2]) / effFringe;
-			frag->scissorScale[1] = std::sqrt(scissor.xform[1] * scissor.xform[1] + scissor.xform[3] * scissor.xform[3]) / effFringe;
-		}
-
-		frag->extent[0] = paint.extent[0];
-		frag->extent[1] = paint.extent[1];
-		frag->strokeMult = (fringe > 1e-4f) ? ((width * 0.5f + fringe * 0.5f) / fringe) : 1.0f;
-		frag->strokeThr = strokeThr;
-
-		Transform2D invxform;
-		if (paint.image != 0) {
-			Texture* tex = findTexture(paint.image);
-			if (tex == nullptr) return false;
-
-			if ((tex->flags & ImageFlags::ImageFlipY) != 0) {
-				Transform2D m1 = Transform2D::translate(0.0f, frag->extent[1] * 0.5f).multiply(paint.xform);
-				Transform2D m2 = Transform2D::scale(1.0f, -1.0f).multiply(m1);
-				Transform2D m3 = Transform2D::translate(0.0f, -frag->extent[1] * 0.5f).multiply(m2);
-				m3.inverse(invxform);
-			} else {
-				paint.xform.inverse(invxform);
-			}
-			frag->type = ShaderFillImg;
-
-			if (tex->type == TextureType::RGBA) {
-				frag->texType = (tex->flags & ImageFlags::ImagePremultiplied) ? 0 : 1;
-			} else {
-				frag->texType = 2;
-			}
-			float invExtX = (frag->extent[0] > 1e-4f) ? (1.0f / frag->extent[0]) : 1.0f;
-			float invExtY = (frag->extent[1] > 1e-4f) ? (1.0f / frag->extent[1]) : 1.0f;
-			Transform2D uvXform = invxform.multiply(Transform2D::scale(invExtX, invExtY));
-			xformToMat3x4(frag->paintMat, uvXform);
-		} else if (paint.extent[0] == 0.0f && paint.extent[1] == 0.0f && paint.radius == 0.0f &&
-		           paint.innerColor.r == paint.outerColor.r &&
-		           paint.innerColor.g == paint.outerColor.g &&
-		           paint.innerColor.b == paint.outerColor.b &&
-		           paint.innerColor.a == paint.outerColor.a) {
-			frag->type = ShaderSolid;
-			frag->radius = 0.0f;
-			frag->feather = 1.0f;
-			frag->innerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-			frag->outerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-		} else if (paint.radius == 0.0f && paint.extent[0] == 0.0f) {
-			frag->type = ShaderLinearGrad;
-			frag->radius = 0.0f;
-			frag->feather = paint.feather;
-			paint.xform.inverse(invxform);
-			float invFeather = (paint.feather > 1e-4f) ? (1.0f / paint.feather) : 1.0f;
-			Transform2D gradXform = invxform.multiply(Transform2D::scale(1.0f, invFeather));
-			xformToMat3x4(frag->paintMat, gradXform);
-		} else if (paint.radius > 0.0f && paint.extent[0] == paint.radius && paint.extent[1] == paint.radius) {
-			frag->type = ShaderRadialGrad;
-			frag->radius = paint.radius;
-			frag->feather = paint.feather;
-			float invFeather = (paint.feather > 1e-4f) ? (1.0f / paint.feather) : 1.0f;
-			frag->extent[0] = invFeather;
-			frag->extent[1] = 0.5f - paint.radius * invFeather;
-			paint.xform.inverse(invxform);
-			xformToMat3x4(frag->paintMat, invxform);
-		} else {
-			frag->type = ShaderFillGrad;
-			frag->radius = paint.radius;
-			frag->feather = paint.feather;
-			paint.xform.inverse(invxform);
-			xformToMat3x4(frag->paintMat, invxform);
-		}
-
-		return true;
+	                  float width, float fringe, float strokeThr, bool hasHwScissor = false,
+	                  int blendModeId = 0, bool fastPrefixOnly = false) {
+		return convertPaintUniforms(frag, paint, scissor, width, fringe, strokeThr, hasHwScissor,
+		                            blendModeId, [this](int id) { return lookupTextureInfo(id); },
+		                            fastPrefixOnly);
 	}
 
 	void fill(const Call& call, int activeClipDepth) {
@@ -619,14 +1149,32 @@ struct GL3Renderer::Impl {
 			glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
 
 			if (simpleShader.prog != 0) useProgramCached(simpleShader.prog);
-			else setUniforms(call.uniformOffset, 0);
+			else if (call.uniformOffset >= 0) setUniforms(call.bucket, call.uniformOffset, 0);
 			checkGLError(flags, "fill clip simple");
 
-			glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
-			glStencilOpSeparate(GL_BACK, GL_KEEP, GL_KEEP, GL_DECR_WRAP);
 			glDisable(GL_CULL_FACE);
-			for (int i = 0; i < npaths; i++) {
-				glDrawArrays(GL_TRIANGLE_FAN, baseVertOffset + callPaths[i].fillOffset, callPaths[i].fillCount);
+			if (call.evenOdd || npaths == 1) {
+				glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT);
+			} else {
+				glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
+				glStencilOpSeparate(GL_BACK, GL_KEEP, GL_KEEP, GL_DECR_WRAP);
+			}
+			if (npaths == 1) {
+				glDrawArrays(GL_TRIANGLE_FAN, baseVertOffset + callPaths[0].fillOffset, callPaths[0].fillCount);
+			} else {
+				stripFirst.clear();
+				stripCount.clear();
+				stripFirst.reserve(npaths);
+				stripCount.reserve(npaths);
+				for (int i = 0; i < npaths; i++) {
+					if (callPaths[i].fillCount > 0) {
+						stripFirst.push_back(baseVertOffset + callPaths[i].fillOffset);
+						stripCount.push_back(callPaths[i].fillCount);
+					}
+				}
+				if (!stripFirst.empty()) {
+					glMultiDrawArrays(GL_TRIANGLE_FAN, stripFirst.data(), stripCount.data(), static_cast<GLsizei>(stripFirst.size()));
+				}
 			}
 			glEnable(GL_CULL_FACE);
 
@@ -639,8 +1187,22 @@ struct GL3Renderer::Impl {
 				stencilMask(0x00);
 				stencilFunc(GL_EQUAL, clipRef, 0xff);
 				glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-				for (int i = 0; i < npaths; i++) {
-					glDrawArrays(GL_TRIANGLE_STRIP, baseVertOffset + callPaths[i].strokeOffset, callPaths[i].strokeCount);
+				if (npaths == 1) {
+					glDrawArrays(GL_TRIANGLE_STRIP, baseVertOffset + callPaths[0].strokeOffset, callPaths[0].strokeCount);
+				} else {
+					stripFirst.clear();
+					stripCount.clear();
+					stripFirst.reserve(npaths);
+					stripCount.reserve(npaths);
+					for (int i = 0; i < npaths; i++) {
+						if (callPaths[i].strokeCount > 0) {
+							stripFirst.push_back(baseVertOffset + callPaths[i].strokeOffset);
+							stripCount.push_back(callPaths[i].strokeCount);
+						}
+					}
+					if (!stripFirst.empty()) {
+						glMultiDrawArrays(GL_TRIANGLE_STRIP, stripFirst.data(), stripCount.data(), static_cast<GLsizei>(stripFirst.size()));
+					}
 				}
 			}
 
@@ -666,19 +1228,32 @@ struct GL3Renderer::Impl {
 		glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
 
 		if (simpleShader.prog != 0) useProgramCached(simpleShader.prog);
-		else setUniforms(call.uniformOffset, 0);
+		else if (call.uniformOffset >= 0) setUniforms(call.bucket, call.uniformOffset, 0);
 		checkGLError(flags, "fill simple");
 
 		glDisable(GL_CULL_FACE);
-		if (npaths == 1) {
-			// Single contour concave polygon (e.g. Star): GL_INVERT is 2x faster than Separate INCR/DECR!
+		if (call.evenOdd || npaths == 1) {
+			// Single contour concave polygon or EvenOdd multi-contour fill: GL_INVERT
 			glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT);
-			glDrawArrays(GL_TRIANGLE_FAN, baseVertOffset + callPaths[0].fillOffset, callPaths[0].fillCount);
 		} else {
 			glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
 			glStencilOpSeparate(GL_BACK, GL_KEEP, GL_KEEP, GL_DECR_WRAP);
+		}
+		if (npaths == 1) {
+			glDrawArrays(GL_TRIANGLE_FAN, baseVertOffset + callPaths[0].fillOffset, callPaths[0].fillCount);
+		} else {
+			stripFirst.clear();
+			stripCount.clear();
+			stripFirst.reserve(npaths);
+			stripCount.reserve(npaths);
 			for (int i = 0; i < npaths; i++) {
-				glDrawArrays(GL_TRIANGLE_FAN, baseVertOffset + callPaths[i].fillOffset, callPaths[i].fillCount);
+				if (callPaths[i].fillCount > 0) {
+					stripFirst.push_back(baseVertOffset + callPaths[i].fillOffset);
+					stripCount.push_back(callPaths[i].fillCount);
+				}
+			}
+			if (!stripFirst.empty()) {
+				glMultiDrawArrays(GL_TRIANGLE_FAN, stripFirst.data(), stripCount.data(), static_cast<GLsizei>(stripFirst.size()));
 			}
 		}
 		glEnable(GL_CULL_FACE);
@@ -691,8 +1266,22 @@ struct GL3Renderer::Impl {
 		if ((flags & CreateFlags::Antialias) != 0) {
 			stencilFunc(GL_EQUAL, 0x00, 0xff);
 			glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-			for (int i = 0; i < npaths; i++) {
-				glDrawArrays(GL_TRIANGLE_STRIP, baseVertOffset + callPaths[i].strokeOffset, callPaths[i].strokeCount);
+			if (npaths == 1) {
+				glDrawArrays(GL_TRIANGLE_STRIP, baseVertOffset + callPaths[0].strokeOffset, callPaths[0].strokeCount);
+			} else {
+				stripFirst.clear();
+				stripCount.clear();
+				stripFirst.reserve(npaths);
+				stripCount.reserve(npaths);
+				for (int i = 0; i < npaths; i++) {
+					if (callPaths[i].strokeCount > 0) {
+						stripFirst.push_back(baseVertOffset + callPaths[i].strokeOffset);
+						stripCount.push_back(callPaths[i].strokeCount);
+					}
+				}
+				if (!stripFirst.empty()) {
+					glMultiDrawArrays(GL_TRIANGLE_STRIP, stripFirst.data(), stripCount.data(), static_cast<GLsizei>(stripFirst.size()));
+				}
 			}
 		}
 
@@ -768,15 +1357,20 @@ struct GL3Renderer::Impl {
 
 		if (call.useStencil) {
 			enableStencil(true);
-			bool switchedProg = (!call.customShader && stencilStrokeShader.prog != 0);
+			const GLuint stencilProg =
+				((call.bucket == ShaderBucket::EffectsFull || call.bucket == ShaderBucket::MultiGradFast) &&
+				 stencilEffectsShader.prog != 0)
+					? stencilEffectsShader.prog
+					: stencilStrokeShader.prog;
+			bool switchedProg = (!call.customShader && stencilProg != 0);
 			if (activeClipDepth > 0) {
 				int clipRef = activeClipDepth << 4;
 				stencilMask(0x0f);
 				stencilFunc(GL_EQUAL, clipRef, 0xff);
 				glStencilOp(GL_KEEP, GL_KEEP, GL_INCR);
-				bindCallShader(call, call.uniformOffset + fragSize, call.image);
+				bindCallShader(call, call.uniformOffset + call.uniformStride, call.image);
 				if (switchedProg) {
-					useProgramCached(stencilStrokeShader.prog);
+					useProgramCached(stencilProg);
 				}
 				checkGLError(flags, "stroke fill 0");
 				for (int i = 0; i < npaths; i++) {
@@ -808,9 +1402,9 @@ struct GL3Renderer::Impl {
 				stencilMask(0xff);
 				stencilFunc(GL_EQUAL, 0x0, 0xff);
 				glStencilOp(GL_KEEP, GL_KEEP, GL_INCR);
-				bindCallShader(call, call.uniformOffset + fragSize, call.image);
+				bindCallShader(call, call.uniformOffset + call.uniformStride, call.image);
 				if (switchedProg) {
-					useProgramCached(stencilStrokeShader.prog);
+					useProgramCached(stencilProg);
 				}
 				checkGLError(flags, "stroke fill 0");
 				for (int i = 0; i < npaths; i++) {
@@ -881,7 +1475,9 @@ struct GL3Renderer::Impl {
 		}
 		bindCallShader(call, call.uniformOffset, call.image);
 		checkGLError(flags, "triangles fill");
+		glDisable(GL_CULL_FACE);
 		glDrawArrays(GL_TRIANGLES, baseVertOffset + call.triangleOffset, call.triangleCount);
+		glEnable(GL_CULL_FACE);
 		unbindCallShader(call);
 	}
 
@@ -958,6 +1554,237 @@ struct GL3Renderer::Impl {
 			}
 		}
 	}
+
+	void pushLayer(const Call& call, int& activeClipDepth) {
+		if (call.layerIndex < 0 || call.layerIndex >= static_cast<int>(layerDescs.size())) return;
+		const LayerDesc& layer = layerDescs[call.layerIndex];
+
+		ensureBaseTargetInfo();
+		const bool inNestedLayer = !activeLayers.empty();
+		const int fbW = inNestedLayer ? layerPool[activeLayers.back().poolIndex].w
+		                              : ((baseViewport[2] > 0) ? baseViewport[2] : std::max(1, static_cast<int>(view[0])));
+		const int fbH = inNestedLayer ? layerPool[activeLayers.back().poolIndex].h
+		                              : ((baseViewport[3] > 0) ? baseViewport[3] : std::max(1, static_cast<int>(view[1])));
+		const GLuint parentDrawFbo = inNestedLayer ? layerPool[activeLayers.back().poolIndex].fbo : baseDrawFbo;
+
+		const float scaleX = (view[0] > 0.0f) ? (static_cast<float>(fbW) / view[0]) : 1.0f;
+		const float scaleY = (view[1] > 0.0f) ? (static_cast<float>(fbH) / view[1]) : 1.0f;
+		int roiX0 = 0, roiY0 = 0, roiX1 = fbW, roiY1 = fbH;
+		if (layer.hasBounds) {
+			roiX0 = std::clamp(static_cast<int>(std::floor(layer.bounds[0] * scaleX)), 0, fbW);
+			roiX1 = std::clamp(static_cast<int>(std::ceil(layer.bounds[2] * scaleX)), 0, fbW);
+			const int topY = std::clamp(static_cast<int>(std::floor(layer.bounds[1] * scaleY)), 0, fbH);
+			const int botY = std::clamp(static_cast<int>(std::ceil(layer.bounds[3] * scaleY)), 0, fbH);
+			roiY0 = fbH - botY;
+			roiY1 = fbH - topY;
+		}
+
+		GLuint backdropFbo = 0;
+		int backdropScale = 1;
+		if (layer.copyBackdrop) {
+			float snapBounds[4]{0.0f, 0.0f, view[0], view[1]};
+			if (layer.hasBounds) {
+				const float pad = (layer.backdropBlurSigma > 0.001f)
+				                      ? (std::ceil(3.0f * layer.backdropBlurSigma) + 4.0f)
+				                      : 2.0f;
+				snapBounds[0] = layer.bounds[0] - pad;
+				snapBounds[1] = layer.bounds[1] - pad;
+				snapBounds[2] = layer.bounds[2] + pad;
+				snapBounds[3] = layer.bounds[3] + pad;
+			}
+			captureDstSnapshot(layer.hasBounds, snapBounds, nullptr);
+			backdropFbo = dstSnapFbo;
+			if (layer.backdropBlurSigma > 0.001f) {
+				BlurResult br = gaussianBlurToFbo(
+					dstSnapFbo, dstSnapTex, fbW, fbH,
+					layer.backdropBlurSigma, layer.backdropBlurSigma,
+					layer.hasBounds, roiX0, roiY0, roiX1, roiY1);
+				if (br.fbo != 0) {
+					backdropFbo = br.fbo;
+					backdropScale = br.scale;
+				}
+			}
+		}
+
+		const int poolIdx = acquireLayerFbo(fbW, fbH);
+		const LayerFbo& lf = layerPool[poolIdx];
+		glBindFramebuffer(GL_FRAMEBUFFER, lf.fbo);
+
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+		stencilMask(0xff);
+		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+		glClearStencil(0);
+		if (layer.hasBounds) {
+			const float maxBlur = std::max(layer.postBlurSigmaX, layer.postBlurSigmaY);
+			const int cPad = (maxBlur > 0.001f) ? (static_cast<int>(std::ceil(maxBlur * 3.0f)) + 8) : 4;
+			const int cx0 = std::clamp(roiX0 - cPad, 0, fbW);
+			const int cy0 = std::clamp(roiY0 - cPad, 0, fbH);
+			const int cx1 = std::clamp(roiX1 + cPad, 0, fbW);
+			const int cy1 = std::clamp(roiY1 + cPad, 0, fbH);
+			if (cx1 > cx0 && cy1 > cy0) {
+				glEnable(GL_SCISSOR_TEST);
+				glScissor(cx0, cy0, cx1 - cx0, cy1 - cy0);
+				glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+			}
+		} else {
+			glDisable(GL_SCISSOR_TEST);
+			glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+		}
+
+		if (layer.copyBackdrop && backdropFbo != 0 && roiX1 > roiX0 && roiY1 > roiY0) {
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, backdropFbo);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, lf.fbo);
+			if (backdropScale > 1) {
+				const int ax0 = (roiX0 / backdropScale) * backdropScale;
+				const int ay0 = (roiY0 / backdropScale) * backdropScale;
+				const int ax1 = std::min(fbW, ((roiX1 + backdropScale - 1) / backdropScale) * backdropScale);
+				const int ay1 = std::min(fbH, ((roiY1 + backdropScale - 1) / backdropScale) * backdropScale);
+				glEnable(GL_SCISSOR_TEST);
+				glScissor(roiX0, roiY0, roiX1 - roiX0, roiY1 - roiY0);
+				glBlitFramebuffer(ax0 / backdropScale, ay0 / backdropScale,
+				                  ax1 / backdropScale, ay1 / backdropScale,
+				                  ax0, ay0, ax1, ay1, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+			} else {
+				glDisable(GL_SCISSOR_TEST);
+				glBlitFramebuffer(roiX0, roiY0, roiX1, roiY1, roiX0, roiY0, roiX1, roiY1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+			}
+			glBindFramebuffer(GL_FRAMEBUFFER, lf.fbo);
+		}
+
+		if (scissorEnabled) {
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(currentScissor[0], currentScissor[1], currentScissor[2], currentScissor[3]);
+		} else {
+			glDisable(GL_SCISSOR_TEST);
+		}
+		activeLayers.push_back(RuntimeLayer{parentDrawFbo, activeClipDepth, poolIdx});
+		activeClipDepth = 0;
+		enableStencil(false);
+	}
+
+	void popLayer(const Call& call, int& activeClipDepth, bool& usedProgrammableBlend) {
+		if (activeLayers.empty()) return;
+		const RuntimeLayer rl = activeLayers.back();
+		activeLayers.pop_back();
+		LayerFbo& lf = layerPool[rl.poolIndex];
+
+		LayerDesc desc;
+		bool hasDesc = false;
+		if (call.layerIndex >= 0 && call.layerIndex < static_cast<int>(layerDescs.size())) {
+			desc = layerDescs[call.layerIndex];
+			hasDesc = true;
+		}
+
+		GLuint layerColorTex = lf.colorTex;
+		const bool doBlur = hasDesc && (desc.postBlurSigmaX > 0.001f || desc.postBlurSigmaY > 0.001f);
+		GLuint blurredTex = 0;
+		if (doBlur) {
+			int roiX0 = 0, roiY0 = 0, roiX1 = lf.w, roiY1 = lf.h;
+			const bool hasRoi = desc.hasBounds && view[0] > 0.0f && view[1] > 0.0f;
+			if (hasRoi) {
+				const float sx = static_cast<float>(lf.w) / view[0];
+				const float sy = static_cast<float>(lf.h) / view[1];
+				roiX0 = std::clamp(static_cast<int>(std::floor(desc.bounds[0] * sx)), 0, lf.w);
+				roiX1 = std::clamp(static_cast<int>(std::ceil(desc.bounds[2] * sx)), 0, lf.w);
+				const int topY = std::clamp(static_cast<int>(std::floor(desc.bounds[1] * sy)), 0, lf.h);
+				const int botY = std::clamp(static_cast<int>(std::ceil(desc.bounds[3] * sy)), 0, lf.h);
+				roiY0 = lf.h - botY;
+				roiY1 = lf.h - topY;
+			}
+			BlurResult br = gaussianBlurToFbo(lf.fbo, lf.colorTex, lf.w, lf.h,
+			                                  desc.postBlurSigmaX, desc.postBlurSigmaY,
+			                                  hasRoi, roiX0, roiY0, roiX1, roiY1);
+			if (br.tex != 0) {
+				blurredTex = br.tex;
+			} else {
+				blurredTex = lf.colorTex;
+			}
+		}
+
+		auto drawQuad = [&](int triOff, int uniOff, GLuint srcTex, ShaderBucket bucket) {
+			setUniforms(bucket, uniOff, 0);
+			glActiveTexture(GL_TEXTURE0);
+			bindTexture(srcTex);
+			if (hasSamplerObjects && boundSampler != 0) {
+				glBindSampler(0, 0);
+				boundSampler = 0;
+			}
+			checkGLError(flags, "pop layer");
+			glDisable(GL_CULL_FACE);
+			glDrawArrays(GL_TRIANGLES, baseVertOffset + triOff, 6);
+			glEnable(GL_CULL_FACE);
+		};
+
+		auto restoreParentState = [&]() {
+			glBindFramebuffer(GL_FRAMEBUFFER, rl.parentFbo);
+			activeClipDepth = rl.parentClipDepth;
+			if (call.programmableBlend) {
+				captureDstSnapshotForCall(call);
+				usedProgrammableBlend = true;
+			}
+			if (activeClipDepth > 0) {
+				enableStencil(true);
+				stencilMask(0x00);
+				stencilFunc(GL_EQUAL, activeClipDepth << 4, 0xf0);
+				glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+			} else {
+				enableStencil(false);
+			}
+		};
+
+		if (hasDesc && desc.isDropShadow) {
+			const GLuint shadowSrcTex = doBlur ? blurredTex : lf.colorTex;
+			if (call.triangleCount == 18) {
+				const int compIdx = acquireLayerFbo(lf.w, lf.h);
+				LayerFbo& cf = layerPool[compIdx];
+				const bool inNestedLayer = !activeLayers.empty();
+				const int vpX = inNestedLayer ? 0 : baseViewport[0];
+				const int vpY = inNestedLayer ? 0 : baseViewport[1];
+				const int vpW = inNestedLayer ? layerPool[activeLayers.back().poolIndex].w : baseViewport[2];
+				const int vpH = inNestedLayer ? layerPool[activeLayers.back().poolIndex].h : baseViewport[3];
+				glBindFramebuffer(GL_FRAMEBUFFER, cf.fbo);
+				glViewport(0, 0, lf.w, lf.h);
+				if (scissorEnabled) glDisable(GL_SCISSOR_TEST);
+				enableStencil(false);
+				glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+				glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+				glClear(GL_COLOR_BUFFER_BIT);
+				blendFuncSeparate(Blend{GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA});
+				drawQuad(call.triangleOffset, call.uniformOffset + call.uniformStride, shadowSrcTex, ShaderBucket::FastCore);
+				drawQuad(call.triangleOffset + 6, call.uniformOffset + 2 * call.uniformStride, lf.colorTex, ShaderBucket::FastCore);
+
+				glViewport(vpX, vpY, vpW, vpH);
+				if (scissorEnabled) glEnable(GL_SCISSOR_TEST);
+				restoreParentState();
+				blendFuncSeparate(call.blendFunc);
+				drawQuad(call.triangleOffset + 12, call.uniformOffset, cf.colorTex, call.bucket);
+				cf.inUse = false;
+			} else {
+				restoreParentState();
+				if (call.triangleCount == 12) {
+					blendFuncSeparate(Blend{GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA});
+					drawQuad(call.triangleOffset, call.uniformOffset + call.uniformStride, shadowSrcTex, ShaderBucket::FastCore);
+					drawQuad(call.triangleOffset + 6, call.uniformOffset, lf.colorTex, call.bucket);
+				} else if (call.triangleCount == 6) {
+					drawQuad(call.triangleOffset, call.uniformOffset, shadowSrcTex, call.bucket);
+				}
+			}
+			lf.inUse = false;
+			return;
+		}
+
+		if (doBlur) {
+			layerColorTex = blurredTex;
+		}
+
+		restoreParentState();
+
+		if (call.triangleCount > 0) {
+			drawQuad(call.triangleOffset, call.uniformOffset, layerColorTex, call.bucket);
+		}
+
+		lf.inUse = false;
+	}
 };
 
 // -------------------------------------------------------------
@@ -973,8 +1800,9 @@ GL3Renderer::~GL3Renderer() {
 }
 
 bool GL3Renderer::init() {
-	const char* ver = reinterpret_cast<const char*>(glGetString(GL_VERSION));
-	bool is_gles = (ver != nullptr && std::strstr(ver, "OpenGL ES") != nullptr);
+	detail::ensure_gl_functions_loaded();
+	bool is_gles = detail::is_gles_or_webgl();
+	m_impl->isGLES = is_gles;
 
 	static const char* shaderHeaderGL =
 		"#version 150 core\n"
@@ -1044,11 +1872,7 @@ bool GL3Renderer::init() {
 		"	outColor = fcolor * (cov.x * cov.y);\n"
 		"}\n";
 
-	static const char* fillFragShader =
-		"#ifdef EDGE_AA\n"
-		"#define EDGE_AA 1\n"
-		"#endif\n"
-		"layout(std140) uniform NisabaShaderParams {\n"
+	static const char* fastUboFields =
 		"	mat3 scissorMat;\n"
 		"	mat3 paintMat;\n"
 		"	vec4 innerCol;\n"
@@ -1061,189 +1885,484 @@ bool GL3Renderer::init() {
 		"	float strokeMult;\n"
 		"	float strokeThr;\n"
 		"	int texType;\n"
-		"	int type;\n"
-		"};\n"
-		"uniform sampler2D tex;\n"
-		"in vec2 ftcoord;\n"
-		"in vec2 fpos;\n"
-		"in vec4 fcolor;\n"
-		"out vec4 outColor;\n"
-		"\n"
+		"	int type;\n";
+
+	static const char* fullUboTailFields =
+		"	int blendMode;\n"
+		"	int hasColorMatrix;\n"
+		"	int gradKind;\n"
+		"	int spreadMode;\n"
+		"	vec4 colorMat0;\n"
+		"	vec4 colorMat1;\n"
+		"	vec4 colorMat2;\n"
+		"	vec4 colorMat3;\n"
+		"	vec4 colorMatBias;\n"
+		"	int gradStopCount;\n"
+		"	int colorTransfer;\n"
+		"	int colorBlendEnabled;\n"
+		"	int colorBlendMode;\n"
+		"	vec4 gradParams0;\n"
+		"	vec4 gradParams1;\n"
+		"	vec4 gradStopPos[4];\n"
+		"	vec4 gradStopColors[16];\n"
+		"	vec4 colorBlendCol;\n";
+
+	static const char* sdfAndScissorGlsl =
 		"float sdf_rounded_rect(vec2 pt, vec2 ext, float rad) {\n"
 		"	if (ext.x == rad && ext.y == rad) return length(pt) - rad;\n"
-		"	vec2 ext2 = ext - vec2(rad,rad);\n"
+		"	vec2 ext2 = ext - vec2(rad, rad);\n"
 		"	vec2 d = abs(pt) - ext2;\n"
-		"	return min(max(d.x,d.y),0.0) + length(max(d,0.0)) - rad;\n"
+		"	return min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - rad;\n"
 		"}\n"
-		"\n"
 		"float evaluate_scissor_clip(vec2 p) {\n"
-		"	vec2 sc = (abs((scissorMat * vec3(p,1.0)).xy) - scissorExt);\n"
-		"	sc = vec2(0.5,0.5) - sc * scissorScale;\n"
-		"	return clamp(sc.x,0.0,1.0) * clamp(sc.y,0.0,1.0);\n"
+		"	vec2 sc = (abs((scissorMat * vec3(p, 1.0)).xy) - scissorExt);\n"
+		"	sc = vec2(0.5, 0.5) - sc * scissorScale;\n"
+		"	return clamp(sc.x, 0.0, 1.0) * clamp(sc.y, 0.0, 1.0);\n"
 		"}\n"
 		"#ifdef EDGE_AA\n"
 		"float evaluate_edge_coverage() {\n"
-		"	return min(1.0, (1.0-abs(ftcoord.x*2.0-1.0))*strokeMult) * min(1.0, ftcoord.y);\n"
+		"	return min(1.0, (1.0 - abs(ftcoord.x * 2.0 - 1.0)) * strokeMult) * min(1.0, ftcoord.y);\n"
 		"}\n"
-		"#endif\n"
-		"\n"
-		"void main(void) {\n"
-		"	if (type == 2) {\n"
-		"		outColor = innerCol;\n"
-		"		return;\n"
+		"#endif\n";
+
+	static const char* effectsHelpersGlsl =
+		"float blend_channel_dodge(float sc, float dc, float sa, float da) {\n"
+		"	if (dc <= 0.0) return sc * (1.0 - da);\n"
+		"	float m = 0.0;\n"
+		"	if (sa > 0.0) {\n"
+		"		m = (sc >= sa) ? (sa * da) : min(sa * da, (dc * sa * sa) / (sa - sc));\n"
 		"	}\n"
-		"	if (type == 4) { // Solid color (Ultra-fast path with per-vertex color)\n"
-		"#ifdef EDGE_AA\n"
-		"		float alpha = evaluate_edge_coverage();\n"
-		"#ifdef STENCIL_STROKES\n"
-		"		if (alpha < strokeThr) discard;\n"
-		"#endif\n"
-		"#else\n"
-		"		float alpha = 1.0;\n"
-		"#endif\n"
-		"		if (scissorExt.x >= 0.0) alpha *= evaluate_scissor_clip(fpos);\n"
-		"		outColor = fcolor * alpha;\n"
-		"		return;\n"
+		"	return sc * (1.0 - da) + dc * (1.0 - sa) + m;\n"
+		"}\n"
+		"float blend_channel_burn(float sc, float dc, float sa, float da) {\n"
+		"	if (dc >= da) return sa * da + sc * (1.0 - da) + dc * (1.0 - sa);\n"
+		"	if (sc <= 0.0) return dc * (1.0 - sa);\n"
+		"	float sub = min(sa * da, ((da - dc) * sa * sa) / sc);\n"
+		"	return sc * (1.0 - da) + dc * (1.0 - sa) + (sa * da - sub);\n"
+		"}\n"
+		"float blend_channel_soft_light(float sc, float dc, float sa, float da) {\n"
+		"	if (da <= 0.0) return sc;\n"
+		"	if (sa <= 0.0) return dc;\n"
+		"	float d_norm = clamp(dc / da, 0.0, 1.0);\n"
+		"	float d_func = (d_norm <= 0.25)\n"
+		"		? (((16.0 * d_norm - 12.0) * d_norm + 4.0) * d_norm)\n"
+		"		: sqrt(d_norm);\n"
+		"	float m = (2.0 * sc <= sa)\n"
+		"		? (dc * (sa + (2.0 * sc - sa) * (1.0 - d_norm)))\n"
+		"		: (dc * sa + (2.0 * sc - sa) * (d_func * da - dc));\n"
+		"	return sc * (1.0 - da) + dc * (1.0 - sa) + m;\n"
+		"}\n"
+		"float hsl_lum(vec3 c) { return 0.3 * c.r + 0.59 * c.g + 0.11 * c.b; }\n"
+		"float hsl_sat(vec3 c) { return max(max(c.r, c.g), c.b) - min(min(c.r, c.g), c.b); }\n"
+		"vec3 hsl_clip_color(vec3 c) {\n"
+		"	float l = hsl_lum(c);\n"
+		"	float mn = min(min(c.r, c.g), c.b);\n"
+		"	float mx = max(max(c.r, c.g), c.b);\n"
+		"	if (mn < 0.0) {\n"
+		"		float den = l - mn;\n"
+		"		c = (den > 1e-5) ? (vec3(l) + (c - vec3(l)) * (l / den)) : vec3(l);\n"
 		"	}\n"
-		"	if (type == 8) { // Analytical Anti-Aliased Rectangle Quad\n"
-		"		vec2 d = (vec2(1.0) - abs(ftcoord)) / max(fwidth(ftcoord), vec2(0.0001));\n"
-		"		vec2 cov = clamp(d + vec2(0.5), 0.0, 1.0);\n"
-		"		float alpha = cov.x * cov.y;\n"
-		"		if (scissorExt.x >= 0.0) alpha *= evaluate_scissor_clip(fpos);\n"
-		"		outColor = fcolor * alpha;\n"
-		"		return;\n"
+		"	if (mx > 1.0) {\n"
+		"		float den = mx - l;\n"
+		"		c = (den > 1e-5) ? (vec3(l) + (c - vec3(l)) * ((1.0 - l) / den)) : vec3(l);\n"
 		"	}\n"
-		"	if (type == 7) { // Analytical Anti-Aliased Circle/Ellipse Quad\n"
-		"		float dist = length(ftcoord);\n"
-		"		float alpha = clamp((1.0 - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
-		"		if (scissorExt.x >= 0.0) alpha *= evaluate_scissor_clip(fpos);\n"
-		"		outColor = fcolor * alpha;\n"
-		"		return;\n"
+		"	return c;\n"
+		"}\n"
+		"vec3 hsl_set_lum(vec3 c, float l) { return hsl_clip_color(c + vec3(l - hsl_lum(c))); }\n"
+		"vec3 hsl_set_sat(vec3 c, float s) {\n"
+		"	float cmin = min(min(c.r, c.g), c.b);\n"
+		"	float cmax = max(max(c.r, c.g), c.b);\n"
+		"	if (cmax <= cmin) return vec3(0.0);\n"
+		"	return clamp((c - vec3(cmin)) * (s / (cmax - cmin)), 0.0, 1.0);\n"
+		"}\n"
+		"vec4 nisaba_blend(vec4 s, vec4 d, int mode) {\n"
+		"	if (mode == 1) return vec4(0.0);\n"
+		"	if (mode == 2) return s;\n"
+		"	if (mode == 3) return d;\n"
+		"	if (mode == 4) return clamp(s + d * (1.0 - s.a), 0.0, 1.0);\n"
+		"	if (mode == 5) return clamp(d + s * (1.0 - d.a), 0.0, 1.0);\n"
+		"	if (mode == 6) return s * d.a;\n"
+		"	if (mode == 7) return d * s.a;\n"
+		"	if (mode == 8) return s * (1.0 - d.a);\n"
+		"	if (mode == 9) return d * (1.0 - s.a);\n"
+		"	if (mode == 10) return clamp(vec4(s.rgb * d.a + d.rgb * (1.0 - s.a), d.a), 0.0, 1.0);\n"
+		"	if (mode == 11) return vec4(d.rgb * s.a + s.rgb * (1.0 - d.a), s.a);\n"
+		"	if (mode == 12) return clamp(s * (1.0 - d.a) + d * (1.0 - s.a), 0.0, 1.0);\n"
+		"	if (mode == 13) return clamp(s + d, 0.0, 1.0);\n"
+		"	if (mode == 14) return s * d;\n"
+		"	if (mode == 15) return clamp(s + d - s * d, 0.0, 1.0);\n"
+		"	float outA = s.a + d.a - s.a * d.a;\n"
+		"	vec3 outRgb = s.rgb + d.rgb * (1.0 - s.a);\n"
+		"	if (mode == 16) {\n"
+		"		vec3 m = mix(vec3(s.a * d.a) - 2.0 * (d.a - d.rgb) * (s.a - s.rgb), 2.0 * s.rgb * d.rgb, lessThanEqual(2.0 * d.rgb, vec3(d.a)));\n"
+		"		outRgb = s.rgb * (1.0 - d.a) + d.rgb * (1.0 - s.a) + m;\n"
+		"	} else if (mode == 17) {\n"
+		"		outRgb = s.rgb + d.rgb - max(s.rgb * d.a, d.rgb * s.a);\n"
+		"	} else if (mode == 18) {\n"
+		"		outRgb = s.rgb + d.rgb - min(s.rgb * d.a, d.rgb * s.a);\n"
+		"	} else if (mode == 19) {\n"
+		"		outRgb = vec3(blend_channel_dodge(s.r, d.r, s.a, d.a), blend_channel_dodge(s.g, d.g, s.a, d.a), blend_channel_dodge(s.b, d.b, s.a, d.a));\n"
+		"	} else if (mode == 20) {\n"
+		"		outRgb = vec3(blend_channel_burn(s.r, d.r, s.a, d.a), blend_channel_burn(s.g, d.g, s.a, d.a), blend_channel_burn(s.b, d.b, s.a, d.a));\n"
+		"	} else if (mode == 21) {\n"
+		"		vec3 m = mix(vec3(s.a * d.a) - 2.0 * (d.a - d.rgb) * (s.a - s.rgb), 2.0 * s.rgb * d.rgb, lessThanEqual(2.0 * s.rgb, vec3(s.a)));\n"
+		"		outRgb = s.rgb * (1.0 - d.a) + d.rgb * (1.0 - s.a) + m;\n"
+		"	} else if (mode == 22) {\n"
+		"		outRgb = vec3(blend_channel_soft_light(s.r, d.r, s.a, d.a), blend_channel_soft_light(s.g, d.g, s.a, d.a), blend_channel_soft_light(s.b, d.b, s.a, d.a));\n"
+		"	} else if (mode == 23) {\n"
+		"		outRgb = s.rgb + d.rgb - 2.0 * min(s.rgb * d.a, d.rgb * s.a);\n"
+		"	} else if (mode == 24) {\n"
+		"		outRgb = s.rgb + d.rgb - 2.0 * s.rgb * d.rgb;\n"
+		"	} else if (mode == 25) {\n"
+		"		outRgb = s.rgb * (1.0 - d.a) + d.rgb * (1.0 - s.a) + s.rgb * d.rgb;\n"
+		"	} else if (mode >= 26 && mode <= 29) {\n"
+		"		if (s.a <= 0.0) return d;\n"
+		"		if (d.a <= 0.0) return s;\n"
+		"		vec3 sc = clamp(s.rgb / s.a, 0.0, 1.0);\n"
+		"		vec3 dc = clamp(d.rgb / d.a, 0.0, 1.0);\n"
+		"		vec3 c = dc;\n"
+		"		if (mode == 26) c = hsl_set_lum(hsl_set_sat(sc, hsl_sat(dc)), hsl_lum(dc));\n"
+		"		else if (mode == 27) c = hsl_set_lum(hsl_set_sat(dc, hsl_sat(sc)), hsl_lum(dc));\n"
+		"		else if (mode == 28) c = hsl_set_lum(sc, hsl_lum(dc));\n"
+		"		else c = hsl_set_lum(dc, hsl_lum(sc));\n"
+		"		outRgb = s.rgb * (1.0 - d.a) + d.rgb * (1.0 - s.a) + s.a * d.a * c;\n"
 		"	}\n"
-		"	if (type == 9) { // Analytical Anti-Aliased Rounded Rectangle Quad\n"
-		"		float r = (ftcoord.x < 0.0) ? ((ftcoord.y < 0.0) ? radius : strokeThr) : ((ftcoord.y < 0.0) ? feather : strokeMult);\n"
-		"		vec2 ext2 = extent - vec2(r, r);\n"
-		"		vec2 d = abs(ftcoord) - ext2;\n"
+		"	outA = clamp(outA, 0.0, 1.0);\n"
+		"	return vec4(clamp(outRgb, vec3(0.0), vec3(outA)), outA);\n"
+		"}\n"
+		"vec4 apply_color_matrix(vec4 premul) {\n"
+		"	vec4 s = (premul.a > 1e-5) ? vec4(premul.rgb / premul.a, premul.a) : vec4(0.0);\n"
+		"	vec4 res = vec4(\n"
+		"		dot(colorMat0, s) + colorMatBias.x,\n"
+		"		dot(colorMat1, s) + colorMatBias.y,\n"
+		"		dot(colorMat2, s) + colorMatBias.z,\n"
+		"		dot(colorMat3, s) + colorMatBias.w\n"
+		"	);\n"
+		"	res = clamp(res, 0.0, 1.0);\n"
+		"	return vec4(res.rgb * res.a, res.a);\n"
+		"}\n"
+		"float srgb_ch_to_linear(float c) {\n"
+		"	return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);\n"
+		"}\n"
+		"float linear_ch_to_srgb(float c) {\n"
+		"	return (c <= 0.0031308) ? (c * 12.92) : (1.055 * pow(max(c, 1e-6), 1.0 / 2.4) - 0.055);\n"
+		"}\n"
+		"vec4 apply_color_transfer(vec4 premul, int mode) {\n"
+		"	if (mode == 0 || premul.a <= 1e-5) return premul;\n"
+		"	vec3 s = clamp(premul.rgb / premul.a, 0.0, 1.0);\n"
+		"	if (mode == 1) {\n"
+		"		s = vec3(srgb_ch_to_linear(s.r), srgb_ch_to_linear(s.g), srgb_ch_to_linear(s.b));\n"
+		"	} else if (mode == 2) {\n"
+		"		s = vec3(linear_ch_to_srgb(s.r), linear_ch_to_srgb(s.g), linear_ch_to_srgb(s.b));\n"
+		"	}\n"
+		"	s = clamp(s, 0.0, 1.0);\n"
+		"	return vec4(s * premul.a, premul.a);\n"
+		"}\n";
+
+	static const char* shadowHelpersGlsl =
+		// Abramowitz & Stegun 7.1.27: exp()-free erf approximation (max error < 5e-4, exact for 8-bit color)
+		"float erf_approx(float x) {\n"
+		"	float ax = abs(x);\n"
+		"	float p = 1.0 + ax * (0.278393 + ax * (0.230389 + ax * (0.000972 + ax * 0.078108)));\n"
+		"	float p2 = p * p;\n"
+		"	float y = 1.0 - 1.0 / (p2 * p2);\n"
+		"	return (x < 0.0) ? -y : y;\n"
+		"}\n"
+		"vec4 norm_shadow_radii(vec4 r, vec2 he) {\n"
+		"	vec2 sz = max(he * 2.0, vec2(1e-4));\n"
+		"	vec4 c = max(r, vec4(0.0));\n"
+		"	float scale = 1.0;\n"
+		"	if (c.x + c.y > sz.x) scale = min(scale, sz.x / (c.x + c.y));\n"
+		"	if (c.z + c.w > sz.x) scale = min(scale, sz.x / (c.z + c.w));\n"
+		"	if (c.x + c.w > sz.y) scale = min(scale, sz.y / (c.x + c.w));\n"
+		"	if (c.y + c.z > sz.y) scale = min(scale, sz.y / (c.y + c.z));\n"
+		"	return c * scale;\n"
+		"}\n"
+		"float eval_rrect_shadow(vec2 p, vec2 he, vec4 radiiIn, float sigma) {\n"
+		"	vec4 radii = max(radiiIn, vec4(0.0));\n"
+		"	float maxR = max(max(radii.x, radii.y), max(radii.z, radii.w));\n"
+		"	if (sigma < 0.1) {\n"
+		"		float r = (p.y < 0.0) ? ((p.x < 0.0) ? radii.x : radii.y) : ((p.x < 0.0) ? radii.w : radii.z);\n"
+		"		vec2 ext2 = he - vec2(r);\n"
+		"		vec2 d = abs(p) - ext2;\n"
 		"		float dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;\n"
-		"		float alpha = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
-		"		if (scissorExt.x >= 0.0) alpha *= evaluate_scissor_clip(fpos);\n"
-		"		outColor = fcolor * alpha;\n"
+		"		float px = max(length(vec2(dFdx(p.x), dFdy(p.x))), 0.001);\n"
+		"		return clamp(0.5 - dist / px, 0.0, 1.0);\n"
+		"	}\n"
+		"	float invS = 0.70710678 / sigma;\n"
+		"	float spread = 3.0 * sigma;\n"
+		"	float yLo = max(-he.y, p.y - spread);\n"
+		"	float yHi = min( he.y, p.y + spread);\n"
+		"	if (yHi <= yLo) return 0.0;\n"
+		"	float xLo = max(-he.x, p.x - spread);\n"
+		"	float xHi = min( he.x, p.x + spread);\n"
+		"	if (xHi <= xLo) return 0.0;\n"
+		"	float ay = 0.5 * (erf_approx((he.y - p.y) * invS) - erf_approx((-he.y - p.y) * invS));\n"
+		"	float rTop = max(radii.x, radii.y);\n"
+		"	float rBot = max(radii.w, radii.z);\n"
+		"	float rLeft = max(radii.x, radii.w);\n"
+		"	float rRight = max(radii.y, radii.z);\n"
+		"	if (p.x >= -he.x + rLeft + spread && p.x <= he.x - rRight - spread) {\n"
+		"		return clamp(ay, 0.0, 1.0);\n"
+		"	}\n"
+		"	if (maxR < 0.5 || (yLo >= -he.y + rTop && yHi <= he.y - rBot)) {\n"
+		"		float ax = 0.5 * (erf_approx((he.x - p.x) * invS) - erf_approx((-he.x - p.x) * invS));\n"
+		"		return clamp(ax * ay, 0.0, 1.0);\n"
+		"	}\n"
+		"	bool chkTL = (radii.x > 0.0 && yLo < -he.y + radii.x && xLo < -he.x + radii.x);\n"
+		"	bool chkBL = (radii.w > 0.0 && yHi >  he.y - radii.w && xLo < -he.x + radii.w);\n"
+		"	bool chkTR = (radii.y > 0.0 && yLo < -he.y + radii.y && xHi >  he.x - radii.y);\n"
+		"	bool chkBR = (radii.z > 0.0 && yHi >  he.y - radii.z && xHi >  he.x - radii.z);\n"
+		"	if (!chkTL && !chkBL && !chkTR && !chkBR) {\n"
+		"		float ax = 0.5 * (erf_approx((he.x - p.x) * invS) - erf_approx((-he.x - p.x) * invS));\n"
+		"		return clamp(ax * ay, 0.0, 1.0);\n"
+		"	}\n"
+		"	// 4-point Gauss-Legendre quadrature (exact to degree 7, 2x fewer iterations than 8-pt midpoint)\n"
+		"	const vec4 glNodes = vec4(0.06943184, 0.33000948, 0.66999052, 0.93056816);\n"
+		"	const vec4 glWeights = vec4(0.17392742, 0.32607258, 0.32607258, 0.17392742);\n"
+		"	float ySpan = yHi - yLo;\n"
+		"	float inv2Sig2 = 0.5 / (sigma * sigma);\n"
+		"	float normG = ySpan / (2.50662827 * sigma);\n"
+		"	float acc = 0.0;\n"
+		"	for (int i = 0; i < 4; ++i) {\n"
+		"		float y = yLo + glNodes[i] * ySpan;\n"
+		"		float xL = -he.x;\n"
+		"		if (chkTL && y < -he.y + radii.x) {\n"
+		"			float ty = (-he.y + radii.x) - y;\n"
+		"			xL = -he.x + radii.x - sqrt(max(0.0, radii.x * radii.x - ty * ty));\n"
+		"		} else if (chkBL && y > he.y - radii.w) {\n"
+		"			float ty = y - (he.y - radii.w);\n"
+		"			xL = -he.x + radii.w - sqrt(max(0.0, radii.w * radii.w - ty * ty));\n"
+		"		}\n"
+		"		float xR = he.x;\n"
+		"		if (chkTR && y < -he.y + radii.y) {\n"
+		"			float ty = (-he.y + radii.y) - y;\n"
+		"			xR = he.x - radii.y + sqrt(max(0.0, radii.y * radii.y - ty * ty));\n"
+		"		} else if (chkBR && y > he.y - radii.z) {\n"
+		"			float ty = y - (he.y - radii.z);\n"
+		"			xR = he.x - radii.z + sqrt(max(0.0, radii.z * radii.z - ty * ty));\n"
+		"		}\n"
+		"		if (xR > xL) {\n"
+		"			float hx = 0.5 * (erf_approx((xR - p.x) * invS) - erf_approx((xL - p.x) * invS));\n"
+		"			float yd = y - p.y;\n"
+		"			acc += (hx * exp(-yd * yd * inv2Sig2) * normG) * glWeights[i];\n"
+		"		}\n"
+		"	}\n"
+		"	return clamp(acc, 0.0, 1.0);\n"
+		"}\n";
+
+	static const char* multiGradHelpersGlsl =
+		"float get_stop_pos(int idx) {\n"
+		"	vec4 v = gradStopPos[idx >> 2];\n"
+		"	int r = idx & 3;\n"
+		"	if (r == 0) return v.x;\n"
+		"	if (r == 1) return v.y;\n"
+		"	if (r == 2) return v.z;\n"
+		"	return v.w;\n"
+		"}\n"
+		"vec4 eval_multi_gradient() {\n"
+		"	vec2 pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"	float t = 0.0;\n"
+		"	if (gradKind == 1) {\n"
+		"		t = (gradParams0.z > 0.5) ? 1.0 : pt.x;\n"
+		"	} else if (gradKind == 2) {\n"
+		"		t = length(pt);\n"
+		"	} else if (gradKind == 3) {\n"
+		"		float angle = (pt.x == 0.0 && pt.y == 0.0) ? 0.0 : atan(pt.y, pt.x);\n"
+		"		if (angle < 0.0) angle += 6.28318530718;\n"
+		"		t = (angle - gradParams0.x) * gradParams0.y;\n"
+		"	} else if (gradKind == 4) {\n"
+		"		bool validT = true;\n"
+		"		if (gradParams1.y > 0.5) {\n"
+		"			float dist = length(pt);\n"
+		"			t = (abs(gradParams0.w) > 1e-6) ? ((dist - gradParams0.z) / gradParams0.w) : 0.0;\n"
+		"		} else {\n"
+		"			float dx = gradParams0.x, dy = gradParams0.y, r0 = gradParams0.z, dr = gradParams0.w, A = gradParams1.x;\n"
+		"			float B = -2.0 * (pt.x * dx + pt.y * dy + r0 * dr);\n"
+		"			float C = dot(pt, pt) - r0 * r0;\n"
+		"			if (abs(A) < 1e-7) {\n"
+		"				if (abs(B) < 1e-7) {\n"
+		"					validT = false;\n"
+		"				} else {\n"
+		"					t = -C / B;\n"
+		"					if (r0 + t * dr < 0.0) validT = false;\n"
+		"				}\n"
+		"			} else {\n"
+		"				float disc = B * B - 4.0 * A * C;\n"
+		"				if (disc < 0.0) {\n"
+		"					validT = false;\n"
+		"				} else {\n"
+		"					float sq = sqrt(disc);\n"
+		"					float t1 = (-B - sq) / (2.0 * A);\n"
+		"					float t2 = (-B + sq) / (2.0 * A);\n"
+		"					bool v1 = (r0 + t1 * dr) >= -1e-4;\n"
+		"					bool v2 = (r0 + t2 * dr) >= -1e-4;\n"
+		"					if (v1 && !v2) t = t1;\n"
+		"					else if (v2 && !v1) t = t2;\n"
+		"					else if (v1 && v2) t = (dr >= 0.0) ? t1 : t2;\n"
+		"					else validT = false;\n"
+		"				}\n"
+		"			}\n"
+		"		}\n"
+		"		if (!validT) return vec4(0.0);\n"
+		"	}\n"
+		"	float tm = t;\n"
+		"	if (spreadMode == 0) {\n"
+		"		tm = clamp(t, 0.0, 1.0);\n"
+		"	} else if (spreadMode == 1) {\n"
+		"		tm = fract(t);\n"
+		"	} else {\n"
+		"		float f = fract(t * 0.5);\n"
+		"		tm = (f < 0.5) ? (f * 2.0) : ((1.0 - f) * 2.0);\n"
+		"	}\n"
+		"	if (gradStopCount < 0) {\n"
+		"		return texture(tex, vec2((tm * 255.0 + 0.5) / 256.0, 0.5));\n"
+		"	}\n"
+		"	if (gradStopCount <= 0) return vec4(0.0);\n"
+		"	vec4 c0 = gradStopColors[0];\n"
+		"	if (gradStopCount == 1) {\n"
+		"		return vec4(c0.rgb * c0.a, c0.a);\n"
+		"	}\n"
+		"	vec4 col = c0;\n"
+		"	if (gradStopCount == 2) {\n"
+		"		float p0 = gradStopPos[0].x;\n"
+		"		float p1 = gradStopPos[0].y;\n"
+		"		if (tm >= p1) {\n"
+		"			col = gradStopColors[1];\n"
+		"		} else if (tm > p0) {\n"
+		"			float r = p1 - p0;\n"
+		"			col = mix(c0, gradStopColors[1], (r > 1e-6) ? ((tm - p0) / r) : 0.0);\n"
+		"		}\n"
+		"	} else if (gradStopCount == 3) {\n"
+		"		float p0 = gradStopPos[0].x;\n"
+		"		float p1 = gradStopPos[0].y;\n"
+		"		float p2 = gradStopPos[0].z;\n"
+		"		if (tm >= p2) {\n"
+		"			col = gradStopColors[2];\n"
+		"		} else if (tm > p0) {\n"
+		"			if (tm <= p1) {\n"
+		"				float r = p1 - p0;\n"
+		"				col = mix(c0, gradStopColors[1], (r > 1e-6) ? ((tm - p0) / r) : 0.0);\n"
+		"			} else {\n"
+		"				float r = p2 - p1;\n"
+		"				col = mix(gradStopColors[1], gradStopColors[2], (r > 1e-6) ? ((tm - p1) / r) : 0.0);\n"
+		"			}\n"
+		"		}\n"
+		"	} else if (gradStopCount == 4) {\n"
+		"		vec4 p = gradStopPos[0];\n"
+		"		if (tm >= p.w) {\n"
+		"			col = gradStopColors[3];\n"
+		"		} else if (tm > p.x) {\n"
+		"			if (tm <= p.y) {\n"
+		"				float r = p.y - p.x;\n"
+		"				col = mix(c0, gradStopColors[1], (r > 1e-6) ? ((tm - p.x) / r) : 0.0);\n"
+		"			} else if (tm <= p.z) {\n"
+		"				float r = p.z - p.y;\n"
+		"				col = mix(gradStopColors[1], gradStopColors[2], (r > 1e-6) ? ((tm - p.y) / r) : 0.0);\n"
+		"			} else {\n"
+		"				float r = p.w - p.z;\n"
+		"				col = mix(gradStopColors[2], gradStopColors[3], (r > 1e-6) ? ((tm - p.z) / r) : 0.0);\n"
+		"			}\n"
+		"		}\n"
+		"	} else {\n"
+		"		if (tm >= get_stop_pos(gradStopCount - 1)) {\n"
+		"			col = gradStopColors[gradStopCount - 1];\n"
+		"		} else if (tm > get_stop_pos(0)) {\n"
+		"			for (int i = 0; i < 15; ++i) {\n"
+		"				if (i + 1 >= gradStopCount) break;\n"
+		"				float p0 = get_stop_pos(i);\n"
+		"				float p1 = get_stop_pos(i + 1);\n"
+		"				if (tm <= p1) {\n"
+		"					float range = p1 - p0;\n"
+		"					float rel = (range > 1e-6) ? ((tm - p0) / range) : 0.0;\n"
+		"					col = mix(gradStopColors[i], gradStopColors[i + 1], rel);\n"
+		"					break;\n"
+		"				}\n"
+		"			}\n"
+		"		}\n"
+		"	}\n"
+		"	return vec4(col.rgb * col.a, col.a);\n"
+		"}\n";
+
+	static const char* fastCoreBodyGlsl =
+		"void main(void) {\n"
+		"	float fragCov = 1.0;\n"
+		"	if (type == 4) {\n"
+		"#ifdef EDGE_AA\n"
+		"		fragCov = evaluate_edge_coverage();\n"
+		"#ifdef STENCIL_STROKES\n"
+		"		if (fragCov < strokeThr) discard;\n"
+		"#endif\n"
+		"#endif\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		outColor = fcolor * fragCov;\n"
 		"		return;\n"
 		"	}\n"
-		"	if (type == 3) { // Textured triangles (Text / Direct UV Quad)\n"
+		"	if (type == 3) {\n"
 		"		vec4 color = texture(tex, ftcoord);\n"
-		"		if (texType == 2) color = vec4(color.r);\n"
-		"		else if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
-		"		color *= innerCol * fcolor;\n"
-		"		if (scissorExt.x >= 0.0) color *= evaluate_scissor_clip(fpos);\n"
-		"		outColor = color;\n"
+		"		vec4 fragCol;\n"
+		"		if (texType == 2) {\n"
+		"			fragCov = color.r;\n"
+		"			fragCol = innerCol * fcolor;\n"
+		"		} else if (texType == 3) {\n"
+		"			fragCol = color * innerCol.a;\n"
+		"		} else if (texType == 4) {\n"
+		"			fragCol = outerCol * (color.a * innerCol.a);\n"
+		"		} else {\n"
+		"			if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
+		"			fragCol = color * innerCol * fcolor;\n"
+		"		}\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		outColor = fragCol * fragCov;\n"
 		"		return;\n"
 		"	}\n"
-		"	if (type == 5) { // Fast-path Linear Gradient\n"
-		"		float alpha = 1.0;\n"
+		"	if (type == 5) {\n"
 		"		float d;\n"
 		"		if (radius > 0.5) {\n"
 		"			d = clamp(ftcoord.y, 0.0, 1.0);\n"
 		"		} else {\n"
 		"#ifdef EDGE_AA\n"
-		"			alpha = evaluate_edge_coverage();\n"
+		"			fragCov = evaluate_edge_coverage();\n"
 		"#ifdef STENCIL_STROKES\n"
-		"			if (alpha < strokeThr) discard;\n"
+		"			if (fragCov < strokeThr) discard;\n"
 		"#endif\n"
 		"#endif\n"
-		"			d = clamp((paintMat * vec3(fpos,1.0)).y, 0.0, 1.0);\n"
+		"			d = clamp((paintMat * vec3(fpos, 1.0)).y, 0.0, 1.0);\n"
 		"		}\n"
-		"		if (scissorExt.x >= 0.0) alpha *= evaluate_scissor_clip(fpos);\n"
-		"		outColor = mix(innerCol,outerCol,d) * alpha;\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		outColor = mix(innerCol, outerCol, d) * fragCov;\n"
 		"		return;\n"
 		"	}\n"
-		"	if (type == 6) { // Fast-path Radial Gradient\n"
-		"		float alpha = 1.0;\n"
-		"		vec2 pt;\n"
+		"	if (type == 6) {\n"
+		"		float d;\n"
 		"		if (strokeMult > 3.5) {\n"
 		"			float dist = length(ftcoord);\n"
-		"			alpha = clamp((strokeThr - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
-		"			if (scissorExt.x >= 0.0) alpha *= evaluate_scissor_clip(fpos);\n"
-		"			float d = clamp(dist * extent.x + extent.y, 0.0, 1.0);\n"
-		"			outColor = mix(innerCol,outerCol,d) * alpha;\n"
-		"			return;\n"
-		"		} else if (strokeMult > 2.5) {\n"
-		"			pt = ftcoord;\n"
-		"		} else if (strokeMult > 1.5) {\n"
-		"			float dist = length(ftcoord);\n"
-		"			alpha = clamp((1.0 - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
-		"			pt = (paintMat * vec3(fpos,1.0)).xy;\n"
+		"			fragCov = clamp((strokeThr - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"			d = clamp(dist * extent.x + extent.y, 0.0, 1.0);\n"
 		"		} else {\n"
+		"			vec2 pt;\n"
+		"			if (strokeMult > 2.5) {\n"
+		"				pt = ftcoord;\n"
+		"			} else if (strokeMult > 1.5) {\n"
+		"				float dist = length(ftcoord);\n"
+		"				fragCov = clamp((1.0 - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"				pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"			} else {\n"
 		"#ifdef EDGE_AA\n"
-		"			alpha = evaluate_edge_coverage();\n"
+		"				fragCov = evaluate_edge_coverage();\n"
 		"#ifdef STENCIL_STROKES\n"
-		"			if (alpha < strokeThr) discard;\n"
+		"				if (fragCov < strokeThr) discard;\n"
 		"#endif\n"
 		"#endif\n"
-		"			pt = (paintMat * vec3(fpos,1.0)).xy;\n"
+		"				pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"			}\n"
+		"			d = clamp(length(pt) * extent.x + extent.y, 0.0, 1.0);\n"
 		"		}\n"
-		"		if (scissorExt.x >= 0.0) alpha *= evaluate_scissor_clip(fpos);\n"
-		"		float d = clamp(length(pt) * extent.x + extent.y, 0.0, 1.0);\n"
-		"		outColor = mix(innerCol,outerCol,d) * alpha;\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		outColor = mix(innerCol, outerCol, d) * fragCov;\n"
 		"		return;\n"
 		"	}\n"
-		"	if (type == 0) { // Box Gradient\n"
-		"		float alpha = 1.0;\n"
-		"		vec2 pt;\n"
-		"		if (strokeMult > 2.5) {\n"
-		"			pt = ftcoord;\n"
-		"		} else {\n"
-		"#ifdef EDGE_AA\n"
-		"			alpha = evaluate_edge_coverage();\n"
-		"#ifdef STENCIL_STROKES\n"
-		"			if (alpha < strokeThr) discard;\n"
-		"#endif\n"
-		"#endif\n"
-		"			pt = (paintMat * vec3(fpos,1.0)).xy;\n"
-		"		}\n"
-		"		if (scissorExt.x >= 0.0) alpha *= evaluate_scissor_clip(fpos);\n"
-		"		float d = clamp((sdf_rounded_rect(pt, extent, radius) + feather*0.5) / feather, 0.0, 1.0);\n"
-		"		outColor = mix(innerCol,outerCol,d) * alpha;\n"
-		"		return;\n"
-		"	}\n"
-		"	if (type == 1) { // Image Pattern\n"
-		"		float alpha = 1.0;\n"
-		"		vec2 pt;\n"
-		"		if (radius > 0.0) {\n"
-		"			vec2 ext2 = extent - vec2(radius, radius);\n"
-		"			vec2 d = abs(ftcoord) - ext2;\n"
-		"			float dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - radius;\n"
-		"			alpha = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
-		"			pt = (paintMat * vec3(ftcoord,1.0)).xy;\n"
-		"		} else {\n"
-		"#ifdef EDGE_AA\n"
-		"			alpha = evaluate_edge_coverage();\n"
-		"#ifdef STENCIL_STROKES\n"
-		"			if (alpha < strokeThr) discard;\n"
-		"#endif\n"
-		"#endif\n"
-		"			pt = (paintMat * vec3(fpos,1.0)).xy;\n"
-		"		}\n"
-		"		if (scissorExt.x >= 0.0) alpha *= evaluate_scissor_clip(fpos);\n"
-		"		vec4 color = texture(tex, pt);\n"
-		"		if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
-		"		else if (texType == 2) color = vec4(color.r);\n"
-		"		outColor = color * innerCol * alpha;\n"
-		"		return;\n"
-		"	}\n"
-		"	if (type == 11) { // Analytical Anti-Aliased Rounded Rectangle / Circle with Linear Gradient\n"
-		"		float r = (ftcoord.x < 0.0) ? ((ftcoord.y < 0.0) ? radius : strokeThr) : ((ftcoord.y < 0.0) ? feather : strokeMult);\n"
-		"		vec2 ext2 = extent - vec2(r, r);\n"
-		"		vec2 d = abs(ftcoord) - ext2;\n"
-		"		float dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;\n"
-		"		float alpha = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
-		"		if (scissorExt.x >= 0.0) alpha *= evaluate_scissor_clip(fpos);\n"
-		"		vec2 pt = (paintMat * vec3(ftcoord,1.0)).xy;\n"
-		"		float gradD = clamp(pt.y, 0.0, 1.0);\n"
-		"		outColor = mix(innerCol, outerCol, gradD) * alpha;\n"
-		"		return;\n"
-		"	}\n"
-		"	if (type == 10) { // Analytical Anti-Aliased Ring / Stroked RRect / Stroked Ellipse Quad\n"
+		"	if (type == 10) {\n"
 		"		float dist;\n"
 		"		if (extent.x > 0.0) {\n"
 		"			vec2 ext2 = extent - vec2(radius, radius);\n"
@@ -1257,55 +2376,685 @@ bool GL3Renderer::init() {
 		"		} else {\n"
 		"			dist = abs(length(ftcoord) - radius) - strokeThr;\n"
 		"		}\n"
-		"		float alpha = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
-		"		if (scissorExt.x >= 0.0) alpha *= evaluate_scissor_clip(fpos);\n"
-		"		outColor = fcolor * alpha;\n"
+		"		fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		outColor = fcolor * fragCov;\n"
 		"		return;\n"
 		"	}\n"
-		"	outColor = vec4(1.0);\n"
+		"	if (type == 11) {\n"
+		"		float r = (ftcoord.x < 0.0) ? ((ftcoord.y < 0.0) ? radius : strokeThr) : ((ftcoord.y < 0.0) ? feather : strokeMult);\n"
+		"		vec2 ext2 = extent - vec2(r, r);\n"
+		"		vec2 d = abs(ftcoord) - ext2;\n"
+		"		float dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;\n"
+		"		fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		vec2 pt = (paintMat * vec3(ftcoord, 1.0)).xy;\n"
+		"		outColor = mix(innerCol, outerCol, clamp(pt.y, 0.0, 1.0)) * fragCov;\n"
+		"		return;\n"
+		"	}\n"
+		"	if (type == 9) {\n"
+		"		float r = (ftcoord.x < 0.0) ? ((ftcoord.y < 0.0) ? radius : strokeThr) : ((ftcoord.y < 0.0) ? feather : strokeMult);\n"
+		"		vec2 ext2 = extent - vec2(r, r);\n"
+		"		vec2 d = abs(ftcoord) - ext2;\n"
+		"		float dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;\n"
+		"		fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		outColor = fcolor * fragCov;\n"
+		"		return;\n"
+		"	}\n"
+		"	if (type == 8) {\n"
+		"		vec2 d = (vec2(1.0) - abs(ftcoord)) / max(fwidth(ftcoord), vec2(0.0001));\n"
+		"		vec2 cov = clamp(d + vec2(0.5), 0.0, 1.0);\n"
+		"		fragCov = cov.x * cov.y;\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		outColor = fcolor * fragCov;\n"
+		"		return;\n"
+		"	}\n"
+		"	if (type == 7) {\n"
+		"		float dist = length(ftcoord);\n"
+		"		fragCov = clamp((1.0 - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		outColor = fcolor * fragCov;\n"
+		"		return;\n"
+		"	}\n"
+		"	if (type == 0) {\n"
+		"		vec2 pt;\n"
+		"		if (strokeMult > 2.5) {\n"
+		"			pt = ftcoord;\n"
+		"		} else {\n"
+		"#ifdef EDGE_AA\n"
+		"			fragCov = evaluate_edge_coverage();\n"
+		"#ifdef STENCIL_STROKES\n"
+		"			if (fragCov < strokeThr) discard;\n"
+		"#endif\n"
+		"#endif\n"
+		"			pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"		}\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		float d = clamp((sdf_rounded_rect(pt, extent, radius) + feather * 0.5) / feather, 0.0, 1.0);\n"
+		"		outColor = mix(innerCol, outerCol, d) * fragCov;\n"
+		"		return;\n"
+		"	}\n"
+		"	if (type == 1) {\n"
+		"		vec2 pt;\n"
+		"		if (radius > 0.0) {\n"
+		"			vec2 ext2 = extent - vec2(radius, radius);\n"
+		"			vec2 d = abs(ftcoord) - ext2;\n"
+		"			float dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - radius;\n"
+		"			fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"			pt = (paintMat * vec3(ftcoord, 1.0)).xy;\n"
+		"		} else {\n"
+		"#ifdef EDGE_AA\n"
+		"			fragCov = evaluate_edge_coverage();\n"
+		"#ifdef STENCIL_STROKES\n"
+		"			if (fragCov < strokeThr) discard;\n"
+		"#endif\n"
+		"#endif\n"
+		"			pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"		}\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		vec4 color = texture(tex, pt);\n"
+		"		if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
+		"		else if (texType == 2) color = vec4(color.r);\n"
+		"		outColor = (color * innerCol) * fragCov;\n"
+		"		return;\n"
+		"	}\n"
+		"	outColor = innerCol;\n"
 		"}\n";
+
+	static const char* effectsBodyGlsl =
+		"void main(void) {\n"
+		"	vec4 fragCol = vec4(1.0);\n"
+		"	float fragCov = 1.0;\n"
+		"	if (type == 2) {\n"
+		"		fragCol = innerCol;\n"
+		"	} else if (type == 4) {\n"
+		"#ifdef EDGE_AA\n"
+		"		fragCov = evaluate_edge_coverage();\n"
+		"#ifdef STENCIL_STROKES\n"
+		"		if (fragCov < strokeThr) discard;\n"
+		"#endif\n"
+		"#endif\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		fragCol = fcolor;\n"
+		"	} else if (type == 8) {\n"
+		"		vec2 d = (vec2(1.0) - abs(ftcoord)) / max(fwidth(ftcoord), vec2(0.0001));\n"
+		"		vec2 cov = clamp(d + vec2(0.5), 0.0, 1.0);\n"
+		"		fragCov = cov.x * cov.y;\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		fragCol = fcolor;\n"
+		"	} else if (type == 7) {\n"
+		"		float dist = length(ftcoord);\n"
+		"		fragCov = clamp((1.0 - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		fragCol = fcolor;\n"
+		"	} else if (type == 9) {\n"
+		"		float r = (ftcoord.x < 0.0) ? ((ftcoord.y < 0.0) ? radius : strokeThr) : ((ftcoord.y < 0.0) ? feather : strokeMult);\n"
+		"		vec2 ext2 = extent - vec2(r, r);\n"
+		"		vec2 d = abs(ftcoord) - ext2;\n"
+		"		float dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;\n"
+		"		fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		fragCol = fcolor;\n"
+		"	} else if (type == 3) {\n"
+		"		vec4 color = texture(tex, ftcoord);\n"
+		"		if (texType == 2) {\n"
+		"			fragCov = color.r;\n"
+		"			fragCol = innerCol * fcolor;\n"
+		"		} else if (texType == 3) {\n"
+		"			fragCol = color;\n"
+		"		} else if (texType == 4) {\n"
+		"			fragCol = outerCol * color.a;\n"
+		"		} else {\n"
+		"			if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
+		"			fragCol = color * innerCol * fcolor;\n"
+		"		}\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	} else if (type == 5) {\n"
+		"		float d;\n"
+		"		if (radius > 0.5) {\n"
+		"			d = clamp(ftcoord.y, 0.0, 1.0);\n"
+		"		} else {\n"
+		"#ifdef EDGE_AA\n"
+		"			fragCov = evaluate_edge_coverage();\n"
+		"#ifdef STENCIL_STROKES\n"
+		"			if (fragCov < strokeThr) discard;\n"
+		"#endif\n"
+		"#endif\n"
+		"			d = clamp((paintMat * vec3(fpos, 1.0)).y, 0.0, 1.0);\n"
+		"		}\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		fragCol = mix(innerCol, outerCol, d);\n"
+		"	} else if (type == 6) {\n"
+		"		float d;\n"
+		"		if (strokeMult > 3.5) {\n"
+		"			float dist = length(ftcoord);\n"
+		"			fragCov = clamp((strokeThr - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"			d = clamp(dist * extent.x + extent.y, 0.0, 1.0);\n"
+		"		} else {\n"
+		"			vec2 pt;\n"
+		"			if (strokeMult > 2.5) {\n"
+		"				pt = ftcoord;\n"
+		"			} else if (strokeMult > 1.5) {\n"
+		"				float dist = length(ftcoord);\n"
+		"				fragCov = clamp((1.0 - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"				pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"			} else {\n"
+		"#ifdef EDGE_AA\n"
+		"				fragCov = evaluate_edge_coverage();\n"
+		"#ifdef STENCIL_STROKES\n"
+		"				if (fragCov < strokeThr) discard;\n"
+		"#endif\n"
+		"#endif\n"
+		"				pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"			}\n"
+		"			d = clamp(length(pt) * extent.x + extent.y, 0.0, 1.0);\n"
+		"		}\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		fragCol = mix(innerCol, outerCol, d);\n"
+		"	} else if (type == 0) {\n"
+		"		vec2 pt;\n"
+		"		if (strokeMult > 2.5) {\n"
+		"			pt = ftcoord;\n"
+		"		} else {\n"
+		"#ifdef EDGE_AA\n"
+		"			fragCov = evaluate_edge_coverage();\n"
+		"#ifdef STENCIL_STROKES\n"
+		"			if (fragCov < strokeThr) discard;\n"
+		"#endif\n"
+		"#endif\n"
+		"			pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"		}\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		float d = clamp((sdf_rounded_rect(pt, extent, radius) + feather * 0.5) / feather, 0.0, 1.0);\n"
+		"		fragCol = mix(innerCol, outerCol, d);\n"
+		"	} else if (type == 1) {\n"
+		"		vec2 pt;\n"
+		"		if (radius > 0.0) {\n"
+		"			vec2 ext2 = extent - vec2(radius, radius);\n"
+		"			vec2 d = abs(ftcoord) - ext2;\n"
+		"			float dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - radius;\n"
+		"			fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"			pt = (paintMat * vec3(ftcoord, 1.0)).xy;\n"
+		"		} else {\n"
+		"#ifdef EDGE_AA\n"
+		"			fragCov = evaluate_edge_coverage();\n"
+		"#ifdef STENCIL_STROKES\n"
+		"			if (fragCov < strokeThr) discard;\n"
+		"#endif\n"
+		"#endif\n"
+		"			pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"		}\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		vec4 color = texture(tex, pt);\n"
+		"		if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
+		"		else if (texType == 2) color = vec4(color.r);\n"
+		"		fragCol = color * innerCol;\n"
+		"	} else if (type == 11) {\n"
+		"		float r = (ftcoord.x < 0.0) ? ((ftcoord.y < 0.0) ? radius : strokeThr) : ((ftcoord.y < 0.0) ? feather : strokeMult);\n"
+		"		vec2 ext2 = extent - vec2(r, r);\n"
+		"		vec2 d = abs(ftcoord) - ext2;\n"
+		"		float dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;\n"
+		"		fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		vec2 pt = (paintMat * vec3(ftcoord, 1.0)).xy;\n"
+		"		fragCol = mix(innerCol, outerCol, clamp(pt.y, 0.0, 1.0));\n"
+		"	} else if (type == 10) {\n"
+		"		float dist;\n"
+		"		if (extent.x > 0.0) {\n"
+		"			vec2 ext2 = extent - vec2(radius, radius);\n"
+		"			vec2 d = abs(ftcoord) - ext2;\n"
+		"			dist = abs(min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - radius) - strokeThr;\n"
+		"		} else if (extent.x < 0.0) {\n"
+		"			vec2 rxry = vec2(-extent.x, extent.y);\n"
+		"			float u = length(ftcoord);\n"
+		"			float grad = max(length(ftcoord / rxry), 0.0001);\n"
+		"			dist = abs(u - 1.0) / grad - strokeThr;\n"
+		"		} else {\n"
+		"			dist = abs(length(ftcoord) - radius) - strokeThr;\n"
+		"		}\n"
+		"		fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		fragCol = fcolor;\n"
+		"	} else if (type == 12) {\n"
+		"#ifdef EDGE_AA\n"
+		"		fragCov = evaluate_edge_coverage();\n"
+		"#ifdef STENCIL_STROKES\n"
+		"		if (fragCov < strokeThr) discard;\n"
+		"#endif\n"
+		"#endif\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		fragCol = eval_multi_gradient() * innerCol.a;\n"
+		"	} else if (type == 13) {\n"
+		"		fragCov = eval_rrect_shadow(ftcoord, extent, vec4(radius, feather, strokeMult, strokeThr), gradParams0.x);\n"
+		"		if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		fragCol = innerCol;\n"
+		"	} else if (type == 14) {\n"
+		"		vec3 uvq = paintMat * vec3(fpos, 1.0);\n"
+		"		if (abs(uvq.z) > 1e-7) {\n"
+		"			vec2 uv = clamp((uvq.xy / uvq.z) / max(extent, vec2(1.0)), gradParams0.xy, gradParams0.zw);\n"
+		"			vec4 color = texture(tex, uv);\n"
+		"			if (texType == 2) {\n"
+		"				fragCov = color.r;\n"
+		"				fragCol = innerCol * fcolor;\n"
+		"			} else if (texType == 3) {\n"
+		"				fragCol = color;\n"
+		"			} else if (texType == 4) {\n"
+		"				fragCol = outerCol * color.a;\n"
+		"			} else {\n"
+		"				if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
+		"				fragCol = color * innerCol * fcolor;\n"
+		"			}\n"
+		"			if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"		} else {\n"
+		"			fragCov = 0.0;\n"
+		"			fragCol = vec4(0.0);\n"
+		"		}\n"
+		"	}\n"
+		"	if (hasColorMatrix != 0) {\n"
+		"		fragCol = apply_color_matrix(fragCol);\n"
+		"	}\n"
+		"	if (colorTransfer != 0) {\n"
+		"		fragCol = apply_color_transfer(fragCol, colorTransfer);\n"
+		"	}\n"
+		"	if (colorBlendEnabled != 0) {\n"
+		"		fragCol = nisaba_blend(colorBlendCol, fragCol, colorBlendMode);\n"
+		"	}\n"
+		"	if ((type == 3 || type == 14) && (texType == 3 || texType == 4)) {\n"
+		"		fragCol *= innerCol.a;\n"
+		"	}\n"
+		"	if (blendMode == 0) {\n"
+		"		outColor = fragCol * fragCov;\n"
+		"		return;\n"
+		"	}\n"
+		"	ivec2 dstSize = textureSize(dstTex, 0);\n"
+		"	ivec2 dstCoord = clamp(ivec2(gl_FragCoord.xy), ivec2(0), dstSize - ivec2(1));\n"
+		"	vec4 dst = texelFetch(dstTex, dstCoord, 0);\n"
+		"	vec4 blended = nisaba_blend(fragCol, dst, blendMode);\n"
+		"	outColor = mix(dst, blended, fragCov);\n"
+		"}\n";
+
+	const std::string fastUboBlock = std::string("layout(std140) uniform NisabaShaderParams {\n") + fastUboFields + "};\n";
+	const std::string fullUboBlock = std::string("layout(std140) uniform NisabaShaderParams {\n") + fastUboFields + fullUboTailFields + "};\n";
+	const std::string varyingsFull = "in vec2 ftcoord;\nin vec2 fpos;\nin vec4 fcolor;\nout vec4 outColor;\n";
+	const std::string varyingsTex  = "uniform sampler2D tex;\n";
+
+	const std::string simpleColorFrag = fastUboBlock + "out vec4 outColor;\nvoid main(void) {\n\toutColor = innerCol;\n}\n";
+	const std::string rrectFrag = fastUboBlock + varyingsFull + sdfAndScissorGlsl +
+		"void main(void) {\n"
+		"	float r = (ftcoord.x < 0.0) ? ((ftcoord.y < 0.0) ? radius : strokeThr) : ((ftcoord.y < 0.0) ? feather : strokeMult);\n"
+		"	vec2 ext2 = extent - vec2(r, r);\n"
+		"	vec2 d = abs(ftcoord) - ext2;\n"
+		"	float dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;\n"
+		"	float fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	outColor = fcolor * fragCov;\n"
+		"}\n";
+	const std::string drrectFrag = fastUboBlock + varyingsFull + sdfAndScissorGlsl +
+		"void main(void) {\n"
+		"	float rO = (ftcoord.x < 0.0) ? ((ftcoord.y < 0.0) ? radius : strokeThr) : ((ftcoord.y < 0.0) ? feather : strokeMult);\n"
+		"	vec2 dO = abs(ftcoord) - (extent - vec2(rO));\n"
+		"	float distO = min(max(dO.x, dO.y), 0.0) + length(max(dO, 0.0)) - rO;\n"
+		"	vec2 pI = ftcoord - paintMat[0].xy;\n"
+		"	vec2 heI = vec2(paintMat[0].z, paintMat[1].x);\n"
+		"	float rI = (pI.x < 0.0) ? ((pI.y < 0.0) ? paintMat[1].y : paintMat[2].y) : ((pI.y < 0.0) ? paintMat[1].z : paintMat[2].x);\n"
+		"	vec2 dI = abs(pI) - (heI - vec2(rI));\n"
+		"	float distI = min(max(dI.x, dI.y), 0.0) + length(max(dI, 0.0)) - rI;\n"
+		"	float dist = max(distO, -distI);\n"
+		"	float fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	outColor = fcolor * fragCov;\n"
+		"}\n";
+	const std::string imgFrag = fastUboBlock + varyingsTex + varyingsFull + sdfAndScissorGlsl +
+		"void main(void) {\n"
+		"	vec4 color = texture(tex, ftcoord);\n"
+		"	float fragCov = 1.0;\n"
+		"	vec4 fragCol;\n"
+		"	if (texType == 2) {\n"
+		"		fragCov = color.r;\n"
+		"		fragCol = innerCol * fcolor;\n"
+		"	} else if (texType == 3) {\n"
+		"		fragCol = color * innerCol.a;\n"
+		"	} else if (texType == 4) {\n"
+		"		fragCol = outerCol * (color.a * innerCol.a);\n"
+		"	} else {\n"
+		"		if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
+		"		fragCol = color * innerCol * fcolor;\n"
+		"	}\n"
+		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	outColor = fragCol * fragCov;\n"
+		"}\n";
+	const std::string ringFrag = fastUboBlock + varyingsFull + sdfAndScissorGlsl +
+		"void main(void) {\n"
+		"	float dist;\n"
+		"	if (extent.x > 0.0) {\n"
+		"		vec2 ext2 = extent - vec2(radius, radius);\n"
+		"		vec2 d = abs(ftcoord) - ext2;\n"
+		"		dist = abs(min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - radius) - strokeThr;\n"
+		"	} else if (extent.x < 0.0) {\n"
+		"		vec2 rxry = vec2(-extent.x, extent.y);\n"
+		"		float u = length(ftcoord);\n"
+		"		float grad = max(length(ftcoord / rxry), 0.0001);\n"
+		"		dist = abs(u - 1.0) / grad - strokeThr;\n"
+		"	} else {\n"
+		"		dist = abs(length(ftcoord) - radius) - strokeThr;\n"
+		"	}\n"
+		"	float fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	outColor = fcolor * fragCov;\n"
+		"}\n";
+	const std::string linearGradFrag = fastUboBlock + varyingsFull + sdfAndScissorGlsl +
+		"void main(void) {\n"
+		"	float fragCov = 1.0;\n"
+		"	float d;\n"
+		"	if (radius > 0.5) {\n"
+		"		d = clamp(ftcoord.y, 0.0, 1.0);\n"
+		"	} else {\n"
+		"#ifdef EDGE_AA\n"
+		"		fragCov = evaluate_edge_coverage();\n"
+		"#endif\n"
+		"		d = clamp((paintMat * vec3(fpos, 1.0)).y, 0.0, 1.0);\n"
+		"	}\n"
+		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	outColor = mix(innerCol, outerCol, d) * fragCov;\n"
+		"}\n";
+	const std::string radialGradFrag = fastUboBlock + varyingsFull + sdfAndScissorGlsl +
+		"void main(void) {\n"
+		"	float fragCov = 1.0;\n"
+		"	float d;\n"
+		"	if (strokeMult > 3.5) {\n"
+		"		float dist = length(ftcoord);\n"
+		"		fragCov = clamp((strokeThr - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"		d = clamp(dist * extent.x + extent.y, 0.0, 1.0);\n"
+		"	} else {\n"
+		"		vec2 pt;\n"
+		"		if (strokeMult > 2.5) {\n"
+		"			pt = ftcoord;\n"
+		"		} else if (strokeMult > 1.5) {\n"
+		"			float dist = length(ftcoord);\n"
+		"			fragCov = clamp((1.0 - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"			pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"		} else {\n"
+		"#ifdef EDGE_AA\n"
+		"			fragCov = evaluate_edge_coverage();\n"
+		"#endif\n"
+		"			pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"		}\n"
+		"		d = clamp(length(pt) * extent.x + extent.y, 0.0, 1.0);\n"
+		"	}\n"
+		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	outColor = mix(innerCol, outerCol, d) * fragCov;\n"
+		"}\n";
+	const std::string multiGradLutFrag = fullUboBlock + varyingsTex + varyingsFull + sdfAndScissorGlsl +
+		"void main(void) {\n"
+		"	float fragCov = 1.0;\n"
+		"#ifdef EDGE_AA\n"
+		"	fragCov = evaluate_edge_coverage();\n"
+		"#endif\n"
+		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	vec2 pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"	float t = 0.0;\n"
+		"	if (gradKind == 1) {\n"
+		"		t = (gradParams0.z > 0.5) ? 1.0 : pt.x;\n"
+		"	} else if (gradKind == 2) {\n"
+		"		t = length(pt);\n"
+		"	} else if (gradKind == 3) {\n"
+		"		float angle = (pt.x == 0.0 && pt.y == 0.0) ? 0.0 : atan(pt.y, pt.x);\n"
+		"		if (angle < 0.0) angle += 6.28318530718;\n"
+		"		t = (angle - gradParams0.x) * gradParams0.y;\n"
+		"	} else if (gradKind == 4) {\n"
+		"		bool validT = true;\n"
+		"		if (gradParams1.y > 0.5) {\n"
+		"			float dist = length(pt);\n"
+		"			t = (abs(gradParams0.w) > 1e-6) ? ((dist - gradParams0.z) / gradParams0.w) : 0.0;\n"
+		"		} else {\n"
+		"			float dx = gradParams0.x, dy = gradParams0.y, r0 = gradParams0.z, dr = gradParams0.w, A = gradParams1.x;\n"
+		"			float B = -2.0 * (pt.x * dx + pt.y * dy + r0 * dr);\n"
+		"			float C = dot(pt, pt) - r0 * r0;\n"
+		"			if (abs(A) < 1e-7) {\n"
+		"				if (abs(B) < 1e-7) validT = false;\n"
+		"				else { t = -C / B; if (r0 + t * dr < 0.0) validT = false; }\n"
+		"			} else {\n"
+		"				float disc = B * B - 4.0 * A * C;\n"
+		"				if (disc < 0.0) validT = false;\n"
+		"				else {\n"
+		"					float sq = sqrt(disc);\n"
+		"					float t1 = (-B - sq) / (2.0 * A);\n"
+		"					float t2 = (-B + sq) / (2.0 * A);\n"
+		"					bool v1 = (r0 + t1 * dr) >= -1e-4;\n"
+		"					bool v2 = (r0 + t2 * dr) >= -1e-4;\n"
+		"					if (v1 && !v2) t = t1;\n"
+		"					else if (v2 && !v1) t = t2;\n"
+		"					else if (v1 && v2) t = (dr >= 0.0) ? t1 : t2;\n"
+		"					else validT = false;\n"
+		"				}\n"
+		"			}\n"
+		"		}\n"
+		"		if (!validT) { outColor = vec4(0.0); return; }\n"
+		"	}\n"
+		"	float tm = (spreadMode == 0) ? clamp(t, 0.0, 1.0) : ((spreadMode == 1) ? fract(t) : (1.0 - abs(fract(t * 0.5) * 2.0 - 1.0)));\n"
+		"	vec4 col = texture(tex, vec2((tm * 255.0 + 0.5) / 256.0, 0.5));\n"
+		"	outColor = (col * innerCol.a) * fragCov;\n"
+		"}\n";
+	const std::string multiGradFrag = fullUboBlock + varyingsTex + varyingsFull + sdfAndScissorGlsl + multiGradHelpersGlsl +
+		"void main(void) {\n"
+		"	float fragCov = 1.0;\n"
+		"#ifdef EDGE_AA\n"
+		"	fragCov = evaluate_edge_coverage();\n"
+		"#endif\n"
+		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	outColor = (eval_multi_gradient() * innerCol.a) * fragCov;\n"
+		"}\n";
+	const std::string shadowFrag = fullUboBlock + varyingsFull + sdfAndScissorGlsl + shadowHelpersGlsl +
+		"void main(void) {\n"
+		"	float fragCov = eval_rrect_shadow(ftcoord, extent, vec4(radius, feather, strokeMult, strokeThr), gradParams0.x);\n"
+		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	outColor = innerCol * fragCov;\n"
+		"}\n";
+	const std::string perspectiveImgFrag = fullUboBlock + varyingsTex + varyingsFull + sdfAndScissorGlsl +
+		"void main(void) {\n"
+		"	vec3 uvq = paintMat * vec3(fpos, 1.0);\n"
+		"	if (abs(uvq.z) <= 1e-7) { outColor = vec4(0.0); return; }\n"
+		"	vec2 uv = clamp((uvq.xy / uvq.z) / max(extent, vec2(1.0)), gradParams0.xy, gradParams0.zw);\n"
+		"	vec4 color = texture(tex, uv);\n"
+		"	float fragCov = 1.0;\n"
+		"	vec4 fragCol;\n"
+		"	if (texType == 2) { fragCov = color.r; fragCol = innerCol * fcolor; }\n"
+		"	else if (texType == 3) { fragCol = color * innerCol.a; }\n"
+		"	else if (texType == 4) { fragCol = outerCol * (color.a * innerCol.a); }\n"
+		"	else {\n"
+		"		if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
+		"		fragCol = color * innerCol * fcolor;\n"
+		"	}\n"
+		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	outColor = fragCol * fragCov;\n"
+		"}\n";
+	const std::string blendFastFrag = fullUboBlock + varyingsTex + "uniform sampler2D dstTex;\n" + varyingsFull +
+		effectsHelpersGlsl + sdfAndScissorGlsl +
+		"void main(void) {\n"
+		"	float fragCov = 1.0;\n"
+		"	vec4 fragCol = innerCol;\n"
+		"	if (type == 4) {\n"
+		"#ifdef EDGE_AA\n"
+		"		fragCov = evaluate_edge_coverage();\n"
+		"#endif\n"
+		"		fragCol = fcolor;\n"
+		"	} else if (type == 7) {\n"
+		"		float dist = length(ftcoord);\n"
+		"		fragCov = clamp((1.0 - dist) / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"		fragCol = fcolor;\n"
+		"	} else if (type == 8) {\n"
+		"		vec2 d = (vec2(1.0) - abs(ftcoord)) / max(fwidth(ftcoord), vec2(0.0001));\n"
+		"		vec2 cov = clamp(d + vec2(0.5), 0.0, 1.0);\n"
+		"		fragCov = cov.x * cov.y;\n"
+		"		fragCol = fcolor;\n"
+		"	} else if (type == 9) {\n"
+		"		float r = (ftcoord.x < 0.0) ? ((ftcoord.y < 0.0) ? radius : strokeThr) : ((ftcoord.y < 0.0) ? feather : strokeMult);\n"
+		"		vec2 d = abs(ftcoord) - (extent - vec2(r));\n"
+		"		float dist = min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;\n"
+		"		fragCov = clamp(-dist / max(fwidth(dist), 0.0001) + 0.5, 0.0, 1.0);\n"
+		"		fragCol = fcolor;\n"
+		"	} else if (type == 3) {\n"
+		"		vec4 color = texture(tex, ftcoord);\n"
+		"		if (texType == 2) { fragCov = color.r; fragCol = innerCol * fcolor; }\n"
+		"		else if (texType == 3) { fragCol = color * innerCol.a; }\n"
+		"		else if (texType == 4) { fragCol = outerCol * (color.a * innerCol.a); }\n"
+		"		else {\n"
+		"			if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
+		"			fragCol = color * innerCol * fcolor;\n"
+		"		}\n"
+		"	}\n"
+		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
+		"	ivec2 dstSize = textureSize(dstTex, 0);\n"
+		"	ivec2 dstCoord = clamp(ivec2(gl_FragCoord.xy), ivec2(0), dstSize - ivec2(1));\n"
+		"	vec4 dst = texelFetch(dstTex, dstCoord, 0);\n"
+		"	vec4 blended = nisaba_blend(fragCol, dst, blendMode);\n"
+		"	outColor = mix(dst, blended, fragCov);\n"
+		"}\n";
+	const std::string fastCoreFrag = fastUboBlock + varyingsTex + varyingsFull + sdfAndScissorGlsl + fastCoreBodyGlsl;
+	const std::string effectsFrag  = fullUboBlock + varyingsTex + "uniform sampler2D dstTex;\n" + varyingsFull +
+		effectsHelpersGlsl + sdfAndScissorGlsl + shadowHelpersGlsl + multiGradHelpersGlsl + effectsBodyGlsl;
 
 	checkGLError(m_impl->flags, "init start");
 
-	// Compile main shader WITHOUT discard (STENCIL_STROKES) so hardware Early-Z/Stencil is 100% active!
-	std::string mainOpts;
-	if (m_impl->flags & CreateFlags::Antialias) mainOpts += "#define EDGE_AA 1\n";
-
-	if (!createShader(m_impl->shader, "shader", shaderHeader, mainOpts.empty() ? nullptr : mainOpts.c_str(), fillVertShader, fillFragShader)) {
-		return false;
-	}
-	getUniforms(m_impl->shader);
-
-	auto bindAttr3 = [](GLShader& s) {
-		if (s.prog != 0) {
+	auto finalizeShader = [&](GLShader& s, bool bindColorAttr) {
+		if (s.prog == 0) return;
+		if (bindColorAttr) {
 			glBindAttribLocation(s.prog, 2, "color");
 			glLinkProgram(s.prog);
-			getUniforms(s);
+		}
+		getUniforms(s);
+		if (static_cast<GLuint>(s.loc[LocParams]) != GL_INVALID_INDEX && s.loc[LocParams] >= 0) {
+			glUniformBlockBinding(s.prog, static_cast<GLuint>(s.loc[LocParams]), ParamsBinding);
+		}
+		if (s.loc[LocTex] >= 0 || s.loc[LocDstTex] >= 0) {
+			glUseProgram(s.prog);
+			if (s.loc[LocTex] >= 0) glUniform1i(s.loc[LocTex], 0);
+			if (s.loc[LocDstTex] >= 0) glUniform1i(s.loc[LocDstTex], 1);
+			glUseProgram(0);
 		}
 	};
-	bindAttr3(m_impl->shader);
 
+	std::string mainOpts;
+	if (m_impl->flags & CreateFlags::Antialias) mainOpts += "#define EDGE_AA 1\n";
+	const char* mainOptsPtr = mainOpts.empty() ? nullptr : mainOpts.c_str();
+
+	if (!createShader(m_impl->shader, "shader", shaderHeader, mainOptsPtr, fillVertShader, fastCoreFrag.c_str())) {
+		return false;
+	}
+	finalizeShader(m_impl->shader, true);
+
+	if (createShader(m_impl->effectsShader, "effects_shader", shaderHeader, mainOptsPtr, fillVertShader, effectsFrag.c_str())) {
+		finalizeShader(m_impl->effectsShader, true);
+	}
+	if (createShader(m_impl->rrectShader, "rrect_shader", shaderHeader, nullptr, fillVertShader, rrectFrag.c_str())) {
+		finalizeShader(m_impl->rrectShader, true);
+	}
+	if (createShader(m_impl->drrectShader, "drrect_shader", shaderHeader, nullptr, fillVertShader, drrectFrag.c_str())) {
+		finalizeShader(m_impl->drrectShader, true);
+	}
+	if (createShader(m_impl->imgShader, "img_shader", shaderHeader, nullptr, fillVertShader, imgFrag.c_str())) {
+		finalizeShader(m_impl->imgShader, true);
+	}
+	if (createShader(m_impl->ringShader, "ring_shader", shaderHeader, nullptr, fillVertShader, ringFrag.c_str())) {
+		finalizeShader(m_impl->ringShader, true);
+	}
+	if (createShader(m_impl->linearGradShader, "linear_grad_shader", shaderHeader, mainOptsPtr, fillVertShader, linearGradFrag.c_str())) {
+		finalizeShader(m_impl->linearGradShader, true);
+	}
+	if (createShader(m_impl->radialGradShader, "radial_grad_shader", shaderHeader, mainOptsPtr, fillVertShader, radialGradFrag.c_str())) {
+		finalizeShader(m_impl->radialGradShader, true);
+	}
+	if (createShader(m_impl->multiGradLutShader, "multi_grad_lut_shader", shaderHeader, mainOptsPtr, fillVertShader, multiGradLutFrag.c_str())) {
+		finalizeShader(m_impl->multiGradLutShader, true);
+	}
+	if (createShader(m_impl->multiGradShader, "multi_grad_shader", shaderHeader, mainOptsPtr, fillVertShader, multiGradFrag.c_str())) {
+		finalizeShader(m_impl->multiGradShader, true);
+	}
+	if (createShader(m_impl->shadowShader, "shadow_shader", shaderHeader, nullptr, fillVertShader, shadowFrag.c_str())) {
+		finalizeShader(m_impl->shadowShader, true);
+	}
+	if (createShader(m_impl->perspectiveImgShader, "perspective_img_shader", shaderHeader, nullptr, fillVertShader, perspectiveImgFrag.c_str())) {
+		finalizeShader(m_impl->perspectiveImgShader, true);
+	}
+	if (createShader(m_impl->blendFastShader, "blend_fast_shader", shaderHeader, mainOptsPtr, fillVertShader, blendFastFrag.c_str())) {
+		finalizeShader(m_impl->blendFastShader, true);
+	}
 	if (createShader(m_impl->simpleShader, "simple_shader", shaderHeader, nullptr, simpleVertShader, simpleFragShader)) {
-		getUniforms(m_impl->simpleShader);
+		finalizeShader(m_impl->simpleShader, false);
+	}
+	if (createShader(m_impl->simpleColorShader, "simple_color_shader", shaderHeader, nullptr, simpleVertShader, simpleColorFrag.c_str())) {
+		finalizeShader(m_impl->simpleColorShader, false);
 	}
 	if (createShader(m_impl->solidVertShader, "solid_vert_shader", shaderHeader, nullptr, fillVertShader, solidVertFragShader)) {
-		bindAttr3(m_impl->solidVertShader);
+		finalizeShader(m_impl->solidVertShader, true);
 	}
 	if (createShader(m_impl->circleVertShader, "circle_vert_shader", shaderHeader, nullptr, fillVertShader, circleVertFragShader)) {
-		bindAttr3(m_impl->circleVertShader);
+		finalizeShader(m_impl->circleVertShader, true);
 	}
 	if (createShader(m_impl->rectVertShader, "rect_vert_shader", shaderHeader, nullptr, fillVertShader, rectVertFragShader)) {
-		bindAttr3(m_impl->rectVertShader);
+		finalizeShader(m_impl->rectVertShader, true);
+	}
+	{
+		static const char* blurVertShader =
+			"out vec2 vUv;\n"
+			"void main(void) {\n"
+			"	vec2 pos = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);\n"
+			"	vUv = 0.5 * pos + vec2(0.5);\n"
+			"	gl_Position = vec4(pos, 0.0, 1.0);\n"
+			"}\n";
+		static const char* blurFragShader =
+			"uniform sampler2D uTex;\n"
+			"uniform vec2 uTexelOffset;\n"
+			"uniform int uRadius;\n"
+			"uniform float uSigma;\n"
+			"uniform vec4 uUvBounds;\n"
+			"in vec2 vUv;\n"
+			"out vec4 outColor;\n"
+			"void main(void) {\n"
+			"	vec2 uvMin = uUvBounds.xy;\n"
+			"	vec2 uvMax = uUvBounds.zw;\n"
+			"	vec4 sum = texture(uTex, clamp(vUv, uvMin, uvMax));\n"
+			"	float weightSum = 1.0;\n"
+			"	if (uRadius > 0 && uSigma > 0.001) {\n"
+			"		float inv2Sig2 = 1.0 / (2.0 * uSigma * uSigma);\n"
+			"		// Bilinear tap pairing: exact mathematical Gaussian with 50% fewer texture fetches\n"
+			"		for (int i = 1; i <= 32; i += 2) {\n"
+			"			if (i > uRadius) break;\n"
+			"			float f1 = float(i);\n"
+			"			float w1 = exp(-(f1 * f1) * inv2Sig2);\n"
+			"			if (i + 1 <= uRadius) {\n"
+			"				float f2 = float(i + 1);\n"
+			"				float w2 = exp(-(f2 * f2) * inv2Sig2);\n"
+			"				float w12 = w1 + w2;\n"
+			"				vec2 off = uTexelOffset * (f1 + w2 / max(w12, 1e-6));\n"
+			"				sum += (texture(uTex, clamp(vUv + off, uvMin, uvMax)) + texture(uTex, clamp(vUv - off, uvMin, uvMax))) * w12;\n"
+			"				weightSum += 2.0 * w12;\n"
+			"			} else {\n"
+			"				vec2 off = uTexelOffset * f1;\n"
+			"				sum += (texture(uTex, clamp(vUv + off, uvMin, uvMax)) + texture(uTex, clamp(vUv - off, uvMin, uvMax))) * w1;\n"
+			"				weightSum += 2.0 * w1;\n"
+			"			}\n"
+			"		}\n"
+			"	}\n"
+			"	outColor = sum / weightSum;\n"
+			"}\n";
+		if (createShader(m_impl->blurShader, "blur_shader", shaderHeader, nullptr, blurVertShader, blurFragShader)) {
+			m_impl->locBlurTex = glGetUniformLocation(m_impl->blurShader.prog, "uTex");
+			m_impl->locBlurTexelOffset = glGetUniformLocation(m_impl->blurShader.prog, "uTexelOffset");
+			m_impl->locBlurRadius = glGetUniformLocation(m_impl->blurShader.prog, "uRadius");
+			m_impl->locBlurSigma = glGetUniformLocation(m_impl->blurShader.prog, "uSigma");
+			m_impl->locBlurUvBounds = glGetUniformLocation(m_impl->blurShader.prog, "uUvBounds");
+		}
 	}
 
 	if (m_impl->flags & CreateFlags::StencilStrokes) {
 		std::string stencilOpts = mainOpts + "#define STENCIL_STROKES 1\n";
-		if (createShader(m_impl->stencilStrokeShader, "stencil_stroke_shader", shaderHeader, stencilOpts.c_str(), fillVertShader, fillFragShader)) {
-			bindAttr3(m_impl->stencilStrokeShader);
-			glUniformBlockBinding(m_impl->stencilStrokeShader.prog, m_impl->stencilStrokeShader.loc[LocParams], ParamsBinding);
-			glUseProgram(m_impl->stencilStrokeShader.prog);
-			glUniform1i(m_impl->stencilStrokeShader.loc[LocTex], 0);
-			glUseProgram(0);
+		if (createShader(m_impl->stencilStrokeShader, "stencil_stroke_shader", shaderHeader, stencilOpts.c_str(), fillVertShader, fastCoreFrag.c_str())) {
+			finalizeShader(m_impl->stencilStrokeShader, true);
+		}
+		if (createShader(m_impl->stencilEffectsShader, "stencil_effects_shader", shaderHeader, stencilOpts.c_str(), fillVertShader, effectsFrag.c_str())) {
+			finalizeShader(m_impl->stencilEffectsShader, true);
 		}
 	}
 
@@ -1323,15 +3072,42 @@ bool GL3Renderer::init() {
 	glBindVertexArray(0);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-	glUniformBlockBinding(m_impl->shader.prog, m_impl->shader.loc[LocParams], ParamsBinding);
 	glGenBuffers(1, &m_impl->fragBuf);
 
 	GLint align = 4;
 	glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &align);
-	m_impl->fragSize = sizeof(FragUniforms) + align - (sizeof(FragUniforms) % align);
+	if (align <= 0) align = 4;
+	auto alignUp = [align](size_t bytes) -> int {
+		const size_t a = static_cast<size_t>(align);
+		return static_cast<int>(((bytes + a - 1) / a) * a);
+	};
+	m_impl->fragFastSize = alignUp(kFastUniformBytes);
+	m_impl->fragSize     = alignUp(sizeof(FragUniforms));
+
+#if defined(NISABA_TARGET_GLES)
+	constexpr bool samplers_supported = true;
+#else
+	const bool samplers_supported = (glGenSamplers && glDeleteSamplers && glBindSampler && glSamplerParameteri);
+#endif
+	if (samplers_supported) {
+		m_impl->hasSamplerObjects = true;
+		constexpr GLenum filters[2] = {GL_NEAREST, GL_LINEAR};
+		constexpr GLenum wraps[3]   = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT};
+		for (int fi = 0; fi < 2; ++fi) {
+			for (int wi = 0; wi < 3; ++wi) {
+				GLuint s = 0;
+				glGenSamplers(1, &s);
+				glSamplerParameteri(s, GL_TEXTURE_MIN_FILTER, filters[fi]);
+				glSamplerParameteri(s, GL_TEXTURE_MAG_FILTER, filters[fi]);
+				glSamplerParameteri(s, GL_TEXTURE_WRAP_S, wraps[wi]);
+				glSamplerParameteri(s, GL_TEXTURE_WRAP_T, wraps[wi]);
+				m_impl->samplerCache[fi][wi] = s;
+			}
+		}
+	}
 
 	// Pre-allocate ring buffers once at init to avoid per-frame GEM allocations
-	m_impl->fragBufCap = (524288 / m_impl->fragSize) * m_impl->fragSize;
+	m_impl->fragBufCap = (1048576 / m_impl->fragSize) * m_impl->fragSize;
 	glBindBuffer(GL_UNIFORM_BUFFER, m_impl->fragBuf);
 	glBufferData(GL_UNIFORM_BUFFER, m_impl->fragBufCap, nullptr, GL_STREAM_DRAW);
 	glBindBuffer(GL_UNIFORM_BUFFER, 0);
@@ -1345,10 +3121,6 @@ bool GL3Renderer::init() {
 	m_impl->dummyTex = createTexture(TextureType::Alpha, 1, 1, 0, nullptr);
 	m_impl->dummyTexPtr = m_impl->findTexture(m_impl->dummyTex);
 
-	glUseProgram(m_impl->shader.prog);
-	glUniform1i(m_impl->shader.loc[LocTex], 0);
-	glUseProgram(0);
-
 	checkGLError(m_impl->flags, "init done");
 	glFinish();
 	return true;
@@ -1358,11 +3130,47 @@ void GL3Renderer::shutdown() {
 	if (!m_impl) return;
 
 	deleteShader(m_impl->shader);
+	deleteShader(m_impl->rrectShader);
+	deleteShader(m_impl->drrectShader);
+	deleteShader(m_impl->imgShader);
+	deleteShader(m_impl->ringShader);
+	deleteShader(m_impl->linearGradShader);
+	deleteShader(m_impl->radialGradShader);
+	deleteShader(m_impl->multiGradLutShader);
+	deleteShader(m_impl->multiGradShader);
+	deleteShader(m_impl->shadowShader);
+	deleteShader(m_impl->perspectiveImgShader);
+	deleteShader(m_impl->blendFastShader);
+	deleteShader(m_impl->effectsShader);
 	deleteShader(m_impl->stencilStrokeShader);
+	deleteShader(m_impl->stencilEffectsShader);
 	deleteShader(m_impl->simpleShader);
+	deleteShader(m_impl->simpleColorShader);
 	deleteShader(m_impl->solidVertShader);
 	deleteShader(m_impl->circleVertShader);
 	deleteShader(m_impl->rectVertShader);
+	deleteShader(m_impl->blurShader);
+	for (int t = 0; t < 3; ++t) {
+		for (int k = 0; k < 2; ++k) {
+			if (m_impl->blurTierFbo[t][k] != 0) {
+				glDeleteFramebuffers(1, &m_impl->blurTierFbo[t][k]);
+				m_impl->blurTierFbo[t][k] = 0;
+			}
+			if (m_impl->blurTierTex[t][k] != 0) {
+				glDeleteTextures(1, &m_impl->blurTierTex[t][k]);
+				m_impl->blurTierTex[t][k] = 0;
+			}
+		}
+		m_impl->blurTierW[t] = 0;
+		m_impl->blurTierH[t] = 0;
+	}
+	for (auto& lf : m_impl->layerPool) {
+		if (lf.fbo != 0) glDeleteFramebuffers(1, &lf.fbo);
+		if (lf.colorTex != 0) glDeleteTextures(1, &lf.colorTex);
+		if (lf.depthStencilRb != 0) glDeleteRenderbuffers(1, &lf.depthStencilRb);
+	}
+	m_impl->layerPool.clear();
+	m_impl->activeLayers.clear();
 
 	if (m_impl->fragBuf != 0) {
 		glDeleteBuffers(1, &m_impl->fragBuf);
@@ -1376,6 +3184,16 @@ void GL3Renderer::shutdown() {
 		glDeleteBuffers(1, &m_impl->vertBuf);
 		m_impl->vertBuf = 0;
 	}
+	if (m_impl->dstSnapFbo != 0) {
+		glDeleteFramebuffers(1, &m_impl->dstSnapFbo);
+		m_impl->dstSnapFbo = 0;
+	}
+	if (m_impl->dstSnapTex != 0) {
+		glDeleteTextures(1, &m_impl->dstSnapTex);
+		m_impl->dstSnapTex = 0;
+	}
+	m_impl->dstSnapW = 0;
+	m_impl->dstSnapH = 0;
 
 	for (auto& t : m_impl->textures) {
 		if (t.tex != 0 && (t.flags & ImageFlagsGL::ImageNoDelete) == 0) {
@@ -1383,6 +3201,18 @@ void GL3Renderer::shutdown() {
 		}
 	}
 	m_impl->textures.clear();
+
+	if (m_impl->hasSamplerObjects) {
+		for (int fi = 0; fi < 2; ++fi) {
+			for (int wi = 0; wi < 3; ++wi) {
+				if (m_impl->samplerCache[fi][wi] != 0) {
+					glDeleteSamplers(1, &m_impl->samplerCache[fi][wi]);
+					m_impl->samplerCache[fi][wi] = 0;
+				}
+			}
+		}
+		m_impl->hasSamplerObjects = false;
+	}
 }
 
 bool GL3Renderer::edgeAntiAlias() const {
@@ -1390,26 +3220,47 @@ bool GL3Renderer::edgeAntiAlias() const {
 }
 
 int GL3Renderer::createTexture(TextureType type, int width, int height, int imageFlags, const unsigned char* data) {
+	return createTextureWithStride(type, width, height, 0, imageFlags, data);
+}
+
+int GL3Renderer::createTextureWithStride(TextureType type, int width, int height, int strideBytes, int imageFlags, const unsigned char* data) {
+	if (width <= 0 || height <= 0) return 0;
+
+	int bpp = (type == TextureType::Alpha) ? 1 : 4;
+	int tightStride = width * bpp;
+	int effectiveStride = (strideBytes > 0) ? strideBytes : tightStride;
+	if (effectiveStride < tightStride) return 0;
+
+	if (data && ((type == TextureType::BGRA && m_impl->isGLES) || (effectiveStride % bpp != 0))) {
+		return Renderer::createTextureWithStride(type, width, height, strideBytes, imageFlags, data);
+	}
+
 	Texture* tex = m_impl->allocTexture();
 	if (!tex) return 0;
 
 	glGenTextures(1, &tex->tex);
 	tex->width = width;
 	tex->height = height;
-	tex->type = type;
+	tex->type = (type == TextureType::Alpha) ? TextureType::Alpha : TextureType::RGBA;
 	tex->flags = imageFlags;
 	glActiveTexture(GL_TEXTURE0);
 	m_impl->bindTexture(tex->tex);
 
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-	glPixelStorei(GL_UNPACK_ROW_LENGTH, tex->width);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, (data && effectiveStride != tightStride) ? (effectiveStride / bpp) : tex->width);
 	glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
 	glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
 
-	if (type == TextureType::RGBA) {
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-	} else {
+	if (type == TextureType::Alpha) {
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, data);
+	} else if (type == TextureType::BGRA) {
+#ifdef GL_BGRA
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, data);
+#else
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+#endif
+	} else {
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
 	}
 
 	if ((imageFlags & ImageFlags::ImageGenerateMipmaps) != 0) {
@@ -1432,8 +3283,14 @@ int GL3Renderer::createTexture(TextureType type, int width, int height, int imag
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	}
 
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, (imageFlags & ImageFlags::ImageRepeatX) ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, (imageFlags & ImageFlags::ImageRepeatY) ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+	const GLenum wrapS = (imageFlags & ImageFlags::ImageMirrorX)
+	    ? GL_MIRRORED_REPEAT
+	    : ((imageFlags & ImageFlags::ImageRepeatX) ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+	const GLenum wrapT = (imageFlags & ImageFlags::ImageMirrorY)
+	    ? GL_MIRRORED_REPEAT
+	    : ((imageFlags & ImageFlags::ImageRepeatY) ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
 
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
@@ -1490,6 +3347,11 @@ bool GL3Renderer::getTextureSize(int image, int& outWidth, int& outHeight) {
 	return true;
 }
 
+int GL3Renderer::textureFlags(int image) const {
+	Texture* tex = m_impl->findTexture(image);
+	return tex ? tex->flags : 0;
+}
+
 int GL3Renderer::createTextureFromNativeHandle(uint64_t handle, int w, int h, int imageFlags) {
 	return createImageFromHandle(static_cast<uint32_t>(handle), w, h, imageFlags | ImageFlagsGL::ImageNoDelete);
 }
@@ -1510,6 +3372,24 @@ uint32_t GL3Renderer::imageHandle(int image) const {
 	return tex ? tex->tex : 0;
 }
 
+void GL3Renderer::resetState() {
+	if (!m_impl) return;
+	m_impl->resetCachedGLState();
+	glActiveTexture(GL_TEXTURE0);
+	if (m_impl->hasSamplerObjects) {
+		glBindSampler(0, 0);
+		glBindSampler(1, 0);
+	}
+	glBlendEquation(GL_FUNC_ADD);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+	glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+	glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glBindVertexArray(0);
+	glUseProgram(0);
+}
+
 void GL3Renderer::viewport(float width, float height, float devicePixelRatio) {
 	(void)devicePixelRatio;
 	if (m_impl->view[0] != width || m_impl->view[1] != height) {
@@ -1522,23 +3402,36 @@ void GL3Renderer::viewport(float width, float height, float devicePixelRatio) {
 			}
 		};
 		setView(m_impl->shader);
+		setView(m_impl->rrectShader);
+		setView(m_impl->drrectShader);
+		setView(m_impl->imgShader);
+		setView(m_impl->ringShader);
+		setView(m_impl->linearGradShader);
+		setView(m_impl->radialGradShader);
+		setView(m_impl->multiGradLutShader);
+		setView(m_impl->multiGradShader);
+		setView(m_impl->shadowShader);
+		setView(m_impl->perspectiveImgShader);
+		setView(m_impl->blendFastShader);
+		setView(m_impl->effectsShader);
 		setView(m_impl->stencilStrokeShader);
+		setView(m_impl->stencilEffectsShader);
 		setView(m_impl->simpleShader);
+		setView(m_impl->simpleColorShader);
 		setView(m_impl->solidVertShader);
 		setView(m_impl->circleVertShader);
 		setView(m_impl->rectVertShader);
+		glUseProgram(0);
 		m_impl->activeProg = 0;
 	}
 }
 
 void GL3Renderer::cancel() {
-	m_impl->verts.clear();
-	m_impl->paths.clear();
-	m_impl->calls.clear();
-	m_impl->uniforms.clear();
-	m_impl->boundUniformOffset = -1;
-	m_impl->lastUniformOffset = -1;
+	m_impl->clearBatchBuffers();
+	m_impl->activeLayers.clear();
+	for (auto& lf : m_impl->layerPool) lf.inUse = false;
 	m_impl->currentClipDepth = 0;
+	m_impl->flushedClipDepth = 0;
 }
 
 void GL3Renderer::flush() {
@@ -1550,7 +3443,8 @@ void GL3Renderer::flush() {
 	{
 		const Call& c0 = m_impl->calls[0];
 		if (c0.type == CallType::Triangles && c0.triangleCount == 6 &&
-		    c0.clipDepth == 0 && c0.scissorRect[0] < 0 && c0.customShader == nullptr &&
+		    !c0.programmableBlend && c0.uniformOffset >= 0 && !Impl::bucketNeedsFullUbo(c0.bucket) &&
+		    c0.clipDepth == 0 && m_impl->flushedClipDepth == 0 && c0.scissorRect[0] < 0 && c0.customShader == nullptr &&
 		    (c0.blendFunc.srcRGB == GL_ONE && (c0.blendFunc.dstRGB == GL_ONE_MINUS_SRC_ALPHA || c0.blendFunc.dstRGB == GL_ZERO))) {
 			const FragUniforms* f0 = m_impl->fragUniformPtr(c0.uniformOffset);
 			if (f0->type == ShaderSimple && f0->innerCol.a >= 0.999f) {
@@ -1560,56 +3454,56 @@ void GL3Renderer::flush() {
 				glClear(GL_COLOR_BUFFER_BIT);
 				firstCallIdx = 1;
 				if (m_impl->calls.size() == 1) {
-					cancel();
+					m_impl->clearBatchBuffers();
 					return;
 				}
 			}
 		}
 	}
 
-	m_impl->activeProg = 0;
+	m_impl->resetCachedGLState();
 	m_impl->useProgramCached(m_impl->shader.prog);
 
 	glEnable(GL_CULL_FACE);
 	glCullFace(GL_BACK);
 	glFrontFace(GL_CCW);
 	glEnable(GL_BLEND);
+	glBlendEquation(GL_FUNC_ADD);
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_STENCIL_TEST);
 	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	glActiveTexture(GL_TEXTURE0);
+	if (m_impl->hasSamplerObjects) glBindSampler(0, 0);
 
-	m_impl->boundTexture = 0;
-	m_impl->stencilEnabled = false;
-	m_impl->stencilMaskVal = 0xffffffff;
-	m_impl->stencilFuncMode = GL_ALWAYS;
-	m_impl->stencilFuncRefVal = 0;
-	m_impl->stencilFuncMaskVal = 0xffffffff;
-	m_impl->blendState = Blend{};
-	m_impl->boundUniformOffset = -1;
-	m_impl->scissorEnabled = false;
-	m_impl->currentScissor[0] = -1;
-	m_impl->currentScissor[1] = -1;
-	m_impl->currentScissor[2] = -1;
-	m_impl->currentScissor[3] = -1;
-
-	// Stream UBO via persistent ring buffer (zero per-frame GEM allocations)
+	// Stream UBO via unsynchronized ring buffer (eliminates Mesa staging-BO copies & GPU stalls)
 	size_t uboBytes = m_impl->uniforms.size();
 	if (uboBytes > 0) {
 		glBindBuffer(GL_UNIFORM_BUFFER, m_impl->fragBuf);
 		if (m_impl->fragBufCap == 0 || m_impl->fragRingOffset + uboBytes > m_impl->fragBufCap) {
-			size_t minCap = (524288 / m_impl->fragSize) * m_impl->fragSize;
+			size_t minCap = (2097152 / m_impl->fragSize) * m_impl->fragSize;
 			m_impl->fragBufCap = std::max(m_impl->fragBufCap, std::max(uboBytes * 4, minCap));
 			glBufferData(GL_UNIFORM_BUFFER, m_impl->fragBufCap, nullptr, GL_STREAM_DRAW);
 			m_impl->fragRingOffset = 0;
 		}
 		m_impl->baseUboOffset = static_cast<int>(m_impl->fragRingOffset);
-		glBufferSubData(GL_UNIFORM_BUFFER, m_impl->baseUboOffset, uboBytes, m_impl->uniforms.data());
+		bool mapped = false;
+		if (glMapBufferRange != nullptr && glUnmapBuffer != nullptr) {
+			void* dst = glMapBufferRange(GL_UNIFORM_BUFFER, m_impl->baseUboOffset, uboBytes,
+			                             GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+			if (dst != nullptr) {
+				std::memcpy(dst, m_impl->uniforms.data(), uboBytes);
+				glUnmapBuffer(GL_UNIFORM_BUFFER);
+				mapped = true;
+			}
+		}
+		if (!mapped) {
+			glBufferSubData(GL_UNIFORM_BUFFER, m_impl->baseUboOffset, uboBytes, m_impl->uniforms.data());
+		}
 		m_impl->fragRingOffset += uboBytes;
 	}
 
-	// Stream VBO via persistent ring buffer (zero per-frame GEM allocations)
+	// Stream VBO via unsynchronized ring buffer (eliminates Mesa staging-BO copies & GPU stalls)
 	glBindVertexArray(m_impl->vertArr);
 	int nverts = static_cast<int>(m_impl->verts.size());
 	size_t vertBytes = static_cast<size_t>(nverts) * sizeof(Vertex);
@@ -1621,13 +3515,89 @@ void GL3Renderer::flush() {
 			m_impl->vertRingPos = 0;
 		}
 		m_impl->baseVertOffset = m_impl->vertRingPos;
-		glBufferSubData(GL_ARRAY_BUFFER, static_cast<GLintptr>(m_impl->baseVertOffset) * sizeof(Vertex), vertBytes, m_impl->verts.data());
+		bool mapped = false;
+		if (glMapBufferRange != nullptr && glUnmapBuffer != nullptr) {
+			void* dst = glMapBufferRange(GL_ARRAY_BUFFER,
+			                             static_cast<GLintptr>(m_impl->baseVertOffset) * sizeof(Vertex),
+			                             vertBytes,
+			                             GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+			if (dst != nullptr) {
+				std::memcpy(dst, m_impl->verts.data(), vertBytes);
+				glUnmapBuffer(GL_ARRAY_BUFFER);
+				mapped = true;
+			}
+		}
+		if (!mapped) {
+			glBufferSubData(GL_ARRAY_BUFFER, static_cast<GLintptr>(m_impl->baseVertOffset) * sizeof(Vertex), vertBytes, m_impl->verts.data());
+		}
 		m_impl->vertRingPos += nverts;
 	}
 
-	int activeClipDepth = 0;
+	int activeClipDepth = m_impl->flushedClipDepth;
+	bool usedProgrammableBlend = false;
+	struct SnapRect { float b[4]; };
+	bool dstSnapValid = false;
+	GLuint dstSnapFboBound = 0;
+	float dstSnapRect[4]{0.0f, 0.0f, 0.0f, 0.0f};
+	std::vector<SnapRect> dirtySnapRects;
+	auto rectOverlaps = [](const float a[4], const float b[4]) noexcept -> bool {
+		return !(a[2] <= b[0] || b[2] <= a[0] || a[3] <= b[1] || b[3] <= a[1]);
+	};
+	auto rectContained = [](const float inner[4], const float outer[4]) noexcept -> bool {
+		return inner[0] >= outer[0] && inner[1] >= outer[1] &&
+		       inner[2] <= outer[2] && inner[3] <= outer[3];
+	};
+	m_impl->activeLayers.clear();
+	for (auto& lf : m_impl->layerPool) lf.inUse = false;
 	for (size_t idx = firstCallIdx; idx < m_impl->calls.size(); ++idx) {
 		const auto& call = m_impl->calls[idx];
+		if (call.programmableBlend && call.type != CallType::PopLayer) {
+			m_impl->ensureBaseTargetInfo();
+			const GLuint curFbo = !m_impl->activeLayers.empty()
+				? m_impl->layerPool[m_impl->activeLayers.back().poolIndex].fbo
+				: m_impl->baseDrawFbo;
+			bool canReuseSnap = dstSnapValid && (dstSnapFboBound == curFbo) &&
+			                    call.hasCallBounds && rectContained(call.callBounds, dstSnapRect);
+			if (canReuseSnap) {
+				for (const auto& dr : dirtySnapRects) {
+					if (rectOverlaps(call.callBounds, dr.b)) {
+						canReuseSnap = false;
+						break;
+					}
+				}
+			}
+			if (!canReuseSnap) {
+				if (call.hasCallBounds) {
+					float unionB[4]{call.callBounds[0], call.callBounds[1], call.callBounds[2], call.callBounds[3]};
+					int lookahead = 1;
+					const size_t maxLook = std::min(m_impl->calls.size(), idx + 64);
+					for (size_t j = idx + 1; j < maxLook; ++j) {
+						const auto& nextC = m_impl->calls[j];
+						if (nextC.type == CallType::PushLayer || nextC.type == CallType::PopLayer) break;
+						if (nextC.programmableBlend && nextC.hasCallBounds) {
+							unionB[0] = std::min(unionB[0], nextC.callBounds[0]);
+							unionB[1] = std::min(unionB[1], nextC.callBounds[1]);
+							unionB[2] = std::max(unionB[2], nextC.callBounds[2]);
+							unionB[3] = std::max(unionB[3], nextC.callBounds[3]);
+							++lookahead;
+						}
+					}
+					m_impl->captureDstSnapshot(true, unionB, (lookahead == 1) ? call.scissorRect : nullptr);
+					dstSnapValid = true;
+					dstSnapFboBound = curFbo;
+					dstSnapRect[0] = unionB[0];
+					dstSnapRect[1] = unionB[1];
+					dstSnapRect[2] = unionB[2];
+					dstSnapRect[3] = unionB[3];
+					dirtySnapRects.clear();
+				} else {
+					m_impl->captureDstSnapshotForCall(call);
+					dstSnapValid = false;
+					dirtySnapRects.clear();
+				}
+			}
+			usedProgrammableBlend = true;
+		}
 		m_impl->blendFuncSeparate(call.blendFunc);
 		bool needScissor = (call.scissorRect[0] >= 0);
 		if (m_impl->scissorEnabled != needScissor) {
@@ -1657,6 +3627,16 @@ void GL3Renderer::flush() {
 			case CallType::RestoreClip:
 				m_impl->restoreClip(call, activeClipDepth);
 				break;
+			case CallType::PushLayer:
+				m_impl->pushLayer(call, activeClipDepth);
+				dstSnapValid = false;
+				dirtySnapRects.clear();
+				break;
+			case CallType::PopLayer:
+				m_impl->popLayer(call, activeClipDepth, usedProgrammableBlend);
+				dstSnapValid = false;
+				dirtySnapRects.clear();
+				break;
 			case CallType::Fill:
 				m_impl->fill(call, activeClipDepth);
 				break;
@@ -1671,6 +3651,30 @@ void GL3Renderer::flush() {
 				break;
 			default:
 				break;
+		}
+		if (dstSnapValid &&
+		    (call.type == CallType::Fill || call.type == CallType::ConvexFill ||
+		     call.type == CallType::Stroke || call.type == CallType::Triangles)) {
+			if (call.hasCallBounds && dirtySnapRects.size() < 64) {
+				dirtySnapRects.push_back(SnapRect{{
+					call.callBounds[0] - 2.0f, call.callBounds[1] - 2.0f,
+					call.callBounds[2] + 2.0f, call.callBounds[3] + 2.0f
+				}});
+			} else if (call.type == CallType::Triangles && call.triangleCount > 0 &&
+			           call.triangleCount <= 64 && dirtySnapRects.size() < 64) {
+				const Vertex* vp = &m_impl->verts[call.triangleOffset];
+				float x0 = vp[0].x, y0 = vp[0].y, x1 = vp[0].x, y1 = vp[0].y;
+				for (int vi = 1; vi < call.triangleCount; ++vi) {
+					x0 = std::min(x0, vp[vi].x);
+					y0 = std::min(y0, vp[vi].y);
+					x1 = std::max(x1, vp[vi].x);
+					y1 = std::max(y1, vp[vi].y);
+				}
+				dirtySnapRects.push_back(SnapRect{{x0 - 2.0f, y0 - 2.0f, x1 + 2.0f, y1 + 2.0f}});
+			} else {
+				dstSnapValid = false;
+				dirtySnapRects.clear();
+			}
 		}
 	}
 
@@ -1687,15 +3691,37 @@ void GL3Renderer::flush() {
 		glDisable(GL_SCISSOR_TEST);
 		m_impl->scissorEnabled = false;
 	}
+	if (m_impl->hasSamplerObjects && m_impl->boundSampler != 0) {
+		glBindSampler(0, 0);
+		m_impl->boundSampler = 0;
+	}
+	if (usedProgrammableBlend) {
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glActiveTexture(GL_TEXTURE0);
+	}
 	glDisable(GL_CULL_FACE);
 
-	cancel();
+	if (!m_impl->activeLayers.empty()) {
+		glBindFramebuffer(GL_FRAMEBUFFER, m_impl->activeLayers.front().parentFbo);
+		m_impl->activeLayers.clear();
+		for (auto& lf : m_impl->layerPool) lf.inUse = false;
+	}
+
+	glBindVertexArray(0);
+	glUseProgram(0);
+	m_impl->activeProg = 0;
+	m_impl->boundTexture = 0;
+	m_impl->flushedClipDepth = activeClipDepth;
+	m_impl->clearBatchBuffers();
 }
 
 void GL3Renderer::renderFill(const Paint& paint, const CompositeOperationState& compOp,
                              const Scissor& scissor, float fringe, const float* bounds,
                              const Path* paths, int npaths) {
-	Blend blend = convertBlend(compOp);
+	const bool programmableBlend = compOp.isProgrammableBlend;
+	const int blendModeId = programmableBlend ? (static_cast<int>(compOp.blendMode) + 1) : 0;
+	Blend blend = programmableBlend ? Blend{GL_ONE, GL_ZERO, GL_ONE, GL_ZERO} : convertBlend(compOp);
 	int hwScissor[4]{-1, -1, -1, -1};
 	bool hasHwScissor = m_impl->getHardwareScissor(scissor, hwScissor);
 	Scissor effectiveScissor = scissor;
@@ -1730,8 +3756,10 @@ void GL3Renderer::renderFill(const Paint& paint, const CompositeOperationState& 
 		triangleCount = 0;
 	}
 
+	const bool fastPrefixOnly = !paintUsesFullEffects(paint, blendModeId);
 	FragUniforms tempFrag;
-	m_impl->convertPaint(&tempFrag, paint, effectiveScissor, fringe, fringe, -1.0f, hasHwScissor);
+	m_impl->convertPaint(&tempFrag, paint, effectiveScissor, fringe, fringe, -1.0f, hasHwScissor, blendModeId, fastPrefixOnly);
+	const ShaderBucket bucket = m_impl->classifyPaintBucket(tempFrag, paint.image, paint.customShader != nullptr, true);
 
 	uint32_t c = paint.innerColor.premultiplied().toRGBA8();
 
@@ -1744,64 +3772,56 @@ void GL3Renderer::renderFill(const Paint& paint, const CompositeOperationState& 
 
 	if (numTriVerts > 0) {
 		const Path& p = paths[0];
-		// Try coalescing with previous Call if both are Triangles and have identical state
-		if (!m_impl->calls.empty()) {
-			Call& last = m_impl->calls.back();
-			if (last.type == CallType::Triangles &&
-			    last.image == paint.image &&
-			    last.customShader == paint.customShader &&
-			    last.blendFunc.srcRGB == blend.srcRGB &&
-			    last.blendFunc.dstRGB == blend.dstRGB &&
-			    last.blendFunc.srcAlpha == blend.srcAlpha &&
-			    last.blendFunc.dstAlpha == blend.dstAlpha &&
-			    last.scissorRect[0] == (hasHwScissor ? hwScissor[0] : -1) &&
-			    last.scissorRect[1] == (hasHwScissor ? hwScissor[1] : -1) &&
-			    last.scissorRect[2] == (hasHwScissor ? hwScissor[2] : -1) &&
-			    last.scissorRect[3] == (hasHwScissor ? hwScissor[3] : -1) &&
-			    last.clipDepth == m_impl->currentClipDepth) {
+		if (Call* last = m_impl->findCoalescableTrianglesCall(bucket, paint.image, paint.customShader, paint.xform,
+		                                                      blend, hasHwScissor, hwScissor, programmableBlend, tempFrag)) {
+			int offset = static_cast<int>(m_impl->verts.size());
+			m_impl->verts.resize(offset + numTriVerts);
+			Vertex* dst = &m_impl->verts[offset];
 
-				FragUniforms* lastFrag = m_impl->fragUniformPtr(last.uniformOffset);
-				if (paint.customShader != nullptr || std::memcmp(lastFrag, &tempFrag, sizeof(FragUniforms)) == 0) {
-					int offset = static_cast<int>(m_impl->verts.size());
-					m_impl->verts.resize(offset + numTriVerts);
-					Vertex* dst = &m_impl->verts[offset];
-
-					if (p.fillCount >= 3 && p.fill != nullptr) {
-						const Vertex& v0 = p.fill[0];
-						for (int k = 0; k < p.fillCount - 2; ++k) {
-							dst[0] = v0;            dst[0].color = c;
-							dst[1] = p.fill[k + 1]; dst[1].color = c;
-							dst[2] = p.fill[k + 2]; dst[2].color = c;
-							dst += 3;
-						}
-					}
-					if (p.strokeCount >= 3 && p.stroke != nullptr) {
-						for (int k = 0; k < p.strokeCount - 2; ++k) {
-							if ((k & 1) == 0) {
-								dst[0] = p.stroke[k];     dst[0].color = c;
-								dst[1] = p.stroke[k + 1]; dst[1].color = c;
-								dst[2] = p.stroke[k + 2]; dst[2].color = c;
-							} else {
-								dst[0] = p.stroke[k + 1]; dst[0].color = c;
-								dst[1] = p.stroke[k];     dst[1].color = c;
-								dst[2] = p.stroke[k + 2]; dst[2].color = c;
-							}
-							dst += 3;
-						}
-					}
-					last.triangleCount += numTriVerts;
-					return;
+			if (p.fillCount >= 3 && p.fill != nullptr) {
+				const Vertex& v0 = p.fill[0];
+				for (int k = 0; k < p.fillCount - 2; ++k) {
+					dst[0] = v0;            dst[0].color = c;
+					dst[1] = p.fill[k + 1]; dst[1].color = c;
+					dst[2] = p.fill[k + 2]; dst[2].color = c;
+					dst += 3;
 				}
 			}
+			if (p.strokeCount >= 3 && p.stroke != nullptr) {
+				for (int k = 0; k < p.strokeCount - 2; ++k) {
+					if ((k & 1) == 0) {
+						dst[0] = p.stroke[k];     dst[0].color = c;
+						dst[1] = p.stroke[k + 1]; dst[1].color = c;
+						dst[2] = p.stroke[k + 2]; dst[2].color = c;
+					} else {
+						dst[0] = p.stroke[k + 1]; dst[0].color = c;
+						dst[1] = p.stroke[k];     dst[1].color = c;
+						dst[2] = p.stroke[k + 2]; dst[2].color = c;
+					}
+					dst += 3;
+				}
+			}
+			last->triangleCount += numTriVerts;
+			return;
 		}
 
 		// Create a new Triangles call for this convex shape
 		Call call;
 		call.type = CallType::Triangles;
+		call.bucket = bucket;
 		call.clipDepth = m_impl->currentClipDepth;
 		call.image = paint.image;
+		call.paintXform = paint.xform;
 		call.customShader = paint.customShader;
 		call.blendFunc = blend;
+		call.programmableBlend = programmableBlend;
+		if (programmableBlend && bounds != nullptr) {
+			call.hasCallBounds = true;
+			call.callBounds[0] = bounds[0] - fringe;
+			call.callBounds[1] = bounds[1] - fringe;
+			call.callBounds[2] = bounds[2] + fringe;
+			call.callBounds[3] = bounds[3] + fringe;
+		}
 		call.triangleOffset = static_cast<int>(m_impl->verts.size());
 		call.triangleCount = numTriVerts;
 		if (hasHwScissor) {
@@ -1839,29 +3859,31 @@ void GL3Renderer::renderFill(const Paint& paint, const CompositeOperationState& 
 			}
 		}
 
-		if (m_impl->lastUniformOffset >= 0 && !m_impl->uniforms.empty() &&
-		    std::memcmp(m_impl->fragUniformPtr(m_impl->lastUniformOffset), &tempFrag, sizeof(FragUniforms)) == 0) {
-			call.uniformOffset = m_impl->lastUniformOffset;
-		} else {
-			call.uniformOffset = m_impl->allocFragUniforms(1);
-			FragUniforms* frag = m_impl->fragUniformPtr(call.uniformOffset);
-			*frag = tempFrag;
-			m_impl->lastUniformOffset = call.uniformOffset;
-		}
-
+		m_impl->assignCallUniforms(call, tempFrag);
 		m_impl->calls.push_back(call);
 		return;
 	}
 
 	Call call;
 	call.type = callType;
+	call.bucket = bucket;
+	call.evenOdd = (npaths > 0 && paths[0].winding == Winding::EvenOdd);
 	call.clipDepth = m_impl->currentClipDepth;
 	call.triangleCount = triangleCount;
 	call.pathOffset = static_cast<int>(m_impl->paths.size());
 	call.pathCount = npaths;
 	call.image = paint.image;
+	call.paintXform = paint.xform;
 	call.customShader = paint.customShader;
 	call.blendFunc = blend;
+	call.programmableBlend = programmableBlend;
+	if (programmableBlend && bounds != nullptr) {
+		call.hasCallBounds = true;
+		call.callBounds[0] = bounds[0] - fringe;
+		call.callBounds[1] = bounds[1] - fringe;
+		call.callBounds[2] = bounds[2] + fringe;
+		call.callBounds[3] = bounds[3] + fringe;
+	}
 	if (hasHwScissor) {
 		call.scissorRect[0] = hwScissor[0];
 		call.scissorRect[1] = hwScissor[1];
@@ -1912,16 +3934,7 @@ void GL3Renderer::renderFill(const Paint& paint, const CompositeOperationState& 
 		curOffset += 4;
 	}
 
-	if (m_impl->lastUniformOffset >= 0 && !m_impl->uniforms.empty() &&
-	    std::memcmp(m_impl->fragUniformPtr(m_impl->lastUniformOffset), &tempFrag, sizeof(FragUniforms)) == 0) {
-		call.uniformOffset = m_impl->lastUniformOffset;
-	} else {
-		call.uniformOffset = m_impl->allocFragUniforms(1);
-		FragUniforms* fragFill = m_impl->fragUniformPtr(call.uniformOffset);
-		*fragFill = tempFrag;
-		m_impl->lastUniformOffset = call.uniformOffset;
-	}
-
+	m_impl->assignCallUniforms(call, tempFrag);
 	m_impl->verts.resize(curOffset);
 	m_impl->calls.push_back(call);
 }
@@ -1929,7 +3942,9 @@ void GL3Renderer::renderFill(const Paint& paint, const CompositeOperationState& 
 void GL3Renderer::renderStroke(const Paint& paint, const CompositeOperationState& compOp,
                               const Scissor& scissor, float fringe, float strokeWidth,
                               const Path* paths, int npaths) {
-	Blend blend = convertBlend(compOp);
+	const bool programmableBlend = compOp.isProgrammableBlend;
+	const int blendModeId = programmableBlend ? (static_cast<int>(compOp.blendMode) + 1) : 0;
+	Blend blend = programmableBlend ? Blend{GL_ONE, GL_ZERO, GL_ONE, GL_ZERO} : convertBlend(compOp);
 	int hwScissor[4]{-1, -1, -1, -1};
 	bool hasHwScissor = m_impl->getHardwareScissor(scissor, hwScissor);
 
@@ -1941,8 +3956,10 @@ void GL3Renderer::renderStroke(const Paint& paint, const CompositeOperationState
 		useStencil = false; // Hairlines and fully opaque strokes do not produce semi-transparent overlap artifacts!
 	}
 
+	const bool fastPrefixOnly = !paintUsesFullEffects(paint, blendModeId);
 	FragUniforms tempFrag;
-	m_impl->convertPaint(&tempFrag, paint, scissor, strokeWidth, fringe, -1.0f, hasHwScissor);
+	m_impl->convertPaint(&tempFrag, paint, scissor, strokeWidth, fringe, -1.0f, hasHwScissor, blendModeId, fastPrefixOnly);
+	const ShaderBucket bucket = m_impl->classifyPaintBucket(tempFrag, paint.image, paint.customShader != nullptr, !useStencil);
 
 	uint32_t c = paint.innerColor.premultiplied().toRGBA8();
 
@@ -1956,58 +3973,43 @@ void GL3Renderer::renderStroke(const Paint& paint, const CompositeOperationState
 	}
 
 	if (numTriVerts > 0) {
-		// Try coalescing with previous Call if both are Triangles and have identical state
-		if (!m_impl->calls.empty()) {
-			Call& last = m_impl->calls.back();
-			if (last.type == CallType::Triangles &&
-			    last.image == paint.image &&
-			    last.customShader == paint.customShader &&
-			    last.blendFunc.srcRGB == blend.srcRGB &&
-			    last.blendFunc.dstRGB == blend.dstRGB &&
-			    last.blendFunc.srcAlpha == blend.srcAlpha &&
-			    last.blendFunc.dstAlpha == blend.dstAlpha &&
-			    last.scissorRect[0] == (hasHwScissor ? hwScissor[0] : -1) &&
-			    last.scissorRect[1] == (hasHwScissor ? hwScissor[1] : -1) &&
-			    last.scissorRect[2] == (hasHwScissor ? hwScissor[2] : -1) &&
-			    last.scissorRect[3] == (hasHwScissor ? hwScissor[3] : -1) &&
-			    last.clipDepth == m_impl->currentClipDepth) {
+		if (Call* last = m_impl->findCoalescableTrianglesCall(bucket, paint.image, paint.customShader, paint.xform,
+		                                                      blend, hasHwScissor, hwScissor, programmableBlend, tempFrag)) {
+			int offset = static_cast<int>(m_impl->verts.size());
+			m_impl->verts.resize(offset + numTriVerts);
+			Vertex* dst = &m_impl->verts[offset];
 
-				FragUniforms* lastFrag = m_impl->fragUniformPtr(last.uniformOffset);
-				if (paint.customShader != nullptr || std::memcmp(lastFrag, &tempFrag, sizeof(FragUniforms)) == 0) {
-					int offset = static_cast<int>(m_impl->verts.size());
-					m_impl->verts.resize(offset + numTriVerts);
-					Vertex* dst = &m_impl->verts[offset];
-
-					for (int i = 0; i < npaths; ++i) {
-						const Path& p = paths[i];
-						if (p.strokeCount >= 3 && p.stroke != nullptr) {
-							for (int k = 0; k < p.strokeCount - 2; ++k) {
-								if ((k & 1) == 0) {
-									dst[0] = p.stroke[k];     dst[0].color = c;
-									dst[1] = p.stroke[k + 1]; dst[1].color = c;
-									dst[2] = p.stroke[k + 2]; dst[2].color = c;
-								} else {
-									dst[0] = p.stroke[k + 1]; dst[0].color = c;
-									dst[1] = p.stroke[k];     dst[1].color = c;
-									dst[2] = p.stroke[k + 2]; dst[2].color = c;
-								}
-								dst += 3;
-							}
+			for (int i = 0; i < npaths; ++i) {
+				const Path& p = paths[i];
+				if (p.strokeCount >= 3 && p.stroke != nullptr) {
+					for (int k = 0; k < p.strokeCount - 2; ++k) {
+						if ((k & 1) == 0) {
+							dst[0] = p.stroke[k];     dst[0].color = c;
+							dst[1] = p.stroke[k + 1]; dst[1].color = c;
+							dst[2] = p.stroke[k + 2]; dst[2].color = c;
+						} else {
+							dst[0] = p.stroke[k + 1]; dst[0].color = c;
+							dst[1] = p.stroke[k];     dst[1].color = c;
+							dst[2] = p.stroke[k + 2]; dst[2].color = c;
 						}
+						dst += 3;
 					}
-					last.triangleCount += numTriVerts;
-					return;
 				}
 			}
+			last->triangleCount += numTriVerts;
+			return;
 		}
 
 		// Create a new Triangles call for this stroke
 		Call call;
 		call.type = CallType::Triangles;
+		call.bucket = bucket;
 		call.clipDepth = m_impl->currentClipDepth;
 		call.image = paint.image;
+		call.paintXform = paint.xform;
 		call.customShader = paint.customShader;
 		call.blendFunc = blend;
+		call.programmableBlend = programmableBlend;
 		call.triangleOffset = static_cast<int>(m_impl->verts.size());
 		call.triangleCount = numTriVerts;
 		if (hasHwScissor) {
@@ -2039,28 +4041,25 @@ void GL3Renderer::renderStroke(const Paint& paint, const CompositeOperationState
 			}
 		}
 
-		if (m_impl->lastUniformOffset >= 0 && !m_impl->uniforms.empty() &&
-		    std::memcmp(m_impl->fragUniformPtr(m_impl->lastUniformOffset), &tempFrag, sizeof(FragUniforms)) == 0) {
-			call.uniformOffset = m_impl->lastUniformOffset;
-		} else {
-			call.uniformOffset = m_impl->allocFragUniforms(1);
-			FragUniforms* frag = m_impl->fragUniformPtr(call.uniformOffset);
-			*frag = tempFrag;
-			m_impl->lastUniformOffset = call.uniformOffset;
+		if (programmableBlend) {
+			Impl::setCallBoundsFromVerts(call, &m_impl->verts[call.triangleOffset], numTriVerts, fringe + 1.0f);
 		}
-
+		m_impl->assignCallUniforms(call, tempFrag);
 		m_impl->calls.push_back(call);
 		return;
 	}
 
 	Call call;
 	call.type = CallType::Stroke;
+	call.bucket = bucket;
 	call.clipDepth = m_impl->currentClipDepth;
 	call.pathOffset = static_cast<int>(m_impl->paths.size());
 	call.pathCount = npaths;
 	call.image = paint.image;
+	call.paintXform = paint.xform;
 	call.customShader = paint.customShader;
 	call.blendFunc = blend;
+	call.programmableBlend = programmableBlend;
 	call.useStencil = useStencil;
 	if (hasHwScissor) {
 		call.scissorRect[0] = hwScissor[0];
@@ -2095,23 +4094,23 @@ void GL3Renderer::renderStroke(const Paint& paint, const CompositeOperationState
 		}
 	}
 
-	if (useStencil) {
-		call.uniformOffset = m_impl->allocFragUniforms(2);
-		FragUniforms* fragBase = m_impl->fragUniformPtr(call.uniformOffset);
-		*fragBase = tempFrag;
+	if (programmableBlend && curOffset > offset) {
+		Impl::setCallBoundsFromVerts(call, &m_impl->verts[offset], curOffset - offset, fringe + 1.0f);
+	}
 
-		FragUniforms* fragOverlap = m_impl->fragUniformPtr(call.uniformOffset + m_impl->fragSize);
-		m_impl->convertPaint(fragOverlap, paint, scissor, strokeWidth, fringe, 1.0f - 0.5f / 255.0f, hasHwScissor);
+	if (useStencil) {
+		const size_t copyBytes = Impl::bucketNeedsFullUbo(bucket) ? sizeof(FragUniforms) : kFastUniformBytes;
+		const int stride = Impl::bucketNeedsFullUbo(bucket) ? m_impl->fragSize : m_impl->fragFastSize;
+		call.uniformStride = stride;
+		call.uniformOffset = m_impl->allocFragUniforms(2, stride);
+		std::memcpy(&m_impl->uniforms[call.uniformOffset], &tempFrag, copyBytes);
+
+		FragUniforms overlapFrag;
+		m_impl->convertPaint(&overlapFrag, paint, scissor, strokeWidth, fringe, 1.0f - 0.5f / 255.0f,
+		                     hasHwScissor, blendModeId, fastPrefixOnly);
+		std::memcpy(&m_impl->uniforms[call.uniformOffset + stride], &overlapFrag, copyBytes);
 	} else {
-		if (m_impl->lastUniformOffset >= 0 && !m_impl->uniforms.empty() &&
-		    std::memcmp(m_impl->fragUniformPtr(m_impl->lastUniformOffset), &tempFrag, sizeof(FragUniforms)) == 0) {
-			call.uniformOffset = m_impl->lastUniformOffset;
-		} else {
-			call.uniformOffset = m_impl->allocFragUniforms(1);
-			FragUniforms* fragBase = m_impl->fragUniformPtr(call.uniformOffset);
-			*fragBase = tempFrag;
-			m_impl->lastUniformOffset = call.uniformOffset;
-		}
+		m_impl->assignCallUniforms(call, tempFrag);
 	}
 
 	m_impl->verts.resize(curOffset);
@@ -2121,137 +4120,37 @@ void GL3Renderer::renderStroke(const Paint& paint, const CompositeOperationState
 void GL3Renderer::renderTriangles(const Paint& paint, const CompositeOperationState& compOp,
                                  const Scissor& scissor, const Vertex* verts, int nverts,
                                  float fringe, int shaderType) {
-	Blend blend = convertBlend(compOp);
+	const bool programmableBlend = compOp.isProgrammableBlend;
+	const int blendModeId = programmableBlend ? (static_cast<int>(compOp.blendMode) + 1) : 0;
+	Blend blend = programmableBlend ? Blend{GL_ONE, GL_ZERO, GL_ONE, GL_ZERO} : convertBlend(compOp);
 	int hwScissor[4]{-1, -1, -1, -1};
 	bool hasHwScissor = m_impl->getHardwareScissor(scissor, hwScissor);
 
+	const bool fastPrefixOnly = !paintUsesFullEffects(paint, blendModeId, shaderType);
 	FragUniforms tempFrag;
-	float widthForMult = (shaderType == -2) ? paint.feather : 1.0f;
-	m_impl->convertPaint(&tempFrag, paint, scissor, widthForMult, fringe, -1.0f, hasHwScissor);
-	if (shaderType == -2) {
-		tempFrag.type = ShaderSolid;
-		tempFrag.radius = 0.0f;
-		tempFrag.feather = 1.0f;
-		tempFrag.innerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-		tempFrag.outerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-	} else if (shaderType == 2) {
-		tempFrag.type = ShaderSimple;
-		tempFrag.innerCol = paint.innerColor.premultiplied();
-		tempFrag.outerCol = tempFrag.innerCol;
-	} else if (shaderType == 15) {
-		// Concentric Circle Radial Gradient (ftcoord in [-Rq, Rq], circle radius in paint.xform[0])
-		tempFrag.type = ShaderRadialGrad;
-		tempFrag.strokeMult = 4.0f;
-		tempFrag.strokeThr = paint.xform[0];
-		std::memset(tempFrag.paintMat, 0, sizeof(tempFrag.paintMat));
-	} else if (shaderType == 12) {
-		// Vertex-interpolated Radial Gradient (ftcoord = pt)
-		tempFrag.type = ShaderRadialGrad;
-		tempFrag.strokeMult = 3.0f;
-		std::memset(tempFrag.paintMat, 0, sizeof(tempFrag.paintMat));
-	} else if (shaderType == 13) {
-		// Vertex-interpolated Box Gradient (ftcoord = pt)
-		tempFrag.type = ShaderFillGrad;
-		tempFrag.strokeMult = 3.0f;
-		std::memset(tempFrag.paintMat, 0, sizeof(tempFrag.paintMat));
-	} else if (shaderType == 14) {
-		// Vertex-interpolated Linear Gradient (ftcoord.y = pt.y)
-		tempFrag.type = ShaderLinearGrad;
-		tempFrag.radius = 1.0f;
-		tempFrag.feather = 1.0f;
-		std::memset(tempFrag.paintMat, 0, sizeof(tempFrag.paintMat));
-	} else if (shaderType >= 0) {
-		tempFrag.type = shaderType;
-	}
+	applyTriangleShaderUniforms(&tempFrag, paint, scissor, fringe, hasHwScissor, blendModeId,
+	                            shaderType, [this](int id) { return m_impl->lookupTextureInfo(id); },
+	                            fastPrefixOnly);
+	const ShaderBucket bucket = m_impl->classifyPaintBucket(tempFrag, paint.image, paint.customShader != nullptr, true);
 
-	if (shaderType == 3) {
-		if (tempFrag.texType == 0 && paint.image != 0) {
-			Texture* tex = m_impl->findTexture(paint.image);
-			if (tex && tex->type == TextureType::Alpha) {
-				tempFrag.texType = 2;
-			}
-		}
-		std::memset(tempFrag.paintMat, 0, sizeof(tempFrag.paintMat));
-		tempFrag.extent[0] = 0.0f;
-		tempFrag.extent[1] = 0.0f;
-		tempFrag.radius = 0.0f;
-		tempFrag.feather = 1.0f;
-		if (paint.radius > 0.5f) {
-			tempFrag.innerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-			tempFrag.outerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-		}
-	} else if (shaderType == 7 || shaderType == 8) {
-		tempFrag.innerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-		tempFrag.outerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-	} else if (shaderType == 9) {
-		tempFrag.extent[0] = paint.extent[0];
-		tempFrag.extent[1] = paint.extent[1];
-		tempFrag.radius = paint.radius;
-		tempFrag.feather = paint.feather;
-		tempFrag.strokeMult = paint.xform[0];
-		tempFrag.strokeThr = paint.xform[1];
-		tempFrag.innerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-		tempFrag.outerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-		std::memset(tempFrag.paintMat, 0, sizeof(tempFrag.paintMat));
-	} else if (shaderType == 10) {
-		tempFrag.extent[0] = paint.extent[0];
-		tempFrag.extent[1] = paint.extent[1];
-		tempFrag.radius = paint.radius;
-		tempFrag.strokeThr = paint.feather;
-		tempFrag.innerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-		tempFrag.outerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-	} else if (shaderType == 11) {
-		tempFrag.extent[0] = paint.extent[0];
-		tempFrag.extent[1] = paint.radius;
-		tempFrag.radius = paint.feather;
-		tempFrag.feather = paint.feather;
-		tempFrag.strokeMult = paint.feather;
-		tempFrag.strokeThr = paint.feather;
-	} else if (shaderType == 6) {
-		tempFrag.strokeMult = 2.0f;
-	} else if (shaderType == 1) {
-		if (paint.radius > 0.0f) {
-			tempFrag.radius = paint.radius;
-			tempFrag.extent[0] = paint.feather;
-			tempFrag.extent[1] = (paint.outerColor.r > 0.0f) ? paint.outerColor.r : paint.feather;
-			tempFrag.outerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
-			tempFrag.feather = 1.0f;
-			tempFrag.strokeMult = 1.0f;
-		}
-	}
-
-	if (!m_impl->calls.empty()) {
-		Call& last = m_impl->calls.back();
-		if (last.type == CallType::Triangles &&
-		    last.image == paint.image &&
-		    last.customShader == paint.customShader &&
-		    last.blendFunc.srcRGB == blend.srcRGB &&
-		    last.blendFunc.dstRGB == blend.dstRGB &&
-		    last.blendFunc.srcAlpha == blend.srcAlpha &&
-		    last.blendFunc.dstAlpha == blend.dstAlpha &&
-		    last.scissorRect[0] == (hasHwScissor ? hwScissor[0] : -1) &&
-		    last.scissorRect[1] == (hasHwScissor ? hwScissor[1] : -1) &&
-		    last.scissorRect[2] == (hasHwScissor ? hwScissor[2] : -1) &&
-		    last.scissorRect[3] == (hasHwScissor ? hwScissor[3] : -1) &&
-		    last.clipDepth == m_impl->currentClipDepth) {
-
-			FragUniforms* lastFrag = m_impl->fragUniformPtr(last.uniformOffset);
-			if (paint.customShader != nullptr || std::memcmp(lastFrag, &tempFrag, sizeof(FragUniforms)) == 0) {
-				int offset = static_cast<int>(m_impl->verts.size());
-				m_impl->verts.resize(offset + nverts);
-				std::memcpy(&m_impl->verts[offset], verts, nverts * sizeof(Vertex));
-				last.triangleCount += nverts;
-				return;
-			}
-		}
+	if (Call* last = m_impl->findCoalescableTrianglesCall(bucket, paint.image, paint.customShader, paint.xform,
+	                                                      blend, hasHwScissor, hwScissor, programmableBlend, tempFrag)) {
+		int offset = static_cast<int>(m_impl->verts.size());
+		m_impl->verts.resize(offset + nverts);
+		std::memcpy(&m_impl->verts[offset], verts, nverts * sizeof(Vertex));
+		last->triangleCount += nverts;
+		return;
 	}
 
 	Call call;
 	call.type = CallType::Triangles;
+	call.bucket = bucket;
 	call.clipDepth = m_impl->currentClipDepth;
 	call.image = paint.image;
+	call.paintXform = paint.xform;
 	call.customShader = paint.customShader;
 	call.blendFunc = blend;
+	call.programmableBlend = programmableBlend;
 	call.triangleOffset = static_cast<int>(m_impl->verts.size());
 	call.triangleCount = nverts;
 	if (hasHwScissor) {
@@ -2266,16 +4165,10 @@ void GL3Renderer::renderTriangles(const Paint& paint, const CompositeOperationSt
 	m_impl->verts.resize(call.triangleOffset + nverts);
 	std::memcpy(&m_impl->verts[call.triangleOffset], verts, nverts * sizeof(Vertex));
 
-	if (m_impl->lastUniformOffset >= 0 && !m_impl->uniforms.empty() &&
-	    std::memcmp(m_impl->fragUniformPtr(m_impl->lastUniformOffset), &tempFrag, sizeof(FragUniforms)) == 0) {
-		call.uniformOffset = m_impl->lastUniformOffset;
-	} else {
-		call.uniformOffset = m_impl->allocFragUniforms(1);
-		FragUniforms* frag = m_impl->fragUniformPtr(call.uniformOffset);
-		*frag = tempFrag;
-		m_impl->lastUniformOffset = call.uniformOffset;
+	if (programmableBlend) {
+		Impl::setCallBoundsFromVerts(call, verts, nverts, fringe + 1.0f);
 	}
-
+	m_impl->assignCallUniforms(call, tempFrag);
 	m_impl->calls.push_back(call);
 }
 
@@ -2288,6 +4181,7 @@ void GL3Renderer::renderClip(const RenderPath* paths, int npaths, Winding windin
 
 	Call call;
 	call.type = CallType::Clip;
+	call.bucket = ShaderBucket::SimpleColor;
 	call.clipDepth = targetDepth;
 	call.winding = winding;
 	call.blendFunc = Blend{GL_ONE, GL_ZERO, GL_ONE, GL_ZERO};
@@ -2339,11 +4233,10 @@ void GL3Renderer::renderClip(const RenderPath* paths, int npaths, Winding windin
 	quad[3] = Vertex(minX, minY, 0.5f, 1.0f);
 	curOffset += 4;
 
-	call.uniformOffset = m_impl->allocFragUniforms(1);
-	FragUniforms* frag = m_impl->fragUniformPtr(call.uniformOffset);
-	*frag = FragUniforms{};
-	frag->strokeThr = -1.0f;
-	frag->type = ShaderSimple;
+	FragUniforms clipFrag{};
+	clipFrag.strokeThr = -1.0f;
+	clipFrag.type = ShaderSimple;
+	m_impl->assignCallUniforms(call, clipFrag);
 
 	m_impl->verts.resize(curOffset);
 	m_impl->calls.push_back(call);
@@ -2355,6 +4248,7 @@ void GL3Renderer::restoreClip(int targetDepth) {
 
 	Call call;
 	call.type = CallType::RestoreClip;
+	call.bucket = ShaderBucket::SimpleColor;
 	call.clipDepth = targetDepth;
 	call.blendFunc = Blend{GL_ONE, GL_ZERO, GL_ONE, GL_ZERO};
 	call.scissorRect[0] = -1;
@@ -2371,11 +4265,10 @@ void GL3Renderer::restoreClip(int targetDepth) {
 	call.triangleOffset = offset;
 	call.triangleCount = 4;
 
-	call.uniformOffset = m_impl->allocFragUniforms(1);
-	FragUniforms* frag = m_impl->fragUniformPtr(call.uniformOffset);
-	*frag = FragUniforms{};
-	frag->strokeThr = -1.0f;
-	frag->type = ShaderSimple;
+	FragUniforms clipFrag{};
+	clipFrag.strokeThr = -1.0f;
+	clipFrag.type = ShaderSimple;
+	m_impl->assignCallUniforms(call, clipFrag);
 
 	m_impl->calls.push_back(call);
 	m_impl->currentClipDepth = targetDepth;
@@ -2383,6 +4276,228 @@ void GL3Renderer::restoreClip(int targetDepth) {
 
 void GL3Renderer::resetClip() {
 	restoreClip(0);
+}
+
+void GL3Renderer::pushLayer(const LayerDesc& desc, const Scissor& parentScissor, int parentClipDepth) {
+	(void)parentScissor;
+	if (m_impl->fragSize <= 0) return;
+
+	Call call;
+	call.type = CallType::PushLayer;
+	call.clipDepth = parentClipDepth;
+	call.layerIndex = static_cast<int>(m_impl->layerDescs.size());
+	m_impl->layerDescs.push_back(desc);
+	call.blendFunc = Blend{GL_ONE, GL_ZERO, GL_ONE, GL_ZERO};
+	call.scissorRect[0] = -1;
+	m_impl->calls.push_back(call);
+	m_impl->currentClipDepth = 0;
+}
+
+void GL3Renderer::popLayer(const LayerDesc& desc, const Scissor& parentScissor, int parentClipDepth) {
+	if (m_impl->fragSize <= 0) return;
+
+	const bool programmableBlend = desc.compOp.isProgrammableBlend;
+	const int blendModeId = programmableBlend ? (static_cast<int>(desc.compOp.blendMode) + 1) : 0;
+	Blend blend = programmableBlend ? Blend{GL_ONE, GL_ZERO, GL_ONE, GL_ZERO} : convertBlend(desc.compOp);
+
+	int hwScissor[4]{-1, -1, -1, -1};
+	bool hasHwScissor = m_impl->getHardwareScissor(parentScissor, hwScissor);
+
+	Call call;
+	call.type = CallType::PopLayer;
+	call.layerIndex = static_cast<int>(m_impl->layerDescs.size());
+	m_impl->layerDescs.push_back(desc);
+	call.blendFunc = blend;
+	call.programmableBlend = programmableBlend;
+	call.clipDepth = parentClipDepth;
+	if (hasHwScissor) {
+		call.scissorRect[0] = hwScissor[0];
+		call.scissorRect[1] = hwScissor[1];
+		call.scissorRect[2] = hwScissor[2];
+		call.scissorRect[3] = hwScissor[3];
+	} else {
+		call.scissorRect[0] = -1;
+	}
+
+	float minX = 0.0f;
+	float minY = 0.0f;
+	float maxX = m_impl->view[0];
+	float maxY = m_impl->view[1];
+	if (desc.hasBounds) {
+		minX = desc.bounds[0];
+		minY = desc.bounds[1];
+		maxX = desc.bounds[2];
+		maxY = desc.bounds[3];
+	}
+
+	Paint popPaint;
+	popPaint.innerColor = Color(1.0f, 1.0f, 1.0f, std::clamp(desc.opacity, 0.0f, 1.0f));
+	popPaint.outerColor = popPaint.innerColor;
+	popPaint.hasColorMatrix = desc.hasColorMatrix;
+	popPaint.colorMatrix = desc.colorMatrix;
+	popPaint.colorTransfer = desc.colorTransfer;
+	popPaint.hasColorBlend = desc.hasColorBlend;
+	popPaint.colorBlendColor = desc.colorBlendColor;
+	popPaint.colorBlendMode = desc.colorBlendMode;
+
+	auto appendQuad = [&](float x0, float y0, float x1, float y1,
+	                      float u0, float vTop, float u1, float vBot) {
+		const int offset = static_cast<int>(m_impl->verts.size());
+		m_impl->verts.resize(offset + 6);
+		Vertex* q = &m_impl->verts[offset];
+		q[0] = Vertex(x0, y0, u0, vTop, 0xFFFFFFFFu);
+		q[1] = Vertex(x1, y0, u1, vTop, 0xFFFFFFFFu);
+		q[2] = Vertex(x1, y1, u1, vBot, 0xFFFFFFFFu);
+		q[3] = Vertex(x0, y0, u0, vTop, 0xFFFFFFFFu);
+		q[4] = Vertex(x1, y1, u1, vBot, 0xFFFFFFFFu);
+		q[5] = Vertex(x0, y1, u0, vBot, 0xFFFFFFFFu);
+	};
+
+	const bool validArea = (maxX > minX && maxY > minY && m_impl->view[0] > 0.0f && m_impl->view[1] > 0.0f);
+	const bool fastPrefixOnly = !paintUsesFullEffects(popPaint, blendModeId);
+	call.bucket = fastPrefixOnly ? ShaderBucket::FastCore : ShaderBucket::EffectsFull;
+	const size_t copyBytes = fastPrefixOnly ? kFastUniformBytes : sizeof(FragUniforms);
+	const int stride = fastPrefixOnly ? m_impl->fragFastSize : m_impl->fragSize;
+	call.uniformStride = stride;
+
+	if (validArea) {
+		const float invW = 1.0f / m_impl->view[0];
+		const float invH = 1.0f / m_impl->view[1];
+		const float u0 = minX * invW;
+		const float u1 = maxX * invW;
+		const float vTop = 1.0f - minY * invH;
+		const float vBot = 1.0f - maxY * invH;
+
+		if (desc.isDropShadow) {
+			if (desc.shadowOnly) {
+				call.hasCallBounds = true;
+				call.callBounds[0] = minX + desc.shadowDx;
+				call.callBounds[1] = minY + desc.shadowDy;
+				call.callBounds[2] = maxX + desc.shadowDx;
+				call.callBounds[3] = maxY + desc.shadowDy;
+				call.triangleOffset = static_cast<int>(m_impl->verts.size());
+				appendQuad(minX + desc.shadowDx, minY + desc.shadowDy,
+				           maxX + desc.shadowDx, maxY + desc.shadowDy,
+				           u0, vTop, u1, vBot);
+				call.triangleCount = 6;
+				call.uniformOffset = m_impl->allocFragUniforms(1, stride);
+				FragUniforms frag;
+				m_impl->convertPaint(&frag, popPaint, parentScissor, 1.0f, 1.0f, -1.0f,
+				                     hasHwScissor, blendModeId, fastPrefixOnly);
+				frag.innerCol = popPaint.innerColor.premultiplied();
+				frag.outerCol = desc.shadowColor.premultiplied();
+				frag.type = ShaderImg;
+				frag.texType = 4;
+				std::memcpy(&m_impl->uniforms[call.uniformOffset], &frag, copyBytes);
+			} else {
+				const bool needsIntermediate = (desc.opacity < 0.999f || desc.hasColorMatrix ||
+				                                 desc.colorTransfer != 0 || desc.hasColorBlend ||
+				                                 desc.compOp.blendMode != BlendMode::SourceOver ||
+				                                 desc.compOp.isProgrammableBlend);
+				call.hasCallBounds = true;
+				call.callBounds[0] = std::min(minX, minX + desc.shadowDx);
+				call.callBounds[1] = std::min(minY, minY + desc.shadowDy);
+				call.callBounds[2] = std::max(maxX, maxX + desc.shadowDx);
+				call.callBounds[3] = std::max(maxY, maxY + desc.shadowDy);
+				call.triangleOffset = static_cast<int>(m_impl->verts.size());
+				appendQuad(minX + desc.shadowDx, minY + desc.shadowDy,
+				           maxX + desc.shadowDx, maxY + desc.shadowDy,
+				           u0, vTop, u1, vBot);
+				appendQuad(minX, minY, maxX, maxY, u0, vTop, u1, vBot);
+
+				if (!needsIntermediate) {
+					call.triangleCount = 12;
+					call.uniformOffset = m_impl->allocFragUniforms(2, stride);
+					FragUniforms fgFrag;
+					m_impl->convertPaint(&fgFrag, popPaint, parentScissor, 1.0f, 1.0f, -1.0f,
+					                     hasHwScissor, blendModeId, fastPrefixOnly);
+					fgFrag.innerCol = popPaint.innerColor.premultiplied();
+					fgFrag.outerCol = fgFrag.innerCol;
+					fgFrag.type = ShaderImg;
+					fgFrag.texType = 3;
+					std::memcpy(&m_impl->uniforms[call.uniformOffset], &fgFrag, copyBytes);
+
+					FragUniforms shFrag;
+					Paint shPaint;
+					shPaint.innerColor = Color(1.0f, 1.0f, 1.0f, 1.0f);
+					m_impl->convertPaint(&shFrag, shPaint, parentScissor, 1.0f, 1.0f, -1.0f,
+					                     hasHwScissor, 0, true);
+					shFrag.innerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
+					shFrag.outerCol = desc.shadowColor.premultiplied();
+					shFrag.type = ShaderImg;
+					shFrag.texType = 4;
+					std::memcpy(&m_impl->uniforms[call.uniformOffset + stride], &shFrag, kFastUniformBytes);
+				} else {
+					const float uMinX = std::clamp(call.callBounds[0], 0.0f, m_impl->view[0]);
+					const float uMinY = std::clamp(call.callBounds[1], 0.0f, m_impl->view[1]);
+					const float uMaxX = std::clamp(call.callBounds[2], 0.0f, m_impl->view[0]);
+					const float uMaxY = std::clamp(call.callBounds[3], 0.0f, m_impl->view[1]);
+					appendQuad(uMinX, uMinY, uMaxX, uMaxY,
+					           uMinX * invW, 1.0f - uMinY * invH, uMaxX * invW, 1.0f - uMaxY * invH);
+					call.triangleCount = 18;
+					call.uniformOffset = m_impl->allocFragUniforms(3, stride);
+
+					FragUniforms compFrag;
+					m_impl->convertPaint(&compFrag, popPaint, parentScissor, 1.0f, 1.0f, -1.0f,
+					                     hasHwScissor, blendModeId, fastPrefixOnly);
+					compFrag.innerCol = popPaint.innerColor.premultiplied();
+					compFrag.outerCol = compFrag.innerCol;
+					compFrag.type = ShaderImg;
+					compFrag.texType = 3;
+					std::memcpy(&m_impl->uniforms[call.uniformOffset], &compFrag, copyBytes);
+
+					Scissor noScissor;
+					Paint idPaint;
+					idPaint.innerColor = Color(1.0f, 1.0f, 1.0f, 1.0f);
+
+					FragUniforms shFrag;
+					m_impl->convertPaint(&shFrag, idPaint, noScissor, 1.0f, 1.0f, -1.0f, false, 0, true);
+					shFrag.innerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
+					shFrag.outerCol = desc.shadowColor.premultiplied();
+					shFrag.type = ShaderImg;
+					shFrag.texType = 4;
+					std::memcpy(&m_impl->uniforms[call.uniformOffset + stride], &shFrag, kFastUniformBytes);
+
+					FragUniforms fgFrag;
+					m_impl->convertPaint(&fgFrag, idPaint, noScissor, 1.0f, 1.0f, -1.0f, false, 0, true);
+					fgFrag.innerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
+					fgFrag.outerCol = Color(1.0f, 1.0f, 1.0f, 1.0f);
+					fgFrag.type = ShaderImg;
+					fgFrag.texType = 3;
+					std::memcpy(&m_impl->uniforms[call.uniformOffset + 2 * stride], &fgFrag, kFastUniformBytes);
+				}
+			}
+		} else {
+			call.hasCallBounds = true;
+			call.callBounds[0] = minX;
+			call.callBounds[1] = minY;
+			call.callBounds[2] = maxX;
+			call.callBounds[3] = maxY;
+			call.triangleOffset = static_cast<int>(m_impl->verts.size());
+			appendQuad(minX, minY, maxX, maxY, u0, vTop, u1, vBot);
+			call.triangleCount = 6;
+			call.uniformOffset = m_impl->allocFragUniforms(1, stride);
+			FragUniforms frag;
+			m_impl->convertPaint(&frag, popPaint, parentScissor, 1.0f, 1.0f, -1.0f,
+			                     hasHwScissor, blendModeId, fastPrefixOnly);
+			frag.innerCol = popPaint.innerColor.premultiplied();
+			frag.outerCol = frag.innerCol;
+			frag.type = ShaderImg;
+			frag.texType = 3; // PremultipliedLayer: colorFilters before layer opacity
+			std::memcpy(&m_impl->uniforms[call.uniformOffset], &frag, copyBytes);
+		}
+	} else {
+		call.uniformOffset = m_impl->allocFragUniforms(1, stride);
+		FragUniforms frag;
+		m_impl->convertPaint(&frag, popPaint, parentScissor, 1.0f, 1.0f, -1.0f,
+		                     hasHwScissor, blendModeId, fastPrefixOnly);
+		frag.type = ShaderImg;
+		frag.texType = 3;
+		std::memcpy(&m_impl->uniforms[call.uniformOffset], &frag, copyBytes);
+	}
+
+	m_impl->calls.push_back(call);
+	m_impl->currentClipDepth = parentClipDepth;
 }
 
 std::unique_ptr<Context> createContextGL3(int flags) {

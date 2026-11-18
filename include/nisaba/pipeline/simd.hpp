@@ -1364,6 +1364,73 @@ inline void blend_solid_multiply_coverage(PremultipliedColorU8* dst, Premultipli
     }
 }
 
+inline PremultipliedColorU8 blend_modulate_pixel(PremultipliedColorU8 d, PremultipliedColorU8 s) noexcept {
+    if (s.alpha() == 0 || d.alpha() == 0) return PremultipliedColorU8();
+    return PremultipliedColorU8::from_rgba_unchecked(
+        premultiply_u8(s.red(), d.red()),
+        premultiply_u8(s.green(), d.green()),
+        premultiply_u8(s.blue(), d.blue()),
+        premultiply_u8(s.alpha(), d.alpha())
+    );
+}
+
+inline void blend_solid_modulate(PremultipliedColorU8* dst, PremultipliedColorU8 src, size_t count) noexcept {
+    if (count == 0) return;
+    if (src.alpha() == 0) {
+        std::fill_n(dst, count, PremultipliedColorU8{});
+        return;
+    }
+    size_t i = 0;
+#if defined(NISABA_HAS_AVX2)
+    __m256i zero = _mm256_setzero_si256();
+    __m256i c_128 = _mm256_set1_epi16(128);
+    uint32_t src_raw = *reinterpret_cast<const uint32_t*>(&src);
+    __m256i v_src_32 = _mm256_set1_epi32(static_cast<int>(src_raw));
+    __m256i v_src_16_lo = _mm256_unpacklo_epi8(v_src_32, zero);
+    __m256i v_src_16_hi = _mm256_unpackhi_epi8(v_src_32, zero);
+
+    for (; i + 8 <= count; i += 8) {
+        __m256i d = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + i));
+        __m256i d_lo = _mm256_unpacklo_epi8(d, zero);
+        __m256i d_hi = _mm256_unpackhi_epi8(d, zero);
+
+        __m256i prod_lo = _mm256_add_epi16(_mm256_mullo_epi16(v_src_16_lo, d_lo), c_128);
+        __m256i prod_hi = _mm256_add_epi16(_mm256_mullo_epi16(v_src_16_hi, d_hi), c_128);
+
+        __m256i res_lo = _mm256_srli_epi16(_mm256_add_epi16(prod_lo, _mm256_srli_epi16(prod_lo, 8)), 8);
+        __m256i res_hi = _mm256_srli_epi16(_mm256_add_epi16(prod_hi, _mm256_srli_epi16(prod_hi, 8)), 8);
+
+        __m256i res = _mm256_packus_epi16(res_lo, res_hi);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), res);
+    }
+#elif defined(NISABA_HAS_SSE2)
+    __m128i zero = _mm_setzero_si128();
+    __m128i c_128 = _mm_set1_epi16(128);
+    uint32_t src_raw = *reinterpret_cast<const uint32_t*>(&src);
+    __m128i v_src_32 = _mm_set1_epi32(static_cast<int>(src_raw));
+    __m128i v_src_16_lo = _mm_unpacklo_epi8(v_src_32, zero);
+    __m128i v_src_16_hi = _mm_unpackhi_epi8(v_src_32, zero);
+
+    for (; i + 4 <= count; i += 4) {
+        __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst + i));
+        __m128i d_lo = _mm_unpacklo_epi8(d, zero);
+        __m128i d_hi = _mm_unpackhi_epi8(d, zero);
+
+        __m128i prod_lo = _mm_add_epi16(_mm_mullo_epi16(v_src_16_lo, d_lo), c_128);
+        __m128i prod_hi = _mm_add_epi16(_mm_mullo_epi16(v_src_16_hi, d_hi), c_128);
+
+        __m128i res_lo = _mm_srli_epi16(_mm_add_epi16(prod_lo, _mm_srli_epi16(prod_lo, 8)), 8);
+        __m128i res_hi = _mm_srli_epi16(_mm_add_epi16(prod_hi, _mm_srli_epi16(prod_hi, 8)), 8);
+
+        __m128i res = _mm_packus_epi16(res_lo, res_hi);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), res);
+    }
+#endif
+    for (; i < count; ++i) {
+        dst[i] = blend_modulate_pixel(dst[i], src);
+    }
+}
+
 inline PremultipliedColorU8 blend_source_in_pixel(PremultipliedColorU8 d, PremultipliedColorU8 s) noexcept {
     uint8_t da = d.alpha();
     if (da == 0) return PremultipliedColorU8();
@@ -2518,28 +2585,30 @@ inline void blend_solid_soft_light_coverage(PremultipliedColorU8* dst, Premultip
 inline PremultipliedColorU8 blend_color_dodge_pixel(PremultipliedColorU8 d, PremultipliedColorU8 s) noexcept {
     uint8_t sa = s.alpha();
     uint8_t da = d.alpha();
-    uint8_t inv_sa = 255 - sa;
-    uint8_t inv_da = 255 - da;
+    if (sa == 0) return d;
+    if (da == 0) return s;
+    uint32_t inv_sa = 255 - sa;
+    uint32_t inv_da = 255 - da;
+    uint32_t sada = static_cast<uint32_t>(sa) * da;
 
     auto dodge_ch = [&](uint8_t sc, uint8_t dc) noexcept -> uint8_t {
-        if (dc == 0) return (static_cast<uint32_t>(sc) * inv_da + 127) / 255;
+        if (dc == 0) return static_cast<uint8_t>((static_cast<uint32_t>(sc) * inv_da + 127) / 255);
         uint32_t ch;
-        if (sc == sa) {
-            ch = static_cast<uint32_t>(sa) * da;
+        if (sc >= sa) {
+            ch = sada;
         } else {
-            uint32_t num = static_cast<uint32_t>(dc) * sa;
-            uint32_t den = static_cast<uint32_t>(sa) - sc;
-            uint32_t val = (num + (den >> 1)) / den;
-            ch = std::min(val, static_cast<uint32_t>(da)) * da;
+            uint32_t den = static_cast<uint32_t>(sa - sc);
+            uint32_t term = (static_cast<uint32_t>(dc) * sa * sa + (den >> 1)) / den;
+            ch = std::min(term, sada);
         }
-        uint32_t res = (static_cast<uint32_t>(sc) * inv_da + static_cast<uint32_t>(dc) * inv_sa + (ch + 127) / 255 + 127) / 255;
+        uint32_t res = (static_cast<uint32_t>(sc) * inv_da + static_cast<uint32_t>(dc) * inv_sa + ch + 127) / 255;
         return static_cast<uint8_t>(std::min(res, 255u));
     };
 
     uint8_t r = dodge_ch(s.red(), d.red());
     uint8_t g = dodge_ch(s.green(), d.green());
     uint8_t b = dodge_ch(s.blue(), d.blue());
-    uint8_t a = static_cast<uint8_t>(sa + (static_cast<uint16_t>(da) * inv_sa + 127) / 255);
+    uint8_t a = static_cast<uint8_t>(sa + (static_cast<uint32_t>(da) * inv_sa + 127) / 255);
     return PremultipliedColorU8::from_rgba_unchecked(r, g, b, a);
 }
 
@@ -2576,23 +2645,28 @@ inline void blend_solid_color_dodge_coverage(PremultipliedColorU8* dst, Premulti
 inline PremultipliedColorU8 blend_color_burn_pixel(PremultipliedColorU8 d, PremultipliedColorU8 s) noexcept {
     uint8_t sa = s.alpha();
     uint8_t da = d.alpha();
-    uint8_t inv_sa = 255 - sa;
-    uint8_t inv_da = 255 - da;
+    if (sa == 0) return d;
+    if (da == 0) return s;
+    uint32_t inv_sa = 255 - sa;
+    uint32_t inv_da = 255 - da;
+    uint32_t sada = static_cast<uint32_t>(sa) * da;
 
     auto burn_ch = [&](uint8_t sc, uint8_t dc) noexcept -> uint8_t {
-        if (dc == da) return std::min(255u, (static_cast<uint32_t>(sa) * da + static_cast<uint32_t>(sc) * inv_da + static_cast<uint32_t>(dc) * inv_sa + 127) / 255);
-        if (sc == 0) return (static_cast<uint32_t>(dc) * inv_sa + 127) / 255;
-        uint32_t num = static_cast<uint32_t>(da - dc) * sa;
-        uint32_t val = (num + (sc >> 1)) / sc;
-        uint32_t ch = (val >= da) ? 0 : (da - val) * da;
-        uint32_t res = (static_cast<uint32_t>(sc) * inv_da + static_cast<uint32_t>(dc) * inv_sa + (ch + 127) / 255 + 127) / 255;
+        if (dc >= da) {
+            uint32_t res = (sada + static_cast<uint32_t>(sc) * inv_da + static_cast<uint32_t>(dc) * inv_sa + 127) / 255;
+            return static_cast<uint8_t>(std::min(res, 255u));
+        }
+        if (sc == 0) return static_cast<uint8_t>((static_cast<uint32_t>(dc) * inv_sa + 127) / 255);
+        uint32_t sub = (static_cast<uint32_t>(da - dc) * sa * sa + (sc >> 1)) / sc;
+        uint32_t ch = (sub >= sada) ? 0u : (sada - sub);
+        uint32_t res = (static_cast<uint32_t>(sc) * inv_da + static_cast<uint32_t>(dc) * inv_sa + ch + 127) / 255;
         return static_cast<uint8_t>(std::min(res, 255u));
     };
 
     uint8_t r = burn_ch(s.red(), d.red());
     uint8_t g = burn_ch(s.green(), d.green());
     uint8_t b = burn_ch(s.blue(), d.blue());
-    uint8_t a = static_cast<uint8_t>(sa + (static_cast<uint16_t>(da) * inv_sa + 127) / 255);
+    uint8_t a = static_cast<uint8_t>(sa + (static_cast<uint32_t>(da) * inv_sa + 127) / 255);
     return PremultipliedColorU8::from_rgba_unchecked(r, g, b, a);
 }
 
@@ -2789,7 +2863,7 @@ inline PremultipliedColorU8 blend_pixel_by_mode(PremultipliedColorU8 d, Premulti
         case BlendMode::DestinationAtop: return blend_dest_atop_pixel(d, s);
         case BlendMode::Xor: return blend_xor_pixel(d, s);
         case BlendMode::Plus: return blend_plus_pixel(d, s);
-        case BlendMode::Modulate: return blend_source_in_pixel(d, s);
+        case BlendMode::Modulate: return blend_modulate_pixel(d, s);
         case BlendMode::Screen: return blend_screen_pixel(d, s);
         case BlendMode::Multiply: return blend_multiply_pixel(d, s);
         case BlendMode::Darken: return blend_darken_pixel(d, s);
@@ -2951,15 +3025,8 @@ inline void blend_solid_dest_in(PremultipliedColorU8* dst, PremultipliedColorU8 
         blend_solid_clear(dst, count);
         return;
     }
-    uint32_t a = static_cast<uint32_t>(sa) + 1;
     for (size_t i = 0; i < count; ++i) {
-        PremultipliedColorU8 d = dst[i];
-        dst[i] = PremultipliedColorU8::from_rgba_unchecked(
-            static_cast<uint8_t>((static_cast<uint32_t>(d.red()) * a) >> 8),
-            static_cast<uint8_t>((static_cast<uint32_t>(d.green()) * a) >> 8),
-            static_cast<uint8_t>((static_cast<uint32_t>(d.blue()) * a) >> 8),
-            static_cast<uint8_t>((static_cast<uint32_t>(d.alpha()) * a) >> 8)
-        );
+        dst[i] = blend_source_in_pixel(src, dst[i]);
     }
 }
 
@@ -3005,7 +3072,7 @@ inline void blend_solid_span_by_mode(PremultipliedColorU8* dst, PremultipliedCol
             blend_solid_plus(dst, src, count);
             break;
         case BlendMode::Modulate:
-            blend_solid_source_in(dst, src, count);
+            blend_solid_modulate(dst, src, count);
             break;
         case BlendMode::Multiply:
             blend_solid_multiply(dst, src, count);
