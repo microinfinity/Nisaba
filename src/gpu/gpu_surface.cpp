@@ -158,6 +158,13 @@ std::shared_ptr<GpuSurface> GpuSurface::from_screen(
     ));
 }
 
+bool GpuSurface::resize_screen(uint32_t width, uint32_t height) noexcept {
+    if (owns_fbo_ || width == 0 || height == 0) return false;
+    width_ = width;
+    height_ = height;
+    return true;
+}
+
 void GpuSurface::bind() {
     if (device_) {
         device_->make_current();

@@ -742,6 +742,196 @@ SuiteResult benchmark_text_layout_and_bounds() {
     return {"6. Text Layout & Bounds", total_nisaba_us / 1000.0, total_fons_us / 1000.0, "Nisaba: full BiDi & word wrap; fons: horizontal bounds only"};
 }
 
+SuiteResult benchmark_phase1_metrics_and_ellipsis() {
+    std::cout << "\n--- Benchmark 7: Phase 1 Paragraph Metrics, Custom Ellipsis & Direction ---\n";
+
+    std::string interPath = resolveFont("Inter-Regular.ttf");
+    std::string arabicPath = resolveFont("NotoSansArabic.ttf");
+    FontSystem fs;
+    fs.set_auto_system_fonts(false);
+    auto id_en = fs.load_font_file(interPath);
+    auto id_ar = fs.load_font_file(arabicPath);
+    if (!id_en || !id_ar) return {"7. Phase 1 Metrics/Ellipsis", 0, 0, "Fonts unavailable"};
+
+    const int ITERATIONS = 500;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    float sink = 0.0f;
+    size_t count_sink = 0;
+
+    for (int i = 0; i < ITERATIONS; ++i) {
+        Buffer en(Metrics(16.0f, 22.0f));
+        en.set_size(220.0f, std::nullopt);
+        en.set_wrap(Wrap::Word);
+        en.set_overflow(Overflow::Ellipsis);
+        en.set_max_lines(2);
+        en.set_ellipsis("... more");
+        en.set_text("Nisaba text layout engine with intrinsic metrics, per-line baselines, and custom truncation.");
+        en.shape_until_scroll(fs);
+        sink += en.min_intrinsic_width(fs) + en.alphabetic_baseline() + en.ideographic_baseline();
+        count_sink += en.line_metrics().size() + en.unresolved_glyphs() + (en.did_exceed_max_lines() ? 1u : 0u);
+
+        Buffer ar(Metrics(18.0f, 28.0f));
+        ar.set_size(240.0f, std::nullopt);
+        ar.set_wrap(Wrap::Word);
+        ar.set_align(Align::Start);
+        ar.set_text_direction(TextDirection::RTL);
+        ar.set_overflow(Overflow::Ellipsis);
+        ar.set_max_lines(1);
+        ar.set_ellipsis("\xE2\x80\xA6 \xD8\xA7\xD9\x84\xD9\x85\xD8\xB2\xD9\x8A\xD8\xAF");
+        ar.set_text("مرحبا بكم في محرك نيسابا للنصوص العربية والاتجاه المختلط English 2026");
+        ar.shape_until_scroll(fs);
+        sink += ar.min_intrinsic_width(fs);
+        count_sink += ar.line_metrics().size();
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double avg_us = (total_ms * 1000.0) / ITERATIONS;
+    std::cout << "  Phase 1 EN+RTL Metrics + Custom Ellipsis: " << avg_us << " us/iter"
+              << " (sink=" << sink << ", items=" << count_sink << ")\n";
+    return {"7. Phase 1 Metrics/Ellipsis", total_ms, total_ms, "Native intrinsic metrics + RTL custom ellipsis"};
+}
+
+SuiteResult benchmark_phase2_placeholders_and_gap_underline() {
+    std::cout << "\n--- Benchmark 8: Phase 2 Placeholders, Rich Paint & DecorationMode::Gaps ---\n";
+
+    std::string interPath = resolveFont("Inter-Regular.ttf");
+    std::string arabicPath = resolveFont("NotoSansArabic.ttf");
+    FontSystem fs;
+    fs.set_auto_system_fonts(false);
+    auto id_en = fs.load_font_file(interPath);
+    auto id_ar = fs.load_font_file(arabicPath);
+    if (!id_en || !id_ar) return {"8. Phase 2 Placeholders/Gaps", 0, 0, "Fonts unavailable"};
+
+    const int ITERATIONS = 300;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    size_t sink = 0;
+
+    Attrs gap_attrs;
+    gap_attrs.set_underline(true).set_decoration_mode(DecorationMode::Gaps);
+
+    for (int i = 0; i < ITERATIONS; ++i) {
+        Buffer b(Metrics(20.0f, 30.0f));
+        b.set_size(260.0f, std::nullopt);
+        b.add_text("Typography ", gap_attrs);
+        b.add_placeholder(24.0f, 24.0f, PlaceholderAlignment::Middle);
+        b.add_text(" gypq يرجى التوقيع ", gap_attrs);
+        b.add_placeholder(20.0f, 18.0f, PlaceholderAlignment::AboveBaseline);
+        b.shape_until_scroll(fs);
+        sink += b.placeholder_rects().size();
+        for (const auto& run : b.layout_runs()) {
+            auto dec = build_run_decorations(run, 0.0f, 0.0f, 20.0f, Color::WHITE, &fs);
+            sink += dec.rects.size();
+        }
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double avg_us = (total_ms * 1000.0) / ITERATIONS;
+    std::cout << "  Phase 2 Placeholders + DecorationMode::Gaps: " << avg_us << " us/iter (sink=" << sink << ")\n";
+    return {"8. Phase 2 Placeholders/Gaps", total_ms, total_ms, "Inline placeholders + descender gap underline"};
+}
+
+SuiteResult benchmark_phase3_variable_fonts_and_features() {
+    std::cout << "\n--- Benchmark 9: Phase 3 Variable Fonts (gvar/HVAR), OpenType Features & StrutStyle ---\n";
+
+    std::string varEnPath = resolveFont("InterVariable.ttf");
+    std::string varArPath = resolveFont("NotoSansArabic.ttf");
+    FontSystem fs;
+    fs.set_auto_system_fonts(false);
+    auto id_en = fs.load_font_file(varEnPath, 0, "InterVarBench");
+    auto id_ar = fs.load_font_file(varArPath, 0, "ArabicVarBench");
+    if (!id_en || !id_ar) return {"9. Phase 3 VarFont/Features", 0, 0, "Fonts unavailable"};
+
+    const int ITERATIONS = 300;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    float sink = 0.0f;
+
+    Attrs attrs;
+    attrs.set_font_families({Family("InterVarBench"), Family("ArabicVarBench")})
+         .set_locale("ar")
+         .add_font_feature("tnum", 1)
+         .add_font_feature("zero", 1)
+         .add_font_variation("wght", 700.0f)
+         .add_font_variation("wdth", 85.0f);
+
+    StrutStyle strut;
+    strut.enabled = true;
+    strut.font_families = {Family("InterVarBench")};
+    strut.font_size = 20.0f;
+    strut.height_multiplier = 1.35f;
+    strut.force_strut_height = true;
+    strut.half_leading = true;
+
+    for (int i = 0; i < ITERATIONS; ++i) {
+        Buffer b(Metrics(20.0f, 28.0f));
+        b.set_strut_style(strut);
+        b.set_text_height_behavior(TextHeightBehavior{false, false});
+        b.set_text("09:42:15 مرحبا نيسابا", attrs);
+        b.shape_until_scroll(fs);
+        sink += b.max_line_width() + b.total_height();
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double avg_us = (total_ms * 1000.0) / ITERATIONS;
+    std::cout << "  Phase 3 VarFont + OT Features + StrutStyle: " << avg_us << " us/iter (sink=" << sink << ")\n";
+    return {"9. Phase 3 VarFont/Features", total_ms, total_ms, "Native gvar/HVAR + tnum/locl + StrutStyle"};
+}
+
+SuiteResult benchmark_phase4_incremental_updates_cache_and_visitor() {
+    std::cout << "\n--- Benchmark 10: Phase 4 Incremental Updates, ParagraphCache & Visitor ---\n";
+
+    std::string interPath = resolveFont("Inter-Regular.ttf");
+    std::string arabicPath = resolveFont("NotoSansArabic.ttf");
+    FontSystem fs;
+    fs.set_auto_system_fonts(false);
+    auto id_en = fs.load_font_file(interPath);
+    auto id_ar = fs.load_font_file(arabicPath);
+    if (!id_en || !id_ar) return {"10. Phase 4 Incr/Cache/Visit", 0, 0, "Fonts unavailable"};
+
+    Buffer buf(Metrics(20.0f, 28.0f));
+    buf.set_size(320.0f, std::nullopt);
+    buf.set_text("Interactive text editor paragraph مرحبا نيسابا 2026");
+    buf.shape_until_scroll(fs);
+
+    Paint fg_a(Color::from_rgba8(255, 100, 100, 255));
+    Paint fg_b(Color::from_rgba8(100, 220, 255, 255));
+    Paint bg_a(Color::from_rgba8(40, 60, 100, 255));
+
+    ParagraphCache pcache(64);
+    Attrs lbl_attrs;
+    lbl_attrs.set_color(TextColor::rgb(240, 240, 240));
+    // Prime cache once
+    (void)pcache.get_or_layout(fs, "Repeated UI Label مرحبا", lbl_attrs, Metrics(18.0f, 24.0f), 260.0f);
+
+    const int ITERATIONS = 2000;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    float sink = 0.0f;
+    size_t glyphs_visited = 0;
+
+    for (int i = 0; i < ITERATIONS; ++i) {
+        buf.update_text_align((i & 1) ? Align::Center : Align::Right);
+        buf.update_foreground_paint(0, 11, (i & 1) ? fg_a : fg_b);
+        buf.update_background_paint(12, 16, bg_a);
+        buf.update_font_size(17, 23, (i & 1) ? 24.0f : 20.0f);
+
+        auto cached = pcache.get_or_layout(fs, "Repeated UI Label مرحبا", lbl_attrs, Metrics(18.0f, 24.0f), 260.0f);
+        sink += cached->max_line_width() + buf.max_line_width();
+
+        buf.visit(fs, [&](const GlyphRunInfo& run) {
+            glyphs_visited += run.glyph_ids.size();
+        });
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double avg_us = (total_ms * 1000.0) / ITERATIONS;
+    std::cout << "  Phase 4 IncrUpdate + ParagraphCache Hit + Visit: " << avg_us
+              << " us/iter (hits=" << pcache.hits() << ", visited=" << glyphs_visited << ", sink=" << sink << ")\n";
+    return {"10. Phase 4 Incr/Cache/Visit", total_ms, total_ms, "Zero-reshape updates + LRU ParagraphCache + visit()"};
+}
+
 // -----------------------------------------------------------------------------
 // Main Entry Point & Grand Total Summary
 // -----------------------------------------------------------------------------
@@ -758,6 +948,10 @@ int main() {
     results.push_back(benchmark_vector_outline_extraction());
     results.push_back(benchmark_glyph_rasterization());
     results.push_back(benchmark_text_layout_and_bounds());
+    results.push_back(benchmark_phase1_metrics_and_ellipsis());
+    results.push_back(benchmark_phase2_placeholders_and_gap_underline());
+    results.push_back(benchmark_phase3_variable_fonts_and_features());
+    results.push_back(benchmark_phase4_incremental_updates_cache_and_visitor());
 
     // Compute Grand Totals
     double grand_nisaba_ms = 0.0;

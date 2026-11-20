@@ -108,11 +108,33 @@ public:
         Stretch stretch = Stretch::Normal
     ) const noexcept;
 
+    /// Matches the first available font in an ordered family fallback chain.
+    FontMatchResult match_font_chain_styled(
+        std::span<const Family> families,
+        const Family& fallback_family,
+        Weight weight = Weight::Normal,
+        Style style = Style::Normal,
+        Stretch stretch = Stretch::Normal,
+        std::string_view locale = {}
+    ) const noexcept;
+
     /// Searches for a glyph representing the codepoint, starting with the primary font,
     /// and falling back via OS/2 Unicode Range bitmasks and system alias chains.
     std::pair<uint32_t, uint16_t> find_glyph_or_fallback(
         uint32_t primary_font_id,
         char32_t codepoint
+    ) const noexcept;
+
+    /// Searches for a glyph starting with primary_font_id, then walking an ordered family chain
+    /// and locale-specific Han unification / script candidates before general system fallback.
+    std::pair<uint32_t, uint16_t> find_glyph_in_chain_or_fallback(
+        std::span<const Family> families,
+        uint32_t primary_font_id,
+        Weight weight,
+        Style style,
+        Stretch stretch,
+        char32_t codepoint,
+        std::string_view locale = {}
     ) const noexcept;
 
     /// Returns the total number of registered/indexed font faces.

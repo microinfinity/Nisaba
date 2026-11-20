@@ -263,6 +263,17 @@ public:
     ) const;
 
     [[nodiscard]] std::span<const VariationAxis> variation_axes() const noexcept { return variation_axes_; }
+    [[nodiscard]] bool is_variable_font() const noexcept { return !variation_axes_.empty(); }
+
+    /// Computes normalized axis coordinates in [-1.0, 1.0] for each 'fvar' axis (applying 'avar' segment maps).
+    std::vector<float> normalize_variation_coords(std::span<const FontVariation> variations) const;
+
+    /// Retrieves horizontal advance at a given font pixel size with Variable Font ('HVAR' / 'gvar') interpolation.
+    float glyph_advance_varied(
+        uint16_t glyph_id,
+        float font_size,
+        std::span<const FontVariation> variations
+    ) const noexcept;
 
     // --- Vector Outline Extraction ---
     /// Extracts the vector outline for a glyph, scaled to the requested font pixel size.
@@ -275,6 +286,16 @@ public:
         uint16_t glyph_id,
         Path& out_path,
         float font_size,
+        bool synthetic_bold = false,
+        bool synthetic_italic = false
+    ) const;
+
+    /// Extracts the vector outline for a glyph with Variable Font ('fvar'/'avar'/'gvar') interpolation and styling.
+    bool get_glyph_path_varied(
+        uint16_t glyph_id,
+        Path& out_path,
+        float font_size,
+        std::span<const FontVariation> variations,
         bool synthetic_bold = false,
         bool synthetic_italic = false
     ) const;
@@ -299,9 +320,28 @@ private:
     bool parse_os2();
     bool parse_post();
     bool parse_fvar();
+    bool parse_avar();
+    bool parse_gvar();
+    bool parse_hvar();
 
     bool extract_simple_glyph(const uint8_t* g_data, Path& path, float scale) const;
+    bool extract_simple_glyph_varied(
+        uint16_t glyph_id,
+        const uint8_t* g_data,
+        Path& path,
+        float scale,
+        std::span<const float> norm_coords
+    ) const;
     bool extract_composite_glyph(const uint8_t* g_data, Path& path, float scale, int recursion_depth) const;
+    bool extract_composite_glyph_varied(
+        uint16_t glyph_id,
+        const uint8_t* g_data,
+        Path& path,
+        float scale,
+        std::span<const float> norm_coords,
+        int recursion_depth
+    ) const;
+    int16_t compute_hvar_advance_delta(uint16_t glyph_id, std::span<const float> norm_coords) const noexcept;
 
     uint16_t lookup_glyph_raw(char32_t codepoint) const noexcept;
     int16_t compute_kerning_slow(uint16_t left_glyph, uint16_t right_glyph) const noexcept;
@@ -407,6 +447,22 @@ private:
     std::unique_ptr<OpenTypeGsub> gsub_{nullptr};
     std::unique_ptr<OpenTypeGpos> gpos_{nullptr};
     std::vector<VariationAxis> variation_axes_{};
+
+    // OpenType Variable Font tables ('avar', 'gvar', 'HVAR')
+    struct AvarSegmentMap {
+        std::vector<std::pair<float, float>> pairs{};
+    };
+    std::vector<AvarSegmentMap> avar_maps_{};
+    uint32_t gvar_offset_{0};
+    uint32_t gvar_length_{0};
+    uint16_t gvar_axis_count_{0};
+    uint16_t gvar_shared_tuple_count_{0};
+    uint32_t gvar_shared_tuples_offset_{0};
+    uint16_t gvar_glyph_count_{0};
+    uint16_t gvar_flags_{0};
+    uint32_t gvar_data_array_offset_{0};
+    uint32_t hvar_offset_{0};
+    uint32_t hvar_length_{0};
 };
 
 /// Standard font alias for TtfFont in Nisaba typography subsystem.

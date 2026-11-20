@@ -877,6 +877,150 @@ std::pair<uint32_t, const TtfFont*> FontSystem::match_font(
     return {res.font_id, res.font};
 }
 
+FontMatchResult FontSystem::match_font_chain_styled(
+    std::span<const Family> families,
+    const Family& fallback_family,
+    Weight weight,
+    Style style,
+    Stretch stretch,
+    std::string_view /*locale*/
+) const noexcept {
+    ensure_default_system_fonts();
+    if (faces_.empty()) return {};
+
+    auto make_result = [&](const FaceRecord& rec) -> FontMatchResult {
+        const TtfFont* f = ensure_face_loaded(rec);
+        bool synth_bold = (static_cast<int>(weight) >= 600) && (static_cast<int>(rec.weight) < 600);
+        bool synth_italic = (style != Style::Normal) && (rec.style == Style::Normal);
+        return FontMatchResult{rec.id, f, synth_bold, synth_italic};
+    };
+
+    for (const auto& fam : families) {
+        if (fam.kind == Family::Kind::Name) {
+            std::string key = LinuxFontConfig::normalize_key(fam.name);
+            auto it = family_to_faces_.find(key);
+            if (it != family_to_faces_.end() && !it->second.empty()) {
+                if (const FaceRecord* matched = score_faces_in_family(it->second, weight, style, stretch)) {
+                    if (ensure_face_loaded(*matched)) {
+                        return make_result(*matched);
+                    }
+                }
+            }
+            // Try Fontconfig aliases for this named family
+            auto candidates = linux_config_.resolve_family_candidates(fam);
+            for (const auto& cname : candidates) {
+                auto cit = family_to_faces_.find(LinuxFontConfig::normalize_key(cname));
+                if (cit != family_to_faces_.end() && !cit->second.empty()) {
+                    if (const FaceRecord* matched = score_faces_in_family(cit->second, weight, style, stretch)) {
+                        if (ensure_face_loaded(*matched)) {
+                            return make_result(*matched);
+                        }
+                    }
+                }
+            }
+        } else {
+            auto res = match_font_styled(fam, weight, style, stretch);
+            if (res.font != nullptr) return res;
+        }
+    }
+
+    return match_font_styled(fallback_family, weight, style, stretch);
+}
+
+std::pair<uint32_t, uint16_t> FontSystem::find_glyph_in_chain_or_fallback(
+    std::span<const Family> families,
+    uint32_t primary_font_id,
+    Weight weight,
+    Style style,
+    Stretch stretch,
+    char32_t codepoint,
+    std::string_view locale
+) const noexcept {
+    ensure_default_system_fonts();
+
+    // 1. Try primary font first
+    if (const FaceRecord* primary_rec = find_face_record(primary_font_id)) {
+        if (const TtfFont* pf = ensure_face_loaded(*primary_rec)) {
+            uint16_t gid = pf->glyph_index(codepoint);
+            if (gid != 0) return {primary_font_id, gid};
+        }
+    }
+
+    auto try_family_name = [&](std::string_view fam_name) -> std::pair<uint32_t, uint16_t> {
+        std::string key = LinuxFontConfig::normalize_key(fam_name);
+        auto it = family_to_faces_.find(key);
+        if (it == family_to_faces_.end() || it->second.empty()) return {0, 0};
+        if (const FaceRecord* rec = score_faces_in_family(it->second, weight, style, stretch)) {
+            if (const TtfFont* f = ensure_face_loaded(*rec)) {
+                uint16_t gid = f->glyph_index(codepoint);
+                if (gid != 0) return {rec->id, gid};
+            }
+        }
+        return {0, 0};
+    };
+
+    // 2. Walk explicit ordered font_families fallback chain
+    for (const auto& fam : families) {
+        if (fam.kind == Family::Kind::Name) {
+            if (auto [fid, gid] = try_family_name(fam.name); gid != 0) {
+                return {fid, gid};
+            }
+            for (const auto& alias_cand : linux_config_.resolve_family_candidates(fam)) {
+                if (auto [fid, gid] = try_family_name(alias_cand); gid != 0) {
+                    return {fid, gid};
+                }
+            }
+        } else {
+            auto m = match_font_styled(fam, weight, style, stretch);
+            if (m.font) {
+                uint16_t gid = m.font->glyph_index(codepoint);
+                if (gid != 0) return {m.font_id, gid};
+            }
+        }
+    }
+
+    // 3. Locale-aware script & Han unification preferred family lookup
+    if (!locale.empty()) {
+        std::string loc;
+        loc.reserve(locale.size());
+        for (char c : locale) {
+            if (c == '_') loc.push_back('-');
+            else if (c >= 'A' && c <= 'Z') loc.push_back(static_cast<char>(c - 'A' + 'a'));
+            else loc.push_back(c);
+        }
+
+        const char* const* preferred = nullptr;
+        size_t pref_count = 0;
+
+        static constexpr const char* kJa[] = {"Noto Sans CJK JP", "Noto Sans JP", "IPAGothic", "VL Gothic", "Droid Sans Fallback"};
+        static constexpr const char* kZhHant[] = {"Noto Sans CJK TC", "Noto Sans TC", "Noto Sans CJK HK", "AR PL UMing TW", "Droid Sans Fallback"};
+        static constexpr const char* kZhHans[] = {"Noto Sans CJK SC", "Noto Sans SC", "WenQuanYi Micro Hei", "Droid Sans Fallback"};
+        static constexpr const char* kKo[] = {"Noto Sans CJK KR", "Noto Sans KR", "UnDotum", "Droid Sans Fallback"};
+        static constexpr const char* kAr[] = {"Noto Sans Arabic", "Amiri", "DejaVu Sans"};
+        static constexpr const char* kHe[] = {"Noto Sans Hebrew", "DejaVu Sans"};
+
+        if (loc.starts_with("ja")) { preferred = kJa; pref_count = std::size(kJa); }
+        else if (loc.starts_with("zh-hant") || loc.starts_with("zh-tw") || loc.starts_with("zh-hk") || loc.starts_with("zh-mo")) {
+            preferred = kZhHant; pref_count = std::size(kZhHant);
+        } else if (loc.starts_with("zh")) { preferred = kZhHans; pref_count = std::size(kZhHans); }
+        else if (loc.starts_with("ko")) { preferred = kKo; pref_count = std::size(kKo); }
+        else if (loc.starts_with("ar") || loc.starts_with("fa") || loc.starts_with("ur")) {
+            preferred = kAr; pref_count = std::size(kAr);
+        } else if (loc.starts_with("he") || loc.starts_with("iw")) {
+            preferred = kHe; pref_count = std::size(kHe);
+        }
+
+        for (size_t i = 0; i < pref_count; ++i) {
+            if (auto [fid, gid] = try_family_name(preferred[i]); gid != 0) {
+                return {fid, gid};
+            }
+        }
+    }
+
+    // 4. General OS/2 Unicode range & system fallback
+    return find_glyph_or_fallback(primary_font_id, codepoint);
+}
+
 std::pair<uint32_t, uint16_t> FontSystem::find_glyph_or_fallback(
     uint32_t primary_font_id,
     char32_t codepoint

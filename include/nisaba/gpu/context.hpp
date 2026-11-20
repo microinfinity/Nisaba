@@ -162,7 +162,14 @@ public:
 
 	float text(float x, float y, const char* string, const char* end = nullptr);
 	float textWithFont(float x, float y, const text::TtfFont& font, float fontSize, const char* string, const char* end = nullptr);
-	void drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontSystem, Point pos = Point{0.0f, 0.0f}, Color defaultColor = Color::rgba(0, 0, 0, 255));
+	/// Draws a text::Buffer on GPU. passMask bits: 0x01=solid backgrounds, 0x02=shadows, 0x04=solid glyphs, 0x08=decorations.
+	void drawTextBuffer(
+		const text::Buffer& buffer,
+		text::FontSystem& fontSystem,
+		Point pos = Point{0.0f, 0.0f},
+		Color defaultColor = Color::rgba(0, 0, 0, 255),
+		uint32_t passMask = 0x0Fu
+	);
 	void textBox(float x, float y, float breakRowWidth, const char* string, const char* end = nullptr);
 	float textBounds(float x, float y, const char* string, const char* end, float* bounds);
 	void textBoxBounds(float x, float y, float breakRowWidth, const char* string, const char* end, float* bounds);

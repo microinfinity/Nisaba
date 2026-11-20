@@ -48,6 +48,9 @@ constexpr uint32_t TAG_CBDT = make_tag('C', 'B', 'D', 'T');
 constexpr uint32_t TAG_SBIX = make_tag('s', 'b', 'i', 'x');
 constexpr uint32_t TAG_SVG  = make_tag('S', 'V', 'G', ' ');
 constexpr uint32_t TAG_FVAR = make_tag('f', 'v', 'a', 'r');
+constexpr uint32_t TAG_AVAR = make_tag('a', 'v', 'a', 'r');
+constexpr uint32_t TAG_GVAR = make_tag('g', 'v', 'a', 'r');
+constexpr uint32_t TAG_HVAR = make_tag('H', 'V', 'A', 'R');
 
 class ByteReader {
 public:
@@ -636,6 +639,9 @@ bool TtfFont::parse_internal(std::span<const uint8_t> data, uint32_t face_index)
     parse_post();
     parse_kern();
     parse_fvar();
+    parse_avar();
+    parse_gvar();
+    parse_hvar();
 
     // Parse OpenType GDEF table (glyph class definitions for IgnoreMarks)
     if (const auto* gdef_rec = find_table(TAG_GDEF)) {
@@ -1032,6 +1038,256 @@ bool TtfFont::parse_fvar() {
         variation_axes_.push_back(axis);
     }
     return true;
+}
+
+bool TtfFont::parse_avar() {
+    const auto* rec = find_table(TAG_AVAR);
+    if (!rec || rec->length < 8 || variation_axes_.empty()) return false;
+    ByteReader reader(data_.subspan(rec->offset, rec->length));
+    uint16_t major = reader.read_u16();
+    uint16_t minor = reader.read_u16();
+    reader.skip(2); // reserved
+    uint16_t axis_count = reader.read_u16();
+    if (major != 1 || minor != 0 || axis_count != variation_axes_.size()) return false;
+
+    avar_maps_.resize(axis_count);
+    for (uint16_t a = 0; a < axis_count; ++a) {
+        if (!reader.can_read(2)) return false;
+        uint16_t pair_count = reader.read_u16();
+        if (!reader.can_read(static_cast<size_t>(pair_count) * 4u)) return false;
+        auto& pairs = avar_maps_[a].pairs;
+        pairs.reserve(pair_count);
+        for (uint16_t p = 0; p < pair_count; ++p) {
+            float from_c = static_cast<float>(reader.read_i16()) / 16384.0f;
+            float to_c = static_cast<float>(reader.read_i16()) / 16384.0f;
+            pairs.emplace_back(from_c, to_c);
+        }
+    }
+    return true;
+}
+
+bool TtfFont::parse_gvar() {
+    const auto* rec = find_table(TAG_GVAR);
+    if (!rec || rec->length < 20) return false;
+    ByteReader reader(data_.subspan(rec->offset, rec->length));
+    uint16_t major = reader.read_u16();
+    uint16_t minor = reader.read_u16();
+    if (major != 1 || minor != 0) return false;
+
+    gvar_axis_count_ = reader.read_u16();
+    gvar_shared_tuple_count_ = reader.read_u16();
+    gvar_shared_tuples_offset_ = reader.read_u32();
+    gvar_glyph_count_ = reader.read_u16();
+    gvar_flags_ = reader.read_u16();
+    gvar_data_array_offset_ = reader.read_u32();
+    gvar_offset_ = rec->offset;
+    gvar_length_ = rec->length;
+    return true;
+}
+
+bool TtfFont::parse_hvar() {
+    const auto* rec = find_table(TAG_HVAR);
+    if (!rec || rec->length < 20) return false;
+    ByteReader reader(data_.subspan(rec->offset, rec->length));
+    uint16_t major = reader.read_u16();
+    uint16_t minor = reader.read_u16();
+    if (major != 1 || minor != 0) return false;
+    hvar_offset_ = rec->offset;
+    hvar_length_ = rec->length;
+    return true;
+}
+
+std::vector<float> TtfFont::normalize_variation_coords(std::span<const FontVariation> variations) const {
+    std::vector<float> coords(variation_axes_.size(), 0.0f);
+    for (size_t i = 0; i < variation_axes_.size(); ++i) {
+        const auto& ax = variation_axes_[i];
+        float v = ax.default_value;
+        for (const auto& fv : variations) {
+            if (fv.tag == ax.tag) {
+                v = fv.value;
+                break;
+            }
+        }
+        v = std::clamp(v, ax.min_value, ax.max_value);
+        float norm = 0.0f;
+        if (v < ax.default_value && ax.default_value > ax.min_value) {
+            norm = (v - ax.default_value) / (ax.default_value - ax.min_value);
+        } else if (v > ax.default_value && ax.max_value > ax.default_value) {
+            norm = (v - ax.default_value) / (ax.max_value - ax.default_value);
+        }
+        norm = std::clamp(norm, -1.0f, 1.0f);
+
+        if (i < avar_maps_.size() && avar_maps_[i].pairs.size() >= 2) {
+            const auto& pairs = avar_maps_[i].pairs;
+            if (norm <= pairs.front().first) {
+                norm = pairs.front().second;
+            } else if (norm >= pairs.back().first) {
+                norm = pairs.back().second;
+            } else {
+                for (size_t p = 1; p < pairs.size(); ++p) {
+                    if (norm <= pairs[p].first) {
+                        const float f0 = pairs[p - 1].first;
+                        const float f1 = pairs[p].first;
+                        const float t0 = pairs[p - 1].second;
+                        const float t1 = pairs[p].second;
+                        norm = (f1 > f0) ? (t0 + (t1 - t0) * ((norm - f0) / (f1 - f0))) : t1;
+                        break;
+                    }
+                }
+            }
+        }
+        coords[i] = std::clamp(norm, -1.0f, 1.0f);
+    }
+    return coords;
+}
+
+int16_t TtfFont::compute_hvar_advance_delta(uint16_t glyph_id, std::span<const float> norm_coords) const noexcept {
+    if (hvar_offset_ == 0 || hvar_length_ < 20 || norm_coords.empty()) return 0;
+    const uint8_t* base = data_.data() + hvar_offset_;
+    auto rd_u16 = [](const uint8_t* p) -> uint16_t { return static_cast<uint16_t>((p[0] << 8) | p[1]); };
+    auto rd_i16 = [](const uint8_t* p) -> int16_t { return static_cast<int16_t>((p[0] << 8) | p[1]); };
+    auto rd_u32 = [](const uint8_t* p) -> uint32_t {
+        return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+               (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+    };
+
+    const uint32_t ivs_off = rd_u32(base + 4);
+    const uint32_t adv_map_off = rd_u32(base + 8);
+    if (ivs_off + 8u > hvar_length_) return 0;
+
+    uint32_t outer_idx = 0;
+    uint32_t inner_idx = glyph_id;
+    if (adv_map_off != 0 && adv_map_off + 4u <= hvar_length_) {
+        const uint8_t* mp = base + adv_map_off;
+        const uint8_t fmt = mp[0];
+        const uint8_t entry_fmt = mp[1];
+        const uint32_t inner_bits = static_cast<uint32_t>(entry_fmt & 0x0Fu) + 1u;
+        const uint32_t entry_size = static_cast<uint32_t>((entry_fmt & 0x30u) >> 4u) + 1u;
+        uint32_t map_count = 0;
+        size_t hdr_sz = 4;
+        if (fmt == 0) {
+            map_count = rd_u16(mp + 2);
+            hdr_sz = 4;
+        } else if (fmt == 1 && adv_map_off + 6u <= hvar_length_) {
+            map_count = rd_u32(mp + 2);
+            hdr_sz = 6;
+        }
+        if (map_count > 0) {
+            const uint32_t clamped = std::min<uint32_t>(glyph_id, map_count - 1u);
+            const size_t entry_off = adv_map_off + hdr_sz + static_cast<size_t>(clamped) * entry_size;
+            if (entry_off + entry_size <= hvar_length_) {
+                uint32_t val = 0;
+                for (uint32_t b = 0; b < entry_size; ++b) {
+                    val = (val << 8) | base[entry_off + b];
+                }
+                outer_idx = val >> inner_bits;
+                inner_idx = val & ((1u << inner_bits) - 1u);
+            }
+        }
+    }
+
+    const uint8_t* ivs = base + ivs_off;
+    const size_t ivs_len = hvar_length_ - ivs_off;
+    if (ivs_len < 8 || rd_u16(ivs) != 1) return 0;
+    const uint32_t reg_list_off = rd_u32(ivs + 2);
+    const uint16_t data_count = rd_u16(ivs + 6);
+    if (outer_idx >= data_count || 8u + static_cast<size_t>(outer_idx + 1u) * 4u > ivs_len) return 0;
+    const uint32_t ivd_off = rd_u32(ivs + 8u + static_cast<size_t>(outer_idx) * 4u);
+    if (ivd_off == 0 || ivd_off + 6u > ivs_len || reg_list_off + 4u > ivs_len) return 0;
+
+    const uint8_t* reg_list = ivs + reg_list_off;
+    const uint16_t reg_axis_count = rd_u16(reg_list);
+    const uint16_t region_count = rd_u16(reg_list + 2);
+    const size_t reg_list_len = ivs_len - reg_list_off;
+
+    const uint8_t* ivd = ivs + ivd_off;
+    const size_t ivd_len = ivs_len - ivd_off;
+    const uint16_t item_count = rd_u16(ivd);
+    const uint16_t word_delta_raw = rd_u16(ivd + 2);
+    const uint16_t reg_idx_count = rd_u16(ivd + 4);
+    if (inner_idx >= item_count || 6u + static_cast<size_t>(reg_idx_count) * 2u > ivd_len) return 0;
+
+    const bool long_words = (word_delta_raw & 0x8000u) != 0;
+    const uint16_t word_count = word_delta_raw & 0x7FFFu;
+    if (word_count > reg_idx_count) return 0;
+
+    const size_t row_bytes = long_words
+        ? (static_cast<size_t>(word_count) * 4u + static_cast<size_t>(reg_idx_count - word_count) * 2u)
+        : (static_cast<size_t>(word_count) * 2u + static_cast<size_t>(reg_idx_count - word_count));
+    const size_t delta_base = 6u + static_cast<size_t>(reg_idx_count) * 2u + static_cast<size_t>(inner_idx) * row_bytes;
+    if (delta_base + row_bytes > ivd_len) return 0;
+
+    const uint8_t* row = ivd + delta_base;
+    float total_delta = 0.0f;
+
+    for (uint16_t r = 0; r < reg_idx_count; ++r) {
+        int32_t delta_val = 0;
+        if (long_words) {
+            if (r < word_count) {
+                delta_val = static_cast<int32_t>(rd_u32(row));
+                row += 4;
+            } else {
+                delta_val = rd_i16(row);
+                row += 2;
+            }
+        } else {
+            if (r < word_count) {
+                delta_val = rd_i16(row);
+                row += 2;
+            } else {
+                delta_val = static_cast<int8_t>(*row++);
+            }
+        }
+        if (delta_val == 0) continue;
+
+        const uint16_t reg_idx = rd_u16(ivd + 6u + static_cast<size_t>(r) * 2u);
+        if (reg_idx >= region_count) continue;
+        const size_t reg_off = 4u + static_cast<size_t>(reg_idx) * static_cast<size_t>(reg_axis_count) * 6u;
+        if (reg_off + static_cast<size_t>(reg_axis_count) * 6u > reg_list_len) continue;
+
+        float scalar = 1.0f;
+        for (uint16_t a = 0; a < reg_axis_count; ++a) {
+            const uint8_t* axp = reg_list + reg_off + static_cast<size_t>(a) * 6u;
+            const float start = static_cast<float>(rd_i16(axp)) / 16384.0f;
+            const float peak = static_cast<float>(rd_i16(axp + 2)) / 16384.0f;
+            const float end = static_cast<float>(rd_i16(axp + 4)) / 16384.0f;
+            const float c = (a < norm_coords.size()) ? norm_coords[a] : 0.0f;
+
+            if (start > peak || peak > end || (start < 0.0f && end > 0.0f && peak != 0.0f) || peak == 0.0f) {
+                continue;
+            }
+            if (c < start || c > end) {
+                scalar = 0.0f;
+                break;
+            }
+            if (c == peak) continue;
+            if (c < peak) {
+                scalar *= (c - start) / (peak - start);
+            } else {
+                scalar *= (end - c) / (end - peak);
+            }
+        }
+        total_delta += scalar * static_cast<float>(delta_val);
+    }
+
+    return static_cast<int16_t>(std::lround(total_delta));
+}
+
+float TtfFont::glyph_advance_varied(
+    uint16_t glyph_id,
+    float font_size,
+    std::span<const FontVariation> variations
+) const noexcept {
+    int32_t adv = glyph_advance_units(glyph_id);
+    if (!variations.empty() && !variation_axes_.empty() && hvar_offset_ != 0) {
+        auto norm = normalize_variation_coords(variations);
+        bool any_nonzero = false;
+        for (float c : norm) { if (std::abs(c) > 1e-5f) { any_nonzero = true; break; } }
+        if (any_nonzero) {
+            adv += compute_hvar_advance_delta(glyph_id, norm);
+        }
+    }
+    return static_cast<float>(std::max<int32_t>(0, adv)) * scale_for_size(font_size);
 }
 
 uint16_t TtfFont::lookup_glyph_raw(char32_t codepoint) const noexcept {
@@ -1734,6 +1990,691 @@ bool TtfFont::extract_composite_glyph(const uint8_t* g_data, Path& path, float s
         return true;
     }
     return false;
+}
+
+namespace {
+
+bool decode_gvar_packed_points(
+    const uint8_t*& p,
+    const uint8_t* end,
+    uint16_t total_points,
+    std::vector<uint16_t>& out_points,
+    bool& out_all_points
+) noexcept {
+    out_points.clear();
+    out_all_points = false;
+    if (p >= end) return false;
+    uint16_t count = *p++;
+    if (count == 0) {
+        out_all_points = true;
+        return true;
+    }
+    if (count & 0x80u) {
+        if (p >= end) return false;
+        count = static_cast<uint16_t>(((count & 0x7Fu) << 8) | (*p++));
+    }
+    out_points.reserve(count);
+    uint16_t cur_pt = 0;
+    while (out_points.size() < count && p < end) {
+        const uint8_t ctrl = *p++;
+        const uint16_t run_len = static_cast<uint16_t>((ctrl & 0x7Fu) + 1u);
+        const bool is_u16 = (ctrl & 0x80u) != 0;
+        for (uint16_t i = 0; i < run_len && out_points.size() < count; ++i) {
+            uint16_t delta = 0;
+            if (is_u16) {
+                if (p + 2 > end) return false;
+                delta = static_cast<uint16_t>((p[0] << 8) | p[1]);
+                p += 2;
+            } else {
+                if (p >= end) return false;
+                delta = *p++;
+            }
+            cur_pt = static_cast<uint16_t>(cur_pt + delta);
+            if (cur_pt < total_points) {
+                out_points.push_back(cur_pt);
+            } else {
+                out_points.push_back(0xFFFFu);
+            }
+        }
+    }
+    return true;
+}
+
+bool decode_gvar_packed_deltas(
+    const uint8_t*& p,
+    const uint8_t* end,
+    size_t count,
+    std::vector<int16_t>& out_deltas
+) noexcept {
+    out_deltas.clear();
+    out_deltas.reserve(count);
+    while (out_deltas.size() < count && p < end) {
+        const uint8_t ctrl = *p++;
+        const size_t run_len = static_cast<size_t>(ctrl & 0x3Fu) + 1u;
+        if (ctrl & 0x80u) {
+            for (size_t i = 0; i < run_len && out_deltas.size() < count; ++i) {
+                out_deltas.push_back(0);
+            }
+        } else if (ctrl & 0x40u) {
+            for (size_t i = 0; i < run_len && out_deltas.size() < count; ++i) {
+                if (p + 2 > end) return false;
+                out_deltas.push_back(static_cast<int16_t>((p[0] << 8) | p[1]));
+                p += 2;
+            }
+        } else {
+            for (size_t i = 0; i < run_len && out_deltas.size() < count; ++i) {
+                if (p >= end) return false;
+                out_deltas.push_back(static_cast<int8_t>(*p++));
+            }
+        }
+    }
+    return out_deltas.size() == count;
+}
+
+void iup_contour_axis(
+    const float* orig_coords,
+    const uint8_t* touched,
+    float* deltas,
+    size_t start,
+    size_t end
+) noexcept {
+    std::vector<size_t> t_idx;
+    for (size_t i = start; i <= end; ++i) {
+        if (touched[i]) t_idx.push_back(i);
+    }
+    if (t_idx.empty()) return;
+    if (t_idx.size() == 1) {
+        const float d = deltas[t_idx[0]];
+        for (size_t i = start; i <= end; ++i) {
+            if (!touched[i]) deltas[i] = d;
+        }
+        return;
+    }
+
+    auto interp_range = [&](size_t p1, size_t p2) {
+        const float o1 = orig_coords[p1];
+        const float o2 = orig_coords[p2];
+        const float d1 = deltas[p1];
+        const float d2 = deltas[p2];
+        const float lo_o = std::min(o1, o2);
+        const float hi_o = std::max(o1, o2);
+        const float lo_d = (o1 <= o2) ? d1 : d2;
+        const float hi_d = (o1 <= o2) ? d2 : d1;
+
+        const size_t count = end - start + 1;
+        size_t i = (p1 == end) ? start : (p1 + 1);
+        for (size_t step = 0; step < count && i != p2; ++step) {
+            if (!touched[i]) {
+                const float op = orig_coords[i];
+                if (op <= lo_o) {
+                    deltas[i] = lo_d;
+                } else if (op >= hi_o) {
+                    deltas[i] = hi_d;
+                } else if (hi_o > lo_o) {
+                    deltas[i] = lo_d + (hi_d - lo_d) * ((op - lo_o) / (hi_o - lo_o));
+                } else {
+                    deltas[i] = lo_d;
+                }
+            }
+            i = (i == end) ? start : (i + 1);
+        }
+    };
+
+    for (size_t k = 0; k + 1 < t_idx.size(); ++k) {
+        interp_range(t_idx[k], t_idx[k + 1]);
+    }
+    interp_range(t_idx.back(), t_idx.front());
+}
+
+} // namespace
+
+bool TtfFont::extract_simple_glyph_varied(
+    uint16_t glyph_id,
+    const uint8_t* g_data,
+    Path& path,
+    float scale,
+    std::span<const float> norm_coords
+) const {
+    if (gvar_offset_ == 0 || glyph_id >= gvar_glyph_count_ || norm_coords.empty()) {
+        return extract_simple_glyph(g_data, path, scale);
+    }
+
+    int16_t num_contours = static_cast<int16_t>((g_data[0] << 8) | g_data[1]);
+    if (num_contours <= 0) {
+        path.reset();
+        return true;
+    }
+
+    const uint8_t* end_pts_data = g_data + 10;
+    uint16_t last_end_idx = static_cast<uint16_t>((end_pts_data[(num_contours - 1) * 2] << 8) |
+                                                   end_pts_data[(num_contours - 1) * 2 + 1]);
+    uint16_t num_points = last_end_idx + 1;
+    if (num_points == 0) {
+        path.reset();
+        return true;
+    }
+
+    const uint8_t* p = end_pts_data + (static_cast<size_t>(num_contours) * 2);
+    uint16_t instruction_len = static_cast<uint16_t>((p[0] << 8) | p[1]);
+    p += 2 + instruction_len;
+
+    std::vector<uint8_t> flags(num_points);
+    for (uint16_t i = 0; i < num_points; ++i) {
+        uint8_t f = *p++;
+        flags[i] = f;
+        if (f & 0x08u) {
+            uint8_t count = *p++;
+            while (count-- > 0 && (i + 1) < num_points) {
+                flags[++i] = f;
+            }
+        }
+    }
+
+    const uint16_t total_points = static_cast<uint16_t>(num_points + 4u);
+    std::vector<float> orig_x(total_points, 0.0f);
+    std::vector<float> orig_y(total_points, 0.0f);
+    std::vector<uint8_t> on_curve(num_points, 0);
+
+    int16_t cur_x = 0;
+    for (uint16_t i = 0; i < num_points; ++i) {
+        uint8_t f = flags[i];
+        on_curve[i] = (f & 0x01u) ? 1u : 0u;
+        if (f & 0x02u) {
+            uint8_t b = *p++;
+            cur_x += (f & 0x10u) ? static_cast<int16_t>(b) : -static_cast<int16_t>(b);
+        } else if (!(f & 0x10u)) {
+            cur_x += static_cast<int16_t>((p[0] << 8) | p[1]);
+            p += 2;
+        }
+        orig_x[i] = static_cast<float>(cur_x);
+    }
+
+    int16_t cur_y = 0;
+    for (uint16_t i = 0; i < num_points; ++i) {
+        uint8_t f = flags[i];
+        if (f & 0x04u) {
+            uint8_t b = *p++;
+            cur_y += (f & 0x20u) ? static_cast<int16_t>(b) : -static_cast<int16_t>(b);
+        } else if (!(f & 0x20u)) {
+            cur_y += static_cast<int16_t>((p[0] << 8) | p[1]);
+            p += 2;
+        }
+        orig_y[i] = static_cast<float>(cur_y);
+    }
+
+    // Populate phantom points for horizontal metrics
+    int16_t adv_u = 0, lsb_u = 0;
+    get_glyph_metrics(glyph_id, &adv_u, &lsb_u);
+    int16_t xMin = static_cast<int16_t>((g_data[2] << 8) | g_data[3]);
+    orig_x[num_points + 0] = static_cast<float>(xMin - lsb_u);
+    orig_x[num_points + 1] = orig_x[num_points + 0] + static_cast<float>(adv_u);
+
+    // Apply 'gvar' tuple variations
+    const uint8_t* gvar_base = data_.data() + gvar_offset_;
+    auto rd_u16 = [](const uint8_t* q) -> uint16_t { return static_cast<uint16_t>((q[0] << 8) | q[1]); };
+    auto rd_i16 = [](const uint8_t* q) -> int16_t { return static_cast<int16_t>((q[0] << 8) | q[1]); };
+    auto rd_u32 = [](const uint8_t* q) -> uint32_t {
+        return (static_cast<uint32_t>(q[0]) << 24) | (static_cast<uint32_t>(q[1]) << 16) |
+               (static_cast<uint32_t>(q[2]) << 8) | static_cast<uint32_t>(q[3]);
+    };
+
+    uint32_t off_start = 0, off_end = 0;
+    const bool long_offsets = (gvar_flags_ & 0x0001u) != 0;
+    const size_t offsets_pos = 20u;
+    if (long_offsets) {
+        if (offsets_pos + static_cast<size_t>(glyph_id + 2u) * 4u <= gvar_length_) {
+            off_start = rd_u32(gvar_base + offsets_pos + static_cast<size_t>(glyph_id) * 4u);
+            off_end = rd_u32(gvar_base + offsets_pos + static_cast<size_t>(glyph_id + 1u) * 4u);
+        }
+    } else {
+        if (offsets_pos + static_cast<size_t>(glyph_id + 2u) * 2u <= gvar_length_) {
+            off_start = static_cast<uint32_t>(rd_u16(gvar_base + offsets_pos + static_cast<size_t>(glyph_id) * 2u)) * 2u;
+            off_end = static_cast<uint32_t>(rd_u16(gvar_base + offsets_pos + static_cast<size_t>(glyph_id + 1u) * 2u)) * 2u;
+        }
+    }
+
+    std::vector<float> accum_dx(total_points, 0.0f);
+    std::vector<float> accum_dy(total_points, 0.0f);
+
+    if (off_end > off_start && static_cast<size_t>(gvar_data_array_offset_) + off_end <= gvar_length_) {
+        const uint8_t* gd = gvar_base + gvar_data_array_offset_ + off_start;
+        const size_t gd_len = off_end - off_start;
+        if (gd_len >= 4) {
+            const uint16_t tv_raw = rd_u16(gd);
+            const uint16_t tv_count = tv_raw & 0x0FFFu;
+            const bool has_shared_pts = (tv_raw & 0x8000u) != 0;
+            const uint16_t data_off = rd_u16(gd + 2);
+
+            if (data_off <= gd_len) {
+                const uint8_t* ser_ptr = gd + data_off;
+                const uint8_t* gd_end = gd + gd_len;
+
+                std::vector<uint16_t> shared_pts;
+                bool shared_all = true;
+                if (has_shared_pts) {
+                    decode_gvar_packed_points(ser_ptr, gd_end, total_points, shared_pts, shared_all);
+                }
+
+                const uint8_t* hdr_ptr = gd + 4;
+                const uint8_t* hdr_limit = gd + data_off;
+
+                std::vector<float> peak(gvar_axis_count_);
+                std::vector<float> reg_start(gvar_axis_count_);
+                std::vector<float> reg_end(gvar_axis_count_);
+                std::vector<uint16_t> priv_pts;
+                std::vector<int16_t> dx_raw, dy_raw;
+                std::vector<float> tuple_dx(total_points);
+                std::vector<float> tuple_dy(total_points);
+                std::vector<uint8_t> touched(total_points);
+
+                for (uint16_t t = 0; t < tv_count && hdr_ptr + 4 <= hdr_limit; ++t) {
+                    const uint16_t var_data_size = rd_u16(hdr_ptr);
+                    const uint16_t tuple_index = rd_u16(hdr_ptr + 2);
+                    hdr_ptr += 4;
+
+                    const bool embedded_peak = (tuple_index & 0x8000u) != 0;
+                    const bool intermediate = (tuple_index & 0x4000u) != 0;
+                    const bool private_pts = (tuple_index & 0x2000u) != 0;
+
+                    if (embedded_peak) {
+                        if (hdr_ptr + static_cast<size_t>(gvar_axis_count_) * 2u > hdr_limit) break;
+                        for (uint16_t a = 0; a < gvar_axis_count_; ++a) {
+                            peak[a] = static_cast<float>(rd_i16(hdr_ptr)) / 16384.0f;
+                            hdr_ptr += 2;
+                        }
+                    } else {
+                        const uint16_t st_idx = tuple_index & 0x0FFFu;
+                        const size_t st_off = static_cast<size_t>(gvar_shared_tuples_offset_) +
+                                              static_cast<size_t>(st_idx) * static_cast<size_t>(gvar_axis_count_) * 2u;
+                        if (st_idx >= gvar_shared_tuple_count_ || st_off + static_cast<size_t>(gvar_axis_count_) * 2u > gvar_length_) {
+                            ser_ptr = std::min(gd_end, ser_ptr + var_data_size);
+                            continue;
+                        }
+                        for (uint16_t a = 0; a < gvar_axis_count_; ++a) {
+                            peak[a] = static_cast<float>(rd_i16(gvar_base + st_off + static_cast<size_t>(a) * 2u)) / 16384.0f;
+                        }
+                    }
+
+                    if (intermediate) {
+                        if (hdr_ptr + static_cast<size_t>(gvar_axis_count_) * 4u > hdr_limit) break;
+                        for (uint16_t a = 0; a < gvar_axis_count_; ++a) {
+                            reg_start[a] = static_cast<float>(rd_i16(hdr_ptr)) / 16384.0f;
+                            hdr_ptr += 2;
+                        }
+                        for (uint16_t a = 0; a < gvar_axis_count_; ++a) {
+                            reg_end[a] = static_cast<float>(rd_i16(hdr_ptr)) / 16384.0f;
+                            hdr_ptr += 2;
+                        }
+                    }
+
+                    const uint8_t* tuple_data_start = ser_ptr;
+                    const uint8_t* tuple_data_end = std::min(gd_end, ser_ptr + var_data_size);
+                    ser_ptr = tuple_data_end;
+
+                    float scalar = 1.0f;
+                    for (uint16_t a = 0; a < gvar_axis_count_; ++a) {
+                        const float pk = peak[a];
+                        if (pk == 0.0f) continue;
+                        const float c = (a < norm_coords.size()) ? norm_coords[a] : 0.0f;
+                        if (c == pk) continue;
+                        if (!intermediate) {
+                            if ((pk > 0.0f && (c <= 0.0f || c > pk)) || (pk < 0.0f && (c >= 0.0f || c < pk))) {
+                                scalar = 0.0f;
+                                break;
+                            }
+                            scalar *= (c / pk);
+                        } else {
+                            const float st = reg_start[a];
+                            const float en = reg_end[a];
+                            if (st > pk || pk > en || (st < 0.0f && en > 0.0f && pk != 0.0f)) continue;
+                            if (c < st || c > en) {
+                                scalar = 0.0f;
+                                break;
+                            }
+                            if (c < pk) scalar *= (c - st) / (pk - st);
+                            else scalar *= (en - c) / (en - pk);
+                        }
+                    }
+
+                    if (std::abs(scalar) < 1e-6f) continue;
+
+                    const uint8_t* tp = tuple_data_start;
+                    bool use_all = shared_all;
+                    const std::vector<uint16_t>* pts_vec = &shared_pts;
+                    if (private_pts) {
+                        if (!decode_gvar_packed_points(tp, tuple_data_end, total_points, priv_pts, use_all)) continue;
+                        pts_vec = &priv_pts;
+                    }
+
+                    const size_t delta_count = use_all ? total_points : pts_vec->size();
+                    if (!decode_gvar_packed_deltas(tp, tuple_data_end, delta_count, dx_raw)) continue;
+                    if (!decode_gvar_packed_deltas(tp, tuple_data_end, delta_count, dy_raw)) continue;
+
+                    if (use_all) {
+                        for (size_t i = 0; i < total_points; ++i) {
+                            accum_dx[i] += scalar * static_cast<float>(dx_raw[i]);
+                            accum_dy[i] += scalar * static_cast<float>(dy_raw[i]);
+                        }
+                    } else {
+                        std::fill(tuple_dx.begin(), tuple_dx.end(), 0.0f);
+                        std::fill(tuple_dy.begin(), tuple_dy.end(), 0.0f);
+                        std::fill(touched.begin(), touched.end(), 0u);
+                        for (size_t i = 0; i < pts_vec->size(); ++i) {
+                            const uint16_t pt = (*pts_vec)[i];
+                            if (pt < total_points) {
+                                tuple_dx[pt] = static_cast<float>(dx_raw[i]);
+                                tuple_dy[pt] = static_cast<float>(dy_raw[i]);
+                                touched[pt] = 1u;
+                            }
+                        }
+                        // Apply TrueType IUP per contour for untouched outline points
+                        uint16_t c_start = 0;
+                        for (int16_t c = 0; c < num_contours; ++c) {
+                            uint16_t c_end = rd_u16(end_pts_data + static_cast<size_t>(c) * 2u);
+                            if (c_end >= c_start && c_end < num_points) {
+                                iup_contour_axis(orig_x.data(), touched.data(), tuple_dx.data(), c_start, c_end);
+                                iup_contour_axis(orig_y.data(), touched.data(), tuple_dy.data(), c_start, c_end);
+                                c_start = static_cast<uint16_t>(c_end + 1u);
+                            }
+                        }
+                        for (size_t i = 0; i < total_points; ++i) {
+                            accum_dx[i] += scalar * tuple_dx[i];
+                            accum_dy[i] += scalar * tuple_dy[i];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build scaled Path from varied coordinates (with Y flipped for screen space)
+    struct RawPt { float x; float y; bool on_curve; };
+    std::vector<RawPt> points(num_points);
+    for (uint16_t i = 0; i < num_points; ++i) {
+        points[i] = RawPt{
+            (orig_x[i] + accum_dx[i]) * scale,
+            -(orig_y[i] + accum_dy[i]) * scale,
+            on_curve[i] != 0
+        };
+    }
+
+    size_t max_verbs = static_cast<size_t>(num_points) + static_cast<size_t>(num_contours) * 2;
+    size_t max_points = static_cast<size_t>(num_points) * 2 + static_cast<size_t>(num_contours);
+    path.verbs_.resize(max_verbs);
+    path.points_.resize(max_points);
+    PathVerb* v_ptr = path.verbs_.data();
+    Point* pt_ptr = path.points_.data();
+
+    uint16_t start_idx = 0;
+    for (int16_t c = 0; c < num_contours; ++c) {
+        uint16_t end_idx = static_cast<uint16_t>((end_pts_data[c * 2] << 8) | end_pts_data[c * 2 + 1]);
+        if (end_idx < start_idx || end_idx >= num_points) break;
+        size_t count = end_idx - start_idx + 1;
+        if (count < 2) { start_idx = end_idx + 1; continue; }
+
+        const RawPt* c_pts = &points[start_idx];
+        float start_x = 0.0f, start_y = 0.0f;
+        size_t curr_idx = 0;
+        if (c_pts[0].on_curve) {
+            start_x = c_pts[0].x; start_y = c_pts[0].y; curr_idx = 1;
+        } else if (c_pts[count - 1].on_curve) {
+            start_x = c_pts[count - 1].x; start_y = c_pts[count - 1].y; curr_idx = 0;
+        } else {
+            start_x = (c_pts[0].x + c_pts[count - 1].x) * 0.5f;
+            start_y = (c_pts[0].y + c_pts[count - 1].y) * 0.5f;
+            curr_idx = 0;
+        }
+
+        *v_ptr++ = PathVerb::Move;
+        *pt_ptr++ = Point(start_x, start_y);
+
+        float cx = 0.0f, cy = 0.0f;
+        bool has_control = false;
+        auto process_pt = [&](const RawPt& pt) {
+            if (pt.on_curve) {
+                if (has_control) {
+                    *v_ptr++ = PathVerb::Quad;
+                    *pt_ptr++ = Point(cx, cy);
+                    *pt_ptr++ = Point(pt.x, pt.y);
+                    has_control = false;
+                } else {
+                    *v_ptr++ = PathVerb::Line;
+                    *pt_ptr++ = Point(pt.x, pt.y);
+                }
+            } else {
+                if (has_control) {
+                    *v_ptr++ = PathVerb::Quad;
+                    *pt_ptr++ = Point(cx, cy);
+                    *pt_ptr++ = Point((cx + pt.x) * 0.5f, (cy + pt.y) * 0.5f);
+                }
+                cx = pt.x; cy = pt.y; has_control = true;
+            }
+        };
+
+        if (curr_idx == 0) {
+            for (size_t i = 0; i < count; ++i) process_pt(c_pts[i]);
+        } else {
+            for (size_t i = 1; i < count; ++i) process_pt(c_pts[i]);
+            process_pt(c_pts[0]);
+        }
+        if (has_control) {
+            *v_ptr++ = PathVerb::Quad;
+            *pt_ptr++ = Point(cx, cy);
+            *pt_ptr++ = Point(start_x, start_y);
+        }
+        *v_ptr++ = PathVerb::Close;
+        start_idx = end_idx + 1;
+    }
+
+    path.verbs_.resize(static_cast<size_t>(v_ptr - path.verbs_.data()));
+    path.points_.resize(static_cast<size_t>(pt_ptr - path.points_.data()));
+    if (auto b = Rect::from_points(path.points_.data(), path.points_.size())) {
+        path.bounds_ = *b;
+    }
+    return true;
+}
+
+bool TtfFont::extract_composite_glyph_varied(
+    uint16_t /*glyph_id*/,
+    const uint8_t* g_data,
+    Path& path,
+    float scale,
+    std::span<const float> norm_coords,
+    int recursion_depth
+) const {
+    if (recursion_depth > 16) return false;
+    const uint8_t* p = g_data + 10;
+
+    constexpr uint16_t ARG_1_AND_2_ARE_WORDS = 0x0001;
+    constexpr uint16_t ARGS_ARE_XY_VALUES = 0x0002;
+    constexpr uint16_t WE_HAVE_A_SCALE = 0x0008;
+    constexpr uint16_t MORE_COMPONENTS = 0x0020;
+    constexpr uint16_t WE_HAVE_AN_X_AND_Y_SCALE = 0x0040;
+    constexpr uint16_t WE_HAVE_A_TWO_BY_TWO = 0x0080;
+
+    PathBuilder combined_builder;
+    const float comp_font_size = scale * static_cast<float>(units_per_em_);
+
+    uint16_t flags = 0;
+    do {
+        flags = static_cast<uint16_t>((p[0] << 8) | p[1]);
+        uint16_t comp_glyph_id = static_cast<uint16_t>((p[2] << 8) | p[3]);
+        p += 4;
+
+        float dx = 0.0f, dy = 0.0f;
+        if (flags & ARG_1_AND_2_ARE_WORDS) {
+            int16_t a1 = static_cast<int16_t>((p[0] << 8) | p[1]);
+            int16_t a2 = static_cast<int16_t>((p[2] << 8) | p[3]);
+            p += 4;
+            if (flags & ARGS_ARE_XY_VALUES) {
+                dx = static_cast<float>(a1) * scale;
+                dy = -static_cast<float>(a2) * scale;
+            }
+        } else {
+            int8_t a1 = static_cast<int8_t>(*p++);
+            int8_t a2 = static_cast<int8_t>(*p++);
+            if (flags & ARGS_ARE_XY_VALUES) {
+                dx = static_cast<float>(a1) * scale;
+                dy = -static_cast<float>(a2) * scale;
+            }
+        }
+
+        auto read_f2dot14 = [&p]() -> float {
+            int16_t val = static_cast<int16_t>((p[0] << 8) | p[1]);
+            p += 2;
+            return static_cast<float>(val) / 16384.0f;
+        };
+
+        float a = 1.0f, b = 0.0f, c = 0.0f, d = 1.0f;
+        if (flags & WE_HAVE_A_SCALE) {
+            a = d = read_f2dot14();
+        } else if (flags & WE_HAVE_AN_X_AND_Y_SCALE) {
+            a = read_f2dot14(); d = read_f2dot14();
+        } else if (flags & WE_HAVE_A_TWO_BY_TWO) {
+            a = read_f2dot14(); b = read_f2dot14(); c = read_f2dot14(); d = read_f2dot14();
+        }
+
+        // Extract component glyph using the same normalized variation coordinates
+        Path comp_path;
+        bool ok = false;
+        if (comp_glyph_id < num_glyphs_ && loca_table_ && glyf_table_) {
+            uint32_t goff = 0, gnext = 0;
+            if (index_to_loc_format_ == 0) {
+                const uint8_t* lp = loca_table_ + static_cast<size_t>(comp_glyph_id) * 2u;
+                goff = static_cast<uint32_t>((lp[0] << 8) | lp[1]) * 2u;
+                gnext = static_cast<uint32_t>((lp[2] << 8) | lp[3]) * 2u;
+            } else {
+                const uint8_t* lp = loca_table_ + static_cast<size_t>(comp_glyph_id) * 4u;
+                goff = (static_cast<uint32_t>(lp[0]) << 24) | (static_cast<uint32_t>(lp[1]) << 16) |
+                       (static_cast<uint32_t>(lp[2]) << 8) | lp[3];
+                gnext = (static_cast<uint32_t>(lp[4]) << 24) | (static_cast<uint32_t>(lp[5]) << 16) |
+                        (static_cast<uint32_t>(lp[6]) << 8) | lp[7];
+            }
+            if (goff < gnext && glyf_offset_ + gnext <= data_.size()) {
+                const uint8_t* cg = glyf_table_ + goff;
+                int16_t nc = static_cast<int16_t>((cg[0] << 8) | cg[1]);
+                if (nc >= 0) {
+                    ok = extract_simple_glyph_varied(comp_glyph_id, cg, comp_path, scale, norm_coords);
+                } else {
+                    ok = extract_composite_glyph_varied(comp_glyph_id, cg, comp_path, scale, norm_coords, recursion_depth + 1);
+                }
+            }
+        }
+        if (!ok) {
+            ok = get_glyph_path(comp_glyph_id, comp_path, comp_font_size);
+        }
+
+        if (ok) {
+            auto transform_pt = [&](Point pt) -> Point {
+                return Point::from_xy(a * pt.x + c * pt.y + dx, b * pt.x + d * pt.y + dy);
+            };
+            auto iter = comp_path.segments();
+            while (auto seg_opt = iter.next()) {
+                const auto& seg = *seg_opt;
+                switch (seg.type) {
+                    case PathSegment::Type::MoveTo: { Point p0 = transform_pt(seg.p0); combined_builder.move_to(p0.x, p0.y); break; }
+                    case PathSegment::Type::LineTo: { Point p0 = transform_pt(seg.p0); combined_builder.line_to(p0.x, p0.y); break; }
+                    case PathSegment::Type::QuadTo: {
+                        Point p0 = transform_pt(seg.p0); Point p1 = transform_pt(seg.p1);
+                        combined_builder.quad_to(p0.x, p0.y, p1.x, p1.y); break;
+                    }
+                    case PathSegment::Type::CubicTo: {
+                        Point p0 = transform_pt(seg.p0); Point p1 = transform_pt(seg.p1); Point p2 = transform_pt(seg.p2);
+                        combined_builder.cubic_to(p0.x, p0.y, p1.x, p1.y, p2.x, p2.y); break;
+                    }
+                    case PathSegment::Type::Close: combined_builder.close(); break;
+                }
+            }
+        }
+    } while (flags & MORE_COMPONENTS);
+
+    if (auto fin = combined_builder.finish()) {
+        path = std::move(*fin);
+        return true;
+    }
+    return false;
+}
+
+bool TtfFont::get_glyph_path_varied(
+    uint16_t glyph_id,
+    Path& out_path,
+    float font_size,
+    std::span<const FontVariation> variations,
+    bool synthetic_bold,
+    bool synthetic_italic
+) const {
+    if (variations.empty() || variation_axes_.empty() || gvar_offset_ == 0 || is_cff_) {
+        return get_glyph_path_styled(glyph_id, out_path, font_size, synthetic_bold, synthetic_italic);
+    }
+
+    auto norm_coords = normalize_variation_coords(variations);
+    bool any_nonzero = false;
+    for (float c : norm_coords) {
+        if (std::abs(c) > 1e-5f) { any_nonzero = true; break; }
+    }
+    if (!any_nonzero) {
+        return get_glyph_path_styled(glyph_id, out_path, font_size, synthetic_bold, synthetic_italic);
+    }
+
+    if (!is_valid_ || glyph_id >= num_glyphs_ || !loca_table_ || !glyf_table_) {
+        return false;
+    }
+
+    uint32_t goff = 0, gnext = 0;
+    if (index_to_loc_format_ == 0) {
+        const uint8_t* lp = loca_table_ + static_cast<size_t>(glyph_id) * 2u;
+        goff = static_cast<uint32_t>((lp[0] << 8) | lp[1]) * 2u;
+        gnext = static_cast<uint32_t>((lp[2] << 8) | lp[3]) * 2u;
+    } else {
+        const uint8_t* lp = loca_table_ + static_cast<size_t>(glyph_id) * 4u;
+        goff = (static_cast<uint32_t>(lp[0]) << 24) | (static_cast<uint32_t>(lp[1]) << 16) |
+               (static_cast<uint32_t>(lp[2]) << 8) | lp[3];
+        gnext = (static_cast<uint32_t>(lp[4]) << 24) | (static_cast<uint32_t>(lp[5]) << 16) |
+                (static_cast<uint32_t>(lp[6]) << 8) | lp[7];
+    }
+
+    if (goff >= gnext || glyf_offset_ + gnext > data_.size()) {
+        out_path.reset();
+        return true;
+    }
+
+    const float scale = scale_for_size(font_size);
+    const uint8_t* g_data = glyf_table_ + goff;
+    int16_t num_contours = static_cast<int16_t>((g_data[0] << 8) | g_data[1]);
+    bool ok = (num_contours >= 0)
+        ? extract_simple_glyph_varied(glyph_id, g_data, out_path, scale, norm_coords)
+        : extract_composite_glyph_varied(glyph_id, g_data, out_path, scale, norm_coords, 0);
+
+    if (!ok || out_path.is_empty()) return ok;
+
+    if (synthetic_italic) {
+        Transform skew = Transform::from_row(1.0f, 0.0f, -0.21255656f, 1.0f, 0.0f, 0.0f);
+        out_path.apply_transform(skew);
+    }
+    if (synthetic_bold) {
+        float bold_offset = std::max(0.45f, font_size * 0.032f);
+        Path shifted = out_path;
+        shifted.apply_transform(Transform::from_translate(bold_offset, 0.0f));
+        PathBuilder combined;
+        auto append_path = [&](const Path& p) {
+            auto iter = p.segments();
+            while (auto seg = iter.next()) {
+                switch (seg->type) {
+                    case PathSegment::Type::MoveTo: combined.move_to(seg->p0.x, seg->p0.y); break;
+                    case PathSegment::Type::LineTo: combined.line_to(seg->p0.x, seg->p0.y); break;
+                    case PathSegment::Type::QuadTo: combined.quad_to(seg->p0.x, seg->p0.y, seg->p1.x, seg->p1.y); break;
+                    case PathSegment::Type::CubicTo: combined.cubic_to(seg->p0.x, seg->p0.y, seg->p1.x, seg->p1.y, seg->p2.x, seg->p2.y); break;
+                    case PathSegment::Type::Close: combined.close(); break;
+                }
+            }
+        };
+        append_path(out_path);
+        append_path(shifted);
+        if (auto fin = combined.finish()) {
+            out_path = std::move(*fin);
+        }
+    }
+    return true;
 }
 
 } // namespace nisaba::text

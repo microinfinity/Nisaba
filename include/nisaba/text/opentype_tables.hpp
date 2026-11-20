@@ -6,6 +6,7 @@
 #include <memory>
 #include <string_view>
 #include <optional>
+#include "nisaba/text/attrs.hpp"
 
 namespace nisaba::text {
 
@@ -77,11 +78,29 @@ public:
     /// on a sequence of glyph IDs in-place.
     bool apply_features(std::vector<uint16_t>& glyphs, std::span<const uint32_t> feature_tags) const;
 
+    /// Applies OpenType features with explicit integer values (0=off, >=1=on/alternate)
+    /// filtered by OpenType ScriptList / LangSys (script_tag e.g. 'latn'/'arab', lang_tag e.g. 'ROM '/'URD ').
+    bool apply_features_for_script(
+        std::vector<uint16_t>& glyphs,
+        std::span<const FontFeature> features,
+        uint32_t script_tag = 0,
+        uint32_t lang_tag = 0
+    ) const;
+
+    /// Maps a BCP-47 locale tag (e.g. "ar", "ur", "ro", "ja", "zh-Hant") to an OpenType 4-byte LangSys tag (or 0).
+    static uint32_t bcp47_to_ot_lang_tag(std::string_view bcp47_locale) noexcept;
+
     /// Convenience wrapper applying standard ligature features ('rlig', 'calt', 'liga', 'clig').
     bool apply_ligatures(std::vector<uint16_t>& glyphs) const;
 
     /// Applies a single substitution feature on a single glyph ID if covered.
-    uint16_t apply_single_glyph_feature(uint16_t glyph_id, uint32_t feature_tag) const noexcept;
+    uint16_t apply_single_glyph_feature(
+        uint16_t glyph_id,
+        uint32_t feature_tag,
+        uint32_t script_tag = 0,
+        uint32_t lang_tag = 0,
+        uint32_t feature_value = 1
+    ) const noexcept;
 
 private:
     struct Impl;

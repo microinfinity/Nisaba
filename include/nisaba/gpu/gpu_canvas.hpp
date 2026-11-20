@@ -44,6 +44,7 @@ public:
 
     // Surface operations
     void clear(nisaba::Color color = nisaba::Color::TRANSPARENT);
+    bool resize(uint32_t width, uint32_t height);
 
     // State stack
     void save() override;

@@ -47,6 +47,7 @@ public:
 
     [[nodiscard]] uint32_t width() const noexcept { return width_; }
     [[nodiscard]] uint32_t height() const noexcept { return height_; }
+    bool resize_screen(uint32_t width, uint32_t height) noexcept;
     [[nodiscard]] uint32_t fbo_id() const noexcept { return fbo_id_; }
     [[nodiscard]] uint32_t resolve_fbo() const noexcept { return resolve_fbo_; }
     [[nodiscard]] uint32_t samples() const noexcept { return samples_; }

@@ -2466,6 +2466,512 @@ static void test_gpu_p3_svg_lottie_3d_parity() {
     std::cout << "  -> P3.11 draw_pixmap_3d, SvgDocument::render_gpu & 3D Lottie Parity OK" << std::endl;
 }
 
+static void test_gpu_phase1_ellipsis_and_direction_parity() {
+    std::cout << "[Test 27/27] Phase 1 Custom Ellipsis & Explicit TextDirection CPU-vs-GPU Parity..." << std::endl;
+
+    text::FontSystem font_system;
+    font_system.set_auto_system_fonts(false);
+    auto fid_noto = font_system.load_font_file(resolve_test_font("NotoSans-Regular.ttf"));
+    auto fid_arabic = font_system.load_font_file(resolve_test_font("NotoSansArabic.ttf"));
+    assert(fid_noto.has_value() && fid_arabic.has_value());
+    font_system.set_default_font(*fid_noto);
+
+    auto device = GpuDevice::create();
+    constexpr uint32_t W = 380;
+    constexpr uint32_t H = 72;
+
+    auto verify_cpu_gpu_text_parity = [&](const char* label, text::Buffer& buf, float ox, float oy,
+                                          bool expect_right_half, bool expect_left_half) {
+        buf.shape_until_scroll(font_system);
+        auto lm = buf.line_metrics();
+        assert(!lm.empty());
+
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(Color::BLACK);
+        {
+            Canvas cpu_canvas(cpu_pm->as_mut());
+            text::GlyphCache cpu_cache(256);
+            buf.draw(cpu_canvas, cpu_cache, font_system, Color::WHITE, ox, oy);
+        }
+
+        auto surface = GpuSurface::create(device, W, H);
+        assert(surface != nullptr);
+        GpuCanvas gpu_canvas(surface);
+        gpu_canvas.clear(Color::BLACK);
+        gpu_canvas.draw_text_buffer(buf, font_system, Point(ox, oy), Color::WHITE);
+        gpu_canvas.flush();
+        auto gpu_pm = surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        const auto cpu_r = cpu_pm->as_ref();
+        const auto gpu_r = gpu_pm->as_ref();
+
+        uint32_t cpu_x0 = W, cpu_x1 = 0, cpu_y0 = H, cpu_y1 = 0;
+        uint32_t gpu_x0 = W, gpu_x1 = 0, gpu_y0 = H, gpu_y1 = 0;
+        size_t cpu_lit = 0, gpu_lit = 0;
+        double sum_abs_diff = 0.0;
+
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cpu_r.pixel(x, y);
+                auto gp = gpu_r.pixel(x, y);
+                assert(cp && gp);
+                if (cp->r > 40 || cp->g > 40 || cp->b > 40) {
+                    ++cpu_lit;
+                    cpu_x0 = std::min(cpu_x0, x);
+                    cpu_x1 = std::max(cpu_x1, x);
+                    cpu_y0 = std::min(cpu_y0, y);
+                    cpu_y1 = std::max(cpu_y1, y);
+                }
+                if (gp->r > 40 || gp->g > 40 || gp->b > 40) {
+                    ++gpu_lit;
+                    gpu_x0 = std::min(gpu_x0, x);
+                    gpu_x1 = std::max(gpu_x1, x);
+                    gpu_y0 = std::min(gpu_y0, y);
+                    gpu_y1 = std::max(gpu_y1, y);
+                }
+                sum_abs_diff += std::abs(int(cp->r) - int(gp->r))
+                              + std::abs(int(cp->g) - int(gp->g))
+                              + std::abs(int(cp->b) - int(gp->b));
+            }
+        }
+
+        const double mae = sum_abs_diff / (double(W) * double(H) * 3.0);
+        if (cpu_lit < 40 || gpu_lit < 40 ||
+            std::abs(int(cpu_x0) - int(gpu_x0)) > 2 ||
+            std::abs(int(cpu_x1) - int(gpu_x1)) > 2 ||
+            std::abs(int(cpu_y0) - int(gpu_y0)) > 2 ||
+            std::abs(int(cpu_y1) - int(gpu_y1)) > 2 ||
+            mae > 3.5) {
+            std::cerr << "  [FAIL] " << label
+                      << " cpu_lit=" << cpu_lit << " gpu_lit=" << gpu_lit
+                      << " cpu_box=(" << cpu_x0 << "," << cpu_y0 << ")-(" << cpu_x1 << "," << cpu_y1 << ")"
+                      << " gpu_box=(" << gpu_x0 << "," << gpu_y0 << ")-(" << gpu_x1 << "," << gpu_y1 << ")"
+                      << " mae=" << mae << std::endl;
+            assert(false);
+        }
+        if (expect_right_half) {
+            assert(cpu_x0 > W / 3 && gpu_x0 > W / 3);
+        }
+        if (expect_left_half) {
+            assert(cpu_x0 < W / 4 && gpu_x0 < W / 4);
+        }
+    };
+
+    // 1. Custom Latin ellipsis ("... more")
+    {
+        text::Buffer b(text::Metrics(20.0f, 28.0f));
+        b.set_size(220.0f, std::nullopt);
+        b.set_wrap(text::Wrap::Word);
+        b.set_overflow(text::Overflow::Ellipsis);
+        b.set_max_lines(1);
+        b.set_ellipsis("... more");
+        b.set_text("Nisaba sovereign text engine with custom truncation label");
+        verify_cpu_gpu_text_parity("Custom Latin Ellipsis", b, 16.0f, 16.0f, false, true);
+        assert(b.did_exceed_max_lines());
+        assert(b.unresolved_glyphs() == 0);
+    }
+
+    // 2. Custom Arabic RTL ellipsis ("… المزيد")
+    {
+        text::Buffer b(text::Metrics(20.0f, 32.0f));
+        b.set_size(240.0f, std::nullopt);
+        b.set_wrap(text::Wrap::Word);
+        b.set_align(text::Align::Start);
+        b.set_overflow(text::Overflow::Ellipsis);
+        b.set_max_lines(1);
+        b.set_ellipsis("\xE2\x80\xA6 \xD8\xA7\xD9\x84\xD9\x85\xD8\xB2\xD9\x8A\xD8\xAF");
+        b.set_text("مرحبا بكم في محرك نيسابا المتكامل للنصوص العربية والطباعة المتقدمة");
+        verify_cpu_gpu_text_parity("Custom Arabic RTL Ellipsis", b, 20.0f, 16.0f, false, false);
+        assert(b.did_exceed_max_lines());
+        assert(b.unresolved_glyphs() == 0);
+    }
+
+    // 3. Explicit TextDirection::RTL on mixed BiDi with Align::Start (aligns right)
+    {
+        text::Buffer b(text::Metrics(20.0f, 30.0f));
+        b.set_size(340.0f, std::nullopt);
+        b.set_align(text::Align::Start);
+        b.set_text_direction(text::TextDirection::RTL);
+        b.set_text("مرحبا Hello");
+        verify_cpu_gpu_text_parity("Explicit RTL BiDi", b, 20.0f, 16.0f, true, false);
+        assert(!b.did_exceed_max_lines());
+    }
+
+    // 4. Explicit TextDirection::LTR on mixed BiDi with Align::Start (aligns left)
+    {
+        text::Buffer b(text::Metrics(20.0f, 30.0f));
+        b.set_size(340.0f, std::nullopt);
+        b.set_align(text::Align::Start);
+        b.set_text_direction(text::TextDirection::LTR);
+        b.set_text("مرحبا Hello");
+        verify_cpu_gpu_text_parity("Explicit LTR BiDi", b, 20.0f, 16.0f, false, true);
+        assert(!b.did_exceed_max_lines());
+    }
+
+    std::cout << "  -> Phase 1 Custom Ellipsis & TextDirection CPU-vs-GPU Parity OK" << std::endl;
+}
+
+static void test_gpu_phase2_placeholders_rich_paint_and_gaps_parity() {
+    std::cout << "[Test 28/28] Phase 2 Placeholders, Rich Paint Spans & DecorationMode::Gaps CPU-vs-GPU Parity..." << std::endl;
+
+    text::FontSystem font_system;
+    font_system.set_auto_system_fonts(false);
+    auto fid_noto = font_system.load_font_file(resolve_test_font("NotoSans-Regular.ttf"));
+    auto fid_arabic = font_system.load_font_file(resolve_test_font("NotoSansArabic.ttf"));
+    assert(fid_noto.has_value() && fid_arabic.has_value());
+    font_system.set_default_font(*fid_noto);
+
+    auto device = GpuDevice::create();
+    constexpr uint32_t W = 400;
+    constexpr uint32_t H = 96;
+
+    auto verify_parity = [&](const char* label, auto&& draw_fn, double max_mae) {
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(Color::BLACK);
+        {
+            Canvas cpu_canvas(cpu_pm->as_mut());
+            text::GlyphCache cpu_cache(256);
+            draw_fn(&cpu_canvas, &cpu_cache, nullptr);
+        }
+
+        auto surface = GpuSurface::create(device, W, H);
+        assert(surface != nullptr);
+        GpuCanvas gpu_canvas(surface);
+        gpu_canvas.clear(Color::BLACK);
+        draw_fn(nullptr, nullptr, &gpu_canvas);
+        gpu_canvas.flush();
+        auto gpu_pm = surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        const auto cpu_r = cpu_pm->as_ref();
+        const auto gpu_r = gpu_pm->as_ref();
+
+        size_t cpu_lit = 0, gpu_lit = 0;
+        double sum_abs = 0.0;
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cpu_r.pixel(x, y);
+                auto gp = gpu_r.pixel(x, y);
+                assert(cp && gp);
+                if (cp->r > 30 || cp->g > 30 || cp->b > 30) ++cpu_lit;
+                if (gp->r > 30 || gp->g > 30 || gp->b > 30) ++gpu_lit;
+                sum_abs += std::abs(int(cp->r) - int(gp->r))
+                         + std::abs(int(cp->g) - int(gp->g))
+                         + std::abs(int(cp->b) - int(gp->b));
+            }
+        }
+        const double mae = sum_abs / (double(W) * double(H) * 3.0);
+        if (cpu_lit < 80 || gpu_lit < 80 || mae > max_mae) {
+            std::cerr << "  [FAIL] " << label
+                      << " cpu_lit=" << cpu_lit << " gpu_lit=" << gpu_lit
+                      << " mae=" << mae << " (max=" << max_mae << ")" << std::endl;
+            assert(false);
+        }
+    };
+
+    // 1. Gradient foreground + Stroked foreground + Gradient background + BlendMode::Plus
+    {
+        text::Buffer buf(text::Metrics(30.0f, 44.0f));
+        auto fg_grad = LinearGradient::create(
+            Point::from_xy(16.0f, 0.0f), Point::from_xy(190.0f, 0.0f),
+            {GradientStop::create(0.0f, Color::from_rgba8(255, 40, 40, 255)),
+             GradientStop::create(1.0f, Color::from_rgba8(40, 120, 255, 255))}
+        );
+        auto bg_grad = LinearGradient::create(
+            Point::from_xy(190.0f, 0.0f), Point::from_xy(360.0f, 0.0f),
+            {GradientStop::create(0.0f, Color::from_rgba8(40, 60, 140, 255)),
+             GradientStop::create(1.0f, Color::from_rgba8(30, 140, 120, 255))}
+        );
+        assert(fg_grad.has_value() && bg_grad.has_value());
+
+        Paint p_grad{Shader{*fg_grad}};
+        Paint p_stroke(Color::from_rgba8(255, 230, 40, 255));
+        p_stroke.set_style(PaintStyle::Stroke);
+        p_stroke.set_stroke_width(1.8f);
+        Paint p_bg{Shader{*bg_grad}};
+
+        text::Attrs a1;
+        a1.set_foreground_paint(p_grad);
+        text::Attrs a2;
+        a2.set_foreground_paint(p_stroke).set_background_paint(p_bg);
+
+        buf.add_text("GRAD ", a1);
+        buf.add_text("STROKE", a2);
+        buf.shape_until_scroll(font_system);
+
+        verify_parity("Gradient & Stroked Span Paint", [&](Canvas* cpu, text::GlyphCache* cache, GpuCanvas* gpu) {
+            if (cpu) buf.draw(*cpu, *cache, font_system, Color::WHITE, 16.0f, 20.0f);
+            else gpu->draw_text_buffer(buf, font_system, Point(16.0f, 20.0f), Color::WHITE);
+        }, 4.5);
+    }
+
+    // 2. Smart Underline Gap Skipping (DecorationMode::Gaps) for Latin & Arabic descenders
+    {
+        text::Buffer buf(text::Metrics(26.0f, 38.0f));
+        text::Attrs a;
+        a.set_color(text::TextColor::rgb(240, 240, 240))
+         .set_underline(true)
+         .set_decoration_mode(text::DecorationMode::Gaps)
+         .set_decoration_color(text::TextColor::rgb(255, 50, 50))
+         .set_decoration_thickness(1.3f);
+        buf.set_text("agypq يرجى التوقيع", a);
+        buf.shape_until_scroll(font_system);
+
+        verify_parity("DecorationMode::Gaps Latin+Arabic", [&](Canvas* cpu, text::GlyphCache* cache, GpuCanvas* gpu) {
+            if (cpu) buf.draw(*cpu, *cache, font_system, Color::WHITE, 16.0f, 24.0f);
+            else gpu->draw_text_buffer(buf, font_system, Point(16.0f, 24.0f), Color::WHITE);
+        }, 4.0);
+    }
+
+    // 3. Inline Placeholders in mixed LTR + Arabic RTL rendered identically on CPU & GPU
+    {
+        text::Buffer buf(text::Metrics(22.0f, 34.0f));
+        text::Attrs a;
+        a.set_color(text::TextColor::rgb(245, 245, 255));
+        buf.add_text("Tag ", a);
+        buf.add_placeholder(24.0f, 24.0f, text::PlaceholderAlignment::Middle);
+        buf.add_text(" مرحبا ", a);
+        buf.add_placeholder(28.0f, 20.0f, text::PlaceholderAlignment::AboveBaseline);
+        buf.add_text(" OK", a);
+        buf.shape_until_scroll(font_system);
+        auto prects = buf.placeholder_rects(16.0f, 24.0f);
+        assert(prects.size() == 2);
+
+        verify_parity("Inline Placeholders CPU vs GPU", [&](Canvas* cpu, text::GlyphCache* cache, GpuCanvas* gpu) {
+            Paint badge(Color::from_rgba8(60, 180, 255, 255));
+            if (cpu) {
+                buf.draw(*cpu, *cache, font_system, Color::WHITE, 16.0f, 24.0f);
+                for (const auto& pr : prects) cpu->fill_rect(pr.rect, badge);
+            } else {
+                gpu->draw_text_buffer(buf, font_system, Point(16.0f, 24.0f), Color::WHITE);
+                for (const auto& pr : prects) gpu->fill_rect(pr.rect, badge);
+            }
+        }, 4.0);
+    }
+
+    std::cout << "  -> Phase 2 Placeholders, Rich Paint Spans & DecorationMode::Gaps Parity OK" << std::endl;
+}
+
+static void test_gpu_phase3_features_variable_fonts_and_strut_parity() {
+    std::cout << "[Test 29/29] Phase 3 OpenType Features, Variable Fonts & StrutStyle CPU-vs-GPU Parity..." << std::endl;
+
+    text::FontSystem font_system;
+    font_system.set_auto_system_fonts(false);
+    auto fid_var_en = font_system.load_font_file(resolve_test_font("InterVariable.ttf"), 0, "InterVarGpu");
+    auto fid_var_ar = font_system.load_font_file(resolve_test_font("NotoSansArabic.ttf"), 0, "ArabicVarGpu");
+    assert(fid_var_en.has_value() && fid_var_ar.has_value());
+    font_system.set_default_font(*fid_var_en);
+
+    auto device = GpuDevice::create();
+    constexpr uint32_t W = 400;
+    constexpr uint32_t H = 120;
+
+    auto verify_parity = [&](const char* label, text::Buffer& buf, float ox, float oy, double max_mae) {
+        buf.shape_until_scroll(font_system);
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(Color::BLACK);
+        {
+            Canvas cpu_canvas(cpu_pm->as_mut());
+            text::GlyphCache cpu_cache(256);
+            buf.draw(cpu_canvas, cpu_cache, font_system, Color::WHITE, ox, oy);
+        }
+
+        auto surface = GpuSurface::create(device, W, H);
+        assert(surface != nullptr);
+        GpuCanvas gpu_canvas(surface);
+        gpu_canvas.clear(Color::BLACK);
+        gpu_canvas.draw_text_buffer(buf, font_system, Point(ox, oy), Color::WHITE);
+        gpu_canvas.flush();
+        auto gpu_pm = surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        const auto cpu_r = cpu_pm->as_ref();
+        const auto gpu_r = gpu_pm->as_ref();
+        size_t cpu_lit = 0, gpu_lit = 0;
+        double sum_abs = 0.0;
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cpu_r.pixel(x, y);
+                auto gp = gpu_r.pixel(x, y);
+                assert(cp && gp);
+                if (cp->r > 30 || cp->g > 30 || cp->b > 30) ++cpu_lit;
+                if (gp->r > 30 || gp->g > 30 || gp->b > 30) ++gpu_lit;
+                sum_abs += std::abs(int(cp->r) - int(gp->r))
+                         + std::abs(int(cp->g) - int(gp->g))
+                         + std::abs(int(cp->b) - int(gp->b));
+            }
+        }
+        const double mae = sum_abs / (double(W) * double(H) * 3.0);
+        if (cpu_lit < 80 || gpu_lit < 80 || mae > max_mae) {
+            std::cerr << "  [FAIL] " << label
+                      << " cpu_lit=" << cpu_lit << " gpu_lit=" << gpu_lit
+                      << " mae=" << mae << " (max=" << max_mae << ")" << std::endl;
+            assert(false);
+        }
+    };
+
+    // 1. Variable font Latin Thin (wght=200) vs Black (wght=850) + 'tnum' + 'zero'
+    {
+        text::Buffer buf(text::Metrics(28.0f, 40.0f));
+        text::Attrs a_thin;
+        a_thin.set_family(text::Family("InterVarGpu"))
+              .add_font_variation("wght", 200.0f)
+              .add_font_feature("tnum", 1)
+              .add_font_feature("zero", 1)
+              .set_color(text::TextColor::rgb(200, 230, 255));
+        text::Attrs a_heavy;
+        a_heavy.set_family(text::Family("InterVarGpu"))
+               .add_font_variation("wght", 850.0f)
+               .add_font_feature("tnum", 1)
+               .add_font_feature("zero", 1)
+               .set_color(text::TextColor::rgb(255, 220, 120));
+        buf.add_text("01:20 ", a_thin);
+        buf.add_text("09:50", a_heavy);
+        verify_parity("Variable Font wght + tnum + zero", buf, 16.0f, 24.0f, 4.0);
+    }
+
+    // 2. Variable font Arabic RTL (wght=800, wdth=75) + StrutStyle + HalfLeading + TextHeightBehavior
+    {
+        text::Buffer buf(text::Metrics(24.0f, 38.0f));
+        text::StrutStyle strut;
+        strut.enabled = true;
+        strut.font_families = {text::Family("InterVarGpu")};
+        strut.font_size = 24.0f;
+        strut.height_multiplier = 1.4f;
+        strut.force_strut_height = true;
+        strut.half_leading = true;
+        buf.set_strut_style(strut);
+        buf.set_text_height_behavior(text::TextHeightBehavior{false, false});
+
+        text::Attrs ar;
+        ar.set_font_families({text::Family("InterVarGpu"), text::Family("ArabicVarGpu")})
+          .set_locale("ar")
+          .add_font_variation("wght", 800.0f)
+          .add_font_variation("wdth", 75.0f)
+          .set_color(text::TextColor::rgb(240, 248, 255));
+        buf.set_text("مرحبا بالعالم 2026\nNisaba Typography", ar);
+        verify_parity("Variable Arabic + StrutStyle + TextHeightBehavior", buf, 16.0f, 16.0f, 4.5);
+    }
+
+    std::cout << "  -> Phase 3 OpenType Features, Variable Fonts & StrutStyle Parity OK" << std::endl;
+}
+
+static void test_gpu_phase4_incremental_updates_cache_and_visitor_parity() {
+    std::cout << "[Test 30/30] Phase 4 Incremental Updates, ParagraphCache & Visitor CPU-vs-GPU Parity..." << std::endl;
+
+    text::FontSystem fs;
+    fs.set_auto_system_fonts(false);
+    auto id_en = fs.load_font_file(resolve_test_font("Inter-Regular.ttf"));
+    auto id_ar = fs.load_font_file(resolve_test_font("NotoSansArabic.ttf"));
+    assert(id_en.has_value() && id_ar.has_value());
+    fs.set_default_font(*id_en);
+
+    auto device = GpuDevice::create();
+    constexpr uint32_t W = 440;
+    constexpr uint32_t H = 130;
+
+    auto verify_parity = [&](const char* label, text::Buffer& buf, float ox, float oy, double max_mae) {
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(Color::from_rgba8(14, 16, 20, 255));
+        {
+            Canvas cpu_canvas(cpu_pm->as_mut());
+            text::GlyphCache gcache(256);
+            buf.draw(cpu_canvas, gcache, fs, Color::WHITE, ox, oy);
+        }
+
+        auto surface = GpuSurface::create(device, W, H);
+        assert(surface != nullptr);
+        GpuCanvas gpu_canvas(surface);
+        gpu_canvas.clear(Color::from_rgba8(14, 16, 20, 255));
+        gpu_canvas.draw_text_buffer(buf, fs, Point(ox, oy), Color::WHITE);
+        gpu_canvas.flush();
+        auto gpu_pm = surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        const auto cpu_r = cpu_pm->as_ref();
+        const auto gpu_r = gpu_pm->as_ref();
+        size_t cpu_lit = 0, gpu_lit = 0;
+        double sum_abs = 0.0;
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cpu_r.pixel(x, y);
+                auto gp = gpu_r.pixel(x, y);
+                assert(cp && gp);
+                if (cp->r > 35 || cp->g > 35 || cp->b > 35) ++cpu_lit;
+                if (gp->r > 35 || gp->g > 35 || gp->b > 35) ++gpu_lit;
+                sum_abs += std::abs(int(cp->r) - int(gp->r))
+                         + std::abs(int(cp->g) - int(gp->g))
+                         + std::abs(int(cp->b) - int(gp->b));
+            }
+        }
+        const double mae = sum_abs / (double(W) * double(H) * 3.0);
+        if (cpu_lit < 100 || gpu_lit < 100 || mae > max_mae) {
+            std::cerr << "  [FAIL] " << label
+                      << " cpu_lit=" << cpu_lit << " gpu_lit=" << gpu_lit
+                      << " mae=" << mae << " (max=" << max_mae << ")" << std::endl;
+            assert(false);
+        }
+    };
+
+    // 1. In-place updates (align + gradient fg + bg paint + font size) with ZERO re-shape
+    {
+        text::Buffer buf(text::Metrics(22.0f, 32.0f));
+        buf.set_size(400.0f, std::nullopt);
+        buf.set_align(text::Align::Left);
+        buf.set_text("Nisaba Live Editor\nتحديث فوري");
+        buf.shape_until_scroll(fs);
+        assert(buf.shape_count() == 1);
+
+        auto grad = LinearGradient::create(
+            Point::from_xy(60.0f, 0.0f),
+            Point::from_xy(340.0f, 0.0f),
+            {
+                GradientStop::create(0.0f, Color::from_rgba8(255, 90, 90, 255)),
+                GradientStop::create(1.0f, Color::from_rgba8(80, 200, 255, 255))
+            }
+        );
+        assert(grad.has_value());
+        Paint fg_grad{Shader{*grad}};
+        Paint bg_hl(Color::from_rgba8(60, 75, 130, 255));
+
+        buf.update_text_align(text::Align::Center);
+        buf.update_background_paint(0, 6, bg_hl);
+        buf.update_foreground_paint(7, 11, fg_grad);
+        buf.update_font_size(12, 18, 30.0f);
+        assert(buf.shape_count() == 1);
+
+        // Verify visit() sees updated font size and RTL Arabic run on line 1
+        bool saw_30px = false;
+        bool saw_ar_rtl = false;
+        buf.visit(fs, [&](const text::GlyphRunInfo& info) {
+            if (!info.is_placeholder && std::abs(info.font_size - 30.0f) < 0.01f) saw_30px = true;
+            if (info.is_rtl && info.line_number == 1 && !info.glyph_ids.empty()) saw_ar_rtl = true;
+        }, 20.0f, 16.0f);
+        assert(saw_30px && saw_ar_rtl);
+
+        verify_parity("Incremental Updates (Align+Paint+Size)", buf, 20.0f, 16.0f, 4.5);
+        assert(buf.shape_count() == 1);
+    }
+
+    // 2. ParagraphCache hit rendering parity (mixed English + Arabic RTL)
+    {
+        text::ParagraphCache pcache(16);
+        text::Attrs attrs;
+        attrs.set_color(text::TextColor::rgb(235, 245, 255));
+        auto b_miss = pcache.get_or_layout(fs, "Cached Label مرحبا 2026", attrs, text::Metrics(24.0f, 34.0f), 380.0f, text::Wrap::Word, text::Align::Center);
+        auto b_hit = pcache.get_or_layout(fs, "Cached Label مرحبا 2026", attrs, text::Metrics(24.0f, 34.0f), 380.0f, text::Wrap::Word, text::Align::Center);
+        assert(b_miss == b_hit && pcache.hits() == 1 && pcache.misses() == 1);
+        verify_parity("ParagraphCache Hit (Latin+Arabic)", *b_hit, 20.0f, 32.0f, 4.0);
+    }
+
+    std::cout << "  -> Phase 4 Incremental Updates, ParagraphCache & Visitor Parity OK" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "Running Nisaba GPU Rendering Pipeline Test Suite" << std::endl;
@@ -2497,9 +3003,13 @@ int main() {
     test_gpu_text_decorations_and_shadows_parity();
     test_gpu_shared_state_reset_and_blur_hardening();
     test_gpu_p3_svg_lottie_3d_parity();
+    test_gpu_phase1_ellipsis_and_direction_parity();
+    test_gpu_phase2_placeholders_rich_paint_and_gaps_parity();
+    test_gpu_phase3_features_variable_fonts_and_strut_parity();
+    test_gpu_phase4_incremental_updates_cache_and_visitor_parity();
 
     std::cout << "========================================" << std::endl;
-    std::cout << "All Nisaba GPU pipeline tests PASSED (26/26)!" << std::endl;
+    std::cout << "All Nisaba GPU pipeline tests PASSED (30/30)!" << std::endl;
     std::cout << "========================================" << std::endl;
 
     return 0;

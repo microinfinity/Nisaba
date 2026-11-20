@@ -50,6 +50,7 @@
 #include "nisaba/text/cursor.hpp"
 #include "nisaba/text/baked_text.hpp"
 #include "nisaba/text/text_cache.hpp"
+#include "nisaba/text/paragraph_cache.hpp"
 #include "nisaba/canvas/painter.hpp"
 #include "nisaba/effects/effects.hpp"
 #include "nisaba/svg/svg.hpp"

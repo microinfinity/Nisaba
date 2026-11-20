@@ -56,6 +56,7 @@ struct CacheKey {
     SubpixelBin x_bin{SubpixelBin::Zero};
     SubpixelBin y_bin{SubpixelBin::Zero};
     uint8_t style_flags{0}; // bit 0: synthetic_bold, bit 1: synthetic_italic
+    uint64_t variation_hash{0};
 
     bool operator==(const CacheKey& other) const noexcept {
         return font_id == other.font_id &&
@@ -63,7 +64,8 @@ struct CacheKey {
                font_size_bits == other.font_size_bits &&
                x_bin == other.x_bin &&
                y_bin == other.y_bin &&
-               style_flags == other.style_flags;
+               style_flags == other.style_flags &&
+               variation_hash == other.variation_hash;
     }
 };
 
@@ -73,6 +75,9 @@ struct CacheKeyHash {
         h ^= (std::hash<uint32_t>{}(k.font_size_bits) + 0x9e3779b9 + (h << 6) + (h >> 2));
         h ^= (std::hash<uint16_t>{}(k.glyph_id) + 0x9e3779b9 + (h << 6) + (h >> 2));
         h ^= (static_cast<size_t>(k.style_flags) << 4) ^ (static_cast<size_t>(k.x_bin) << 2) ^ static_cast<size_t>(k.y_bin);
+        if (k.variation_hash != 0) {
+            h ^= (static_cast<size_t>(k.variation_hash) + 0x9e3779b9 + (h << 6) + (h >> 2));
+        }
         return h;
     }
 };
@@ -106,7 +111,9 @@ public:
         float x,
         float y,
         bool synthetic_bold = false,
-        bool synthetic_italic = false
+        bool synthetic_italic = false,
+        std::span<const FontVariation> variations = {},
+        uint64_t variation_hash = 0
     );
 
     void clear() noexcept {

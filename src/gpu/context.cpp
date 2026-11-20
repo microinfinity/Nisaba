@@ -2721,7 +2721,8 @@ float Context::textWithFont(float x, float y, const text::TtfFont& font, float f
 	return x + totalWidth * invscale;
 }
 
-void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontSystem, Point pos, Color defaultColor) {
+void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontSystem, Point pos, Color defaultColor, uint32_t passMask) {
+	if (passMask == 0u) return;
 	bool need_shaping = false;
 	for (const auto& line : buffer.lines()) {
 		if (!line.is_shaped()) {
@@ -2787,7 +2788,8 @@ void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontS
 	};
 
 	auto emitGlyphQuad = [&](const text::TtfFont* font, uint32_t font_id, uint16_t glyph_id, float font_size,
-	                         float glyph_x, float glyph_y, bool synth_bold, bool synth_italic, uint32_t vcolor) {
+	                         float glyph_x, float glyph_y, bool synth_bold, bool synth_italic, uint32_t vcolor,
+	                         std::span<const text::FontVariation> variations = {}, uint64_t variation_hash = 0) {
 		float scaledSize = font_size * scale;
 		uint32_t sizeBits = 0;
 		std::memcpy(&sizeBits, &scaledSize, sizeof(float));
@@ -2799,13 +2801,13 @@ void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontS
 		auto [intY, yBin] = text::compute_subpixel_bin(targetY);
 
 		uint8_t styleFlags = (synth_bold ? 1 : 0) | (synth_italic ? 2 : 0);
-		text::CacheKey key{font_id, glyph_id, sizeBits, xBin, yBin, styleFlags};
+		text::CacheKey key{font_id, glyph_id, sizeBits, xBin, yBin, styleFlags, variation_hash};
 		const AtlasGlyphEntry* entry = m_atlas->find(key);
 
 		if (!entry) {
 			const text::CachedGlyph* cg = m_glyphCache.get_or_render(
 				*font, font_id, glyph_id, scaledSize, targetX, targetY,
-				synth_bold, synth_italic);
+				synth_bold, synth_italic, variations, variation_hash);
 
 			auto inserted = m_atlas->insert(key, cg);
 			if (!inserted) {
@@ -2879,33 +2881,41 @@ void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontS
 
 	auto emitGlyphWithColor = [&](const text::LayoutGlyph& glyph, const text::TtfFont* font,
 	                              float gx, float gy, uint32_t overrideRgba, bool forceSolid) {
+		const std::span<const text::FontVariation> vars = glyph.variation_coords_opt
+			? std::span<const text::FontVariation>(*glyph.variation_coords_opt)
+			: std::span<const text::FontVariation>{};
 		if (font->has_color_glyphs() && font->get_color_glyph_layers(glyph.glyph_id, color_layers)) {
 			for (const auto& layer : color_layers) {
 				uint32_t layerRgba = (forceSolid || layer.use_foreground)
 					? overrideRgba
 					: Color(layer.color.to_color()).premultiplied().toRGBA8();
 				emitGlyphQuad(font, glyph.font_id, layer.glyph_id, glyph.font_size,
-				              gx, gy, glyph.synthetic_bold, glyph.synthetic_italic, layerRgba);
+				              gx, gy, glyph.synthetic_bold, glyph.synthetic_italic, layerRgba,
+				              vars, glyph.variation_hash);
 			}
 			return;
 		}
 		emitGlyphQuad(font, glyph.font_id, glyph.glyph_id, glyph.font_size,
-		              gx, gy, glyph.synthetic_bold, glyph.synthetic_italic, overrideRgba);
+		              gx, gy, glyph.synthetic_bold, glyph.synthetic_italic, overrideRgba,
+		              vars, glyph.variation_hash);
 	};
 
 	std::vector<float> blur_sigmas;
 	bool has_sharp_shadows = false;
-	for (const auto& run : runs) {
-		for (const auto& glyph : run.glyphs) {
-			for (const auto& sh : glyph.shadows) {
-				if (sh.blur_sigma > 0.1f) {
-					if (std::find_if(blur_sigmas.begin(), blur_sigmas.end(), [&](float s) {
-							return std::abs(s - sh.blur_sigma) < 0.05f;
-						}) == blur_sigmas.end()) {
-						blur_sigmas.push_back(sh.blur_sigma);
+	if ((passMask & 0x02u) != 0u) {
+		for (const auto& run : runs) {
+			for (const auto& glyph : run.glyphs) {
+				if (glyph.is_placeholder) continue;
+				for (const auto& sh : glyph.shadows) {
+					if (sh.blur_sigma > 0.1f) {
+						if (std::find_if(blur_sigmas.begin(), blur_sigmas.end(), [&](float s) {
+								return std::abs(s - sh.blur_sigma) < 0.05f;
+							}) == blur_sigmas.end()) {
+							blur_sigmas.push_back(sh.blur_sigma);
+						}
+					} else {
+						has_sharp_shadows = true;
 					}
-				} else {
-					has_sharp_shadows = true;
 				}
 			}
 		}
@@ -2915,10 +2925,11 @@ void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontS
 		const float baseline_offset = (run.max_ascent > 0.0f) ? run.max_ascent : buffer.metrics().font_size;
 		const float line_baseline = pos.y + run.line_top + baseline_offset;
 
-		// Pass 1: Span background highlights
-		if (run.line_height > 0.0f) {
+		// Pass 1: Span background highlights (solid colors only; rich Paint backgrounds handled by GpuCanvas)
+		if ((passMask & 0x01u) != 0u && run.line_height > 0.0f) {
 			const float curAlpha = currentState().alpha;
 			for (const auto& glyph : run.glyphs) {
+				if (glyph.background_paint_opt != nullptr) continue;
 				if (glyph.background_color_opt.has_value() && glyph.w > 0.0f) {
 					Color bg = glyph.background_color_opt->to_color();
 					bg.a *= curAlpha;
@@ -2933,9 +2944,9 @@ void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontS
 		}
 
 		// Pass 1.5a: Sharp TextShadows
-		if (has_sharp_shadows) {
+		if ((passMask & 0x02u) != 0u && has_sharp_shadows) {
 			for (const auto& glyph : run.glyphs) {
-				if (glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
+				if (glyph.is_placeholder || glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
 				const text::TtfFont* font = resolveGlyphFont(glyph.font_id);
 				if (!font) continue;
 				const float gx = pos.x + glyph.x + glyph.x_offset;
@@ -2950,12 +2961,12 @@ void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontS
 		}
 
 		// Pass 1.5b: Blurred TextShadows via Gaussian blur offscreen layer
-		for (float sigma : blur_sigmas) {
+		if ((passMask & 0x02u) != 0u) for (float sigma : blur_sigmas) {
 			float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
 			bool any_for_sigma = false;
 			const Transform2D xf = currentState().xform;
 			for (const auto& glyph : run.glyphs) {
-				if (glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
+				if (glyph.is_placeholder || glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
 				const float gx = pos.x + glyph.x + glyph.x_offset;
 				for (const auto& sh : glyph.shadows) {
 					if (sh.blur_sigma > 0.1f && std::abs(sh.blur_sigma - sigma) < 0.05f) {
@@ -2996,7 +3007,7 @@ void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontS
 			pushLayer(ldesc);
 
 			for (const auto& glyph : run.glyphs) {
-				if (glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
+				if (glyph.is_placeholder || glyph.glyph_id == 0 || glyph.shadows.empty()) continue;
 				const text::TtfFont* font = resolveGlyphFont(glyph.font_id);
 				if (!font) continue;
 				const float gx = pos.x + glyph.x + glyph.x_offset;
@@ -3012,56 +3023,67 @@ void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontS
 			restore();
 		}
 
-		// Pass 2: Glyphs (including COLR/CPAL color layers)
-		for (const auto& glyph : run.glyphs) {
-			if (glyph.glyph_id == 0) continue;
-			const text::TtfFont* font = resolveGlyphFont(glyph.font_id);
-			if (!font) continue;
+		// Pass 2: Glyphs (including COLR/CPAL color layers; skips placeholders and vector rich-Paint glyphs)
+		if ((passMask & 0x04u) != 0u) {
+			for (const auto& glyph : run.glyphs) {
+				if (glyph.is_placeholder || glyph.glyph_id == 0) continue;
+				if (glyph.foreground_paint_opt && text::paint_requires_vector_path(*glyph.foreground_paint_opt)) {
+					continue;
+				}
+				const text::TtfFont* font = resolveGlyphFont(glyph.font_id);
+				if (!font) continue;
 
-			const float glyph_x = pos.x + glyph.x + glyph.x_offset;
-			const float glyph_y = line_baseline + glyph.y + glyph.y_offset;
-			Color fg = glyph.color_opt.has_value() ? Color(glyph.color_opt->to_color()) : defaultColor;
-			uint32_t fgRgba = fg.premultiplied().toRGBA8();
+				const float glyph_x = pos.x + glyph.x + glyph.x_offset;
+				const float glyph_y = line_baseline + glyph.y + glyph.y_offset;
+				uint32_t fgRgba = defColorRgba;
+				if (glyph.foreground_paint_opt) {
+					fgRgba = Color(glyph.foreground_paint_opt->shader.solid_color()).premultiplied().toRGBA8();
+				} else if (glyph.color_opt.has_value()) {
+					fgRgba = Color(glyph.color_opt->to_color()).premultiplied().toRGBA8();
+				}
 
-			emitGlyphWithColor(glyph, font, glyph_x, glyph_y,
-			                   glyph.color_opt.has_value() ? fgRgba : defColorRgba, false);
-		}
-
-		// Pass 3: Decorations (underline, strikethrough, overline + all 5 styles)
-		const auto dec = text::build_run_decorations(
-			run, pos.x, pos.y, buffer.metrics().font_size,
-			nisaba::Color::from_rgba_unchecked(defaultColor.r, defaultColor.g, defaultColor.b, defaultColor.a)
-		);
-		const State& cur = currentState();
-		for (const auto& r : dec.rects) {
-			Color dc(r.color);
-			dc.a *= cur.alpha;
-			appendSolidRect(solidVerts, r.x, r.y, r.w, r.h, dc.premultiplied().toRGBA8());
-		}
-		for (const auto& wv : dec.waves) {
-			Color dc(wv.color);
-			dc.a *= cur.alpha;
-			const uint32_t dcRgba = dc.premultiplied().toRGBA8();
-			const float halfW = wv.stroke_width * 0.5f;
-			for (size_t i = 0; i + 1 < wv.points.size(); ++i) {
-				const auto& a = wv.points[i];
-				const auto& b = wv.points[i + 1];
-				const float dx = b.x - a.x;
-				const float dy = b.y - a.y;
-				const float len = std::hypot(dx, dy);
-				if (len <= 1e-4f) continue;
-				const float nx = (-dy / len) * halfW;
-				const float ny = ( dx / len) * halfW;
-				Point p0 = cur.xform.transformPoint(a.x - nx, a.y - ny);
-				Point p1 = cur.xform.transformPoint(b.x - nx, b.y - ny);
-				Point p2 = cur.xform.transformPoint(b.x + nx, b.y + ny);
-				Point p3 = cur.xform.transformPoint(a.x + nx, a.y + ny);
-				appendSolidQuadPts(solidVerts, p0, p1, p2, p3, dcRgba);
+				emitGlyphWithColor(glyph, font, glyph_x, glyph_y, fgRgba, false);
 			}
 		}
-		if (!solidVerts.empty()) {
-			flushBatch();
-			flushSolidRects(solidVerts);
+
+		// Pass 3: Decorations (underline + DecorationMode::Gaps, strikethrough, overline, all 5 styles)
+		if ((passMask & 0x08u) != 0u) {
+			const auto dec = text::build_run_decorations(
+				run, pos.x, pos.y, buffer.metrics().font_size,
+				nisaba::Color::from_rgba_unchecked(defaultColor.r, defaultColor.g, defaultColor.b, defaultColor.a),
+				&fontSystem
+			);
+			const State& cur = currentState();
+			for (const auto& r : dec.rects) {
+				Color dc(r.color);
+				dc.a *= cur.alpha;
+				appendSolidRect(solidVerts, r.x, r.y, r.w, r.h, dc.premultiplied().toRGBA8());
+			}
+			for (const auto& wv : dec.waves) {
+				Color dc(wv.color);
+				dc.a *= cur.alpha;
+				const uint32_t dcRgba = dc.premultiplied().toRGBA8();
+				const float halfW = wv.stroke_width * 0.5f;
+				for (size_t i = 0; i + 1 < wv.points.size(); ++i) {
+					const auto& a = wv.points[i];
+					const auto& b = wv.points[i + 1];
+					const float dx = b.x - a.x;
+					const float dy = b.y - a.y;
+					const float len = std::hypot(dx, dy);
+					if (len <= 1e-4f) continue;
+					const float nx = (-dy / len) * halfW;
+					const float ny = ( dx / len) * halfW;
+					Point p0 = cur.xform.transformPoint(a.x - nx, a.y - ny);
+					Point p1 = cur.xform.transformPoint(b.x - nx, b.y - ny);
+					Point p2 = cur.xform.transformPoint(b.x + nx, b.y + ny);
+					Point p3 = cur.xform.transformPoint(a.x + nx, a.y + ny);
+					appendSolidQuadPts(solidVerts, p0, p1, p2, p3, dcRgba);
+				}
+			}
+			if (!solidVerts.empty()) {
+				flushBatch();
+				flushSolidRects(solidVerts);
+			}
 		}
 	}
 

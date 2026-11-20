@@ -167,7 +167,8 @@ CharType Bidi::classify_char(char32_t c) noexcept {
         (c >= '[' && c <= '`') || (c >= '{' && c <= '~') ||
         c == 0x060C || c == 0x061B || c == 0x061F ||
         c == 0x00AB || c == 0x00BB || c == 0x2039 || c == 0x203A ||
-        (c >= 0x2010 && c <= 0x2027)) {
+        (c >= 0x2010 && c <= 0x2027) ||
+        c == 0xFFFC) {
         return CharType::Neutral;
     }
     return CharType::LTR;
@@ -325,10 +326,10 @@ std::vector<BidiRun> Bidi::segment_runs(std::string_view text, std::optional<Dir
         if (type == CharType::ArabicLetter || type == CharType::RTL) {
             char_level = 1;
         } else if (type == CharType::LTR) {
-            char_level = 0;
+            char_level = (base_level == 1) ? 2 : 0;
         } else if (type == CharType::EuropeanNumber || type == CharType::ArabicNumber) {
             // Numbers inside RTL context remain level 2 (LTR number run embedded inside RTL)
-            char_level = ((current_level % 2) != 0) ? 2 : 0;
+            char_level = ((current_level % 2) != 0 || base_level == 1) ? 2 : 0;
         } else {
             // Neutral/whitespace: look ahead to next strong type (UAX #9 N1/N2)
             char_level = current_level;
@@ -340,7 +341,7 @@ std::vector<BidiRun> Bidi::segment_runs(std::string_view text, std::optional<Dir
                     if ((current_level % 2) != 0) char_level = 1;
                     break;
                 } else if (ntype == CharType::LTR) {
-                    if ((current_level % 2) == 0) char_level = 0;
+                    if ((current_level % 2) == 0) char_level = (base_level == 1) ? 2 : 0;
                     break;
                 } else if (ntype == CharType::EuropeanNumber || ntype == CharType::ArabicNumber) {
                     break;
@@ -371,7 +372,34 @@ std::vector<ShapedChar> Bidi::shape_text(std::string_view text, const std::vecto
     auto chars = decode_utf8(text);
     if (chars.empty()) return result;
 
-    for (const auto& run : runs) {
+    // UAX #9 Rule L2 visual run reordering across embedding levels
+    std::vector<BidiRun> visual_runs = runs;
+    uint8_t max_level = 0;
+    for (const auto& r : visual_runs) {
+        max_level = std::max(max_level, r.level);
+    }
+    if (max_level > 0 && visual_runs.size() > 1) {
+        for (uint8_t lvl = max_level; lvl >= 1; --lvl) {
+            size_t i = 0;
+            while (i < visual_runs.size()) {
+                if (visual_runs[i].level >= lvl) {
+                    size_t j = i + 1;
+                    while (j < visual_runs.size() && visual_runs[j].level >= lvl) {
+                        ++j;
+                    }
+                    if (j - i > 1) {
+                        std::reverse(visual_runs.begin() + static_cast<ptrdiff_t>(i),
+                                     visual_runs.begin() + static_cast<ptrdiff_t>(j));
+                    }
+                    i = j;
+                } else {
+                    ++i;
+                }
+            }
+        }
+    }
+
+    for (const auto& run : visual_runs) {
         std::vector<std::pair<char32_t, size_t>> run_chars;
         for (const auto& c : chars) {
             if (c.second >= run.start_byte && c.second < run.end_byte) {

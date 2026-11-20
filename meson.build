@@ -46,6 +46,7 @@ nisaba_sources = files(
   'src/text/cursor.cpp',
   'src/text/baked_text.cpp',
   'src/text/text_cache.cpp',
+  'src/text/paragraph_cache.cpp',
   'src/effects/blur.cpp',
   'src/effects/color_filter.cpp',
   'src/effects/color_matrix.cpp',

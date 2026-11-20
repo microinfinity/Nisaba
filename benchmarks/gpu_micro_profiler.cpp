@@ -51,6 +51,7 @@ namespace skottie { class PropertyObserver; }
 #include "nisaba/gpu/gpu_device.hpp"
 #include "nisaba/gpu/gpu_surface.hpp"
 #include "nisaba/gpu/gpu_canvas.hpp"
+#include "nisaba/text/paragraph_cache.hpp"
 #include "nisaba/gpu/gpu_texture.hpp"
 #include "nisaba/lottie/animation.hpp"
 #include "nisaba/svg/svg_document.hpp"
@@ -4641,6 +4642,118 @@ int main(int argc, char** argv) {
 					if (i % 3 == 0) c->drawLine(60.0f, base - fontSizes[i] * 0.35f, 700.0f, base - fontSizes[i] * 0.35f, pLine);
 					y += fontSizes[i] * 1.8f;
 				}
+			}
+		);
+
+		nisaba::text::Buffer ellRtlBuf(nisaba::text::Metrics(22.0f, 34.0f));
+		ellRtlBuf.set_size(420.0f, std::nullopt);
+		ellRtlBuf.set_wrap(nisaba::text::Wrap::Word);
+		ellRtlBuf.set_align(nisaba::text::Align::Start);
+		ellRtlBuf.set_text_direction(nisaba::text::TextDirection::RTL);
+		ellRtlBuf.set_overflow(nisaba::text::Overflow::Ellipsis);
+		ellRtlBuf.set_max_lines(2);
+		ellRtlBuf.set_ellipsis("\xE2\x80\xA6 \xD8\xA7\xD9\x84\xD9\x85\xD8\xB2\xD9\x8A\xD8\xAF");
+		ellRtlBuf.set_text("مرحبا بكم في محرك نيسابا للرسوميات والنصوص العربية المتكاملة مع دعم الاتجاه الصريح وعلامة القطع المخصصة English 2026");
+		if (fontSys) ellRtlBuf.shape_until_scroll(*fontSys);
+
+		benchmark_canvas_op("129b. Custom RTL Ellipsis + Explicit Direction",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				if (fontSys) c.draw_text_buffer(ellRtlBuf, *fontSys, nisaba::Point::from_xy(60.0f, 120.0f), nisaba::Color::WHITE);
+			},
+			[&](SkCanvas* c) {
+				SkFont f(skArabicTf ? skArabicTf : skiaTypeface, 22.0f);
+				SkPaint p; p.setAntiAlias(true); p.setColor(SK_ColorWHITE);
+				c->drawString("مرحبا بكم في محرك نيسابا للرسوميات والنصوص", 60.0f, 146.0f, f, p);
+				c->drawString("… المزيد", 60.0f, 180.0f, f, p);
+			}
+		);
+
+		nisaba::text::Buffer phase2Buf(nisaba::text::Metrics(28.0f, 40.0f));
+		auto p2Grad = nisaba::LinearGradient::create(
+			nisaba::Point::from_xy(60.0f, 0.0f), nisaba::Point::from_xy(420.0f, 0.0f),
+			{nisaba::GradientStop::create(0.0f, nisaba::Color::from_rgba8(255, 80, 120, 255)),
+			 nisaba::GradientStop::create(1.0f, nisaba::Color::from_rgba8(60, 210, 255, 255))}
+		);
+		nisaba::Paint p2Fg{nisaba::Shader{*p2Grad}};
+		nisaba::text::Attrs p2Attrs;
+		p2Attrs.set_foreground_paint(p2Fg)
+		       .set_underline(true)
+		       .set_decoration_mode(nisaba::text::DecorationMode::Gaps)
+		       .set_decoration_color(nisaba::text::TextColor::rgb(255, 190, 60));
+		phase2Buf.add_text("Typography ", p2Attrs);
+		phase2Buf.add_placeholder(24.0f, 24.0f, nisaba::text::PlaceholderAlignment::Middle);
+		phase2Buf.add_text(" gypq يرجى التوقيع", p2Attrs);
+		if (fontSys) phase2Buf.shape_until_scroll(*fontSys);
+
+		benchmark_canvas_op("129c. Gradient Text + Gaps Underline + Placeholder",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				if (fontSys) c.draw_text_buffer(phase2Buf, *fontSys, nisaba::Point::from_xy(60.0f, 140.0f), nisaba::Color::WHITE);
+			},
+			[&](SkCanvas* c) {
+				SkFont f(skiaTypeface, 28.0f);
+				SkPaint p; p.setAntiAlias(true); p.setColor(SK_ColorWHITE);
+				c->drawString("Typography gypq", 60.0f, 168.0f, f, p);
+			}
+		);
+
+		nisaba::text::Buffer phase3Buf(nisaba::text::Metrics(26.0f, 38.0f));
+		nisaba::text::StrutStyle p3Strut;
+		p3Strut.enabled = true;
+		p3Strut.font_size = 26.0f;
+		p3Strut.height_multiplier = 1.35f;
+		p3Strut.force_strut_height = true;
+		p3Strut.half_leading = true;
+		phase3Buf.set_strut_style(p3Strut);
+		nisaba::text::Attrs p3Attrs;
+		p3Attrs.add_font_feature("tnum", 1)
+		       .add_font_feature("zero", 1)
+		       .add_font_variation("wght", 750.0f)
+		       .set_color(nisaba::text::TextColor::rgb(235, 245, 255));
+		phase3Buf.set_text("09:42:15 Variable Typography مرحبا", p3Attrs);
+		if (fontSys) phase3Buf.shape_until_scroll(*fontSys);
+
+		benchmark_canvas_op("129d. Variable Font + OT Features + StrutStyle",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				if (fontSys) c.draw_text_buffer(phase3Buf, *fontSys, nisaba::Point::from_xy(60.0f, 140.0f), nisaba::Color::WHITE);
+			},
+			[&](SkCanvas* c) {
+				SkFont f(skiaTypeface, 26.0f);
+				SkPaint p; p.setAntiAlias(true); p.setColor(SK_ColorWHITE);
+				c->drawString("09:42:15 Variable Typography", 60.0f, 166.0f, f, p);
+			}
+		);
+
+		nisaba::text::ParagraphCache phase4Cache(32);
+		nisaba::text::Attrs p4Attrs;
+		p4Attrs.set_color(nisaba::text::TextColor::rgb(235, 245, 255));
+		std::shared_ptr<nisaba::text::Buffer> phase4CachedBuf;
+		if (fontSys) {
+			phase4CachedBuf = phase4Cache.get_or_layout(
+				*fontSys, "Cached Interactive Paragraph مرحبا 2026",
+				p4Attrs, nisaba::text::Metrics(24.0f, 34.0f), 420.0f,
+				nisaba::text::Wrap::Word, nisaba::text::Align::Left
+			);
+		}
+		nisaba::Paint p4Bg(nisaba::Color::from_rgba8(55, 75, 130, 255));
+		int p4Frame = 0;
+
+		benchmark_canvas_op("129e. Incremental Updates + ParagraphCache",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				if (fontSys) {
+					auto hit = phase4Cache.get_or_layout(
+						*fontSys, "Cached Interactive Paragraph مرحبا 2026",
+						p4Attrs, nisaba::text::Metrics(24.0f, 34.0f), 420.0f,
+						nisaba::text::Wrap::Word, nisaba::text::Align::Left
+					);
+					hit->update_text_align((p4Frame++ & 1) ? nisaba::text::Align::Center : nisaba::text::Align::Left);
+					hit->update_background_paint(0, 6, p4Bg);
+					c.draw_text_buffer(*hit, *fontSys, nisaba::Point::from_xy(60.0f, 140.0f), nisaba::Color::WHITE);
+				}
+			},
+			[&](SkCanvas* c) {
+				SkFont f(skiaTypeface, 24.0f);
+				SkPaint p; p.setAntiAlias(true); p.setColor(SK_ColorWHITE);
+				c->drawString("Cached Interactive Paragraph", 60.0f, 164.0f, f, p);
 			}
 		);
 	}

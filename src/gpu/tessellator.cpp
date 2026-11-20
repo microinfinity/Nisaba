@@ -495,11 +495,24 @@ void Tessellator::calculateJoins(float w, LineJoin join, float miterLimit) {
 		PathContour& contour = m_contours[i];
 		ContourPoint* pts = &m_points[contour.first];
 		int nleft = 0;
+		int x_sign_flips = 0;
+		int first_x_sign = 0;
+		int prev_x_sign = 0;
 		contour.nbevel = 0;
 
 		for (int j = 0; j < contour.count; ++j) {
 			ContourPoint* p0 = (j > 0) ? &pts[j - 1] : &pts[contour.count - 1];
 			ContourPoint* p1 = &pts[j];
+
+			const int cur_x_sign = (p1->dx > 1e-6f) ? 1 : ((p1->dx < -1e-6f) ? -1 : 0);
+			if (cur_x_sign != 0) {
+				if (first_x_sign == 0) {
+					first_x_sign = cur_x_sign;
+				} else if (cur_x_sign != prev_x_sign) {
+					++x_sign_flips;
+				}
+				prev_x_sign = cur_x_sign;
+			}
 
 			float dlx0 = p0->dy;
 			float dly0 = -p0->dx;
@@ -538,8 +551,11 @@ void Tessellator::calculateJoins(float w, LineJoin join, float miterLimit) {
 				contour.nbevel++;
 			}
 		}
+		if (first_x_sign != 0 && prev_x_sign != 0 && first_x_sign != prev_x_sign) {
+			++x_sign_flips;
+		}
 
-		contour.convex = (nleft == contour.count || nleft == 0);
+		contour.convex = (nleft == contour.count || nleft == 0) && (x_sign_flips <= 2);
 	}
 }
 

@@ -12,6 +12,19 @@ showcase_text_exe = executable('showcase_text',
   dependencies : nisaba_dep
 )
 
+showcase_text_adv_deps = [nisaba_dep]
+showcase_text_adv_args = []
+if get_option('enable_gpu')
+  showcase_text_adv_deps += [extra_deps]
+  showcase_text_adv_args += ['-DNISABA_HAS_GPU=1']
+endif
+
+showcase_text_advanced_exe = executable('showcase_text_advanced',
+  'showcase_text_advanced.cpp',
+  cpp_args : showcase_text_adv_args,
+  dependencies : showcase_text_adv_deps
+)
+
 showcase_effects_exe = executable('showcase_effects',
   'showcase_effects.cpp',
   dependencies : nisaba_dep

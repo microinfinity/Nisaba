@@ -29,7 +29,9 @@ Nisaba delivers high-end vector graphics, real-time 3D PBR rendering with Cook-T
 ![Nisaba Vector Showcase](showcase/embedded_hmi_showcase.png)
 
 ### Multilingual Typography & Text Layout Showcase
-![Nisaba Text Showcase](showcase/nisaba_text_showcase.png)
+| Multilingual & Embedded Text Layout | Advanced Typography (Variable Fonts, OpenType, Placeholders, Gaps & StrutStyle) |
+| :---: | :---: |
+| ![Nisaba Text Showcase](showcase/nisaba_text_showcase.png) | ![Nisaba Advanced Typography Showcase](showcase/nisaba_text_advanced_gpu.png) |
 
 ### Modern Glassmorphism & Visual Effects Showcase
 ![Nisaba Effects Showcase](showcase/nisaba_effects_showcase.png)

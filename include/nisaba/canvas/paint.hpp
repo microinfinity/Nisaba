@@ -48,6 +48,7 @@ public:
     std::optional<effects::ColorEffect> color_effect{std::nullopt};
     std::optional<effects::ImageFilter> image_filter{std::nullopt};
     PaintStyle style{PaintStyle::Fill};
+    float stroke_width{1.0f};
 
     std::shared_ptr<gpu::Shader> custom_shader{nullptr};
 
@@ -139,6 +140,14 @@ public:
 
     [[nodiscard]] PaintStyle paint_style() const noexcept {
         return style;
+    }
+
+    void set_stroke_width(float w) noexcept {
+        stroke_width = (w > 0.0f) ? w : 0.0f;
+    }
+
+    [[nodiscard]] float get_stroke_width() const noexcept {
+        return stroke_width;
     }
 };
 

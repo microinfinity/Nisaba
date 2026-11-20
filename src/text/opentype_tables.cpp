@@ -249,6 +249,148 @@ struct OpenTypeGsub::Impl {
         return false;
     }
 
+    std::vector<uint16_t> get_langsys_feature_indices(uint32_t script_tag, uint32_t lang_tag) const {
+        std::vector<uint16_t> indices;
+        if (script_list_offset == 0 || script_list_offset + 2u > data.size()) return indices;
+
+        SpanReader sr(data.subspan(script_list_offset));
+        uint16_t script_count = sr.read_u16();
+        if (script_count == 0) return indices;
+
+        auto find_script_offset = [&](uint32_t target_tag) -> uint16_t {
+            SpanReader r(data.subspan(script_list_offset + 2u));
+            for (uint16_t i = 0; i < script_count; ++i) {
+                if (!r.can_read(6)) break;
+                uint32_t tag = r.read_u32();
+                uint16_t off = r.read_u16();
+                if (tag == target_tag) return off;
+            }
+            return 0;
+        };
+
+        uint16_t script_off = 0;
+        if (script_tag != 0) {
+            script_off = find_script_offset(script_tag);
+        }
+        if (script_off == 0) {
+            script_off = find_script_offset(make_tag('D', 'F', 'L', 'T'));
+        }
+        if (script_off == 0) {
+            script_off = find_script_offset(make_tag('l', 'a', 't', 'n'));
+        }
+        if (script_off == 0 || script_list_offset + script_off + 4u > data.size()) return indices;
+
+        const size_t script_abs = script_list_offset + script_off;
+        SpanReader sc(data.subspan(script_abs));
+        uint16_t default_lang_off = sc.read_u16();
+        uint16_t lang_count = sc.read_u16();
+
+        uint16_t chosen_lang_off = 0;
+        if (lang_tag != 0) {
+            for (uint16_t i = 0; i < lang_count; ++i) {
+                if (!sc.can_read(6)) break;
+                uint32_t lt = sc.read_u32();
+                uint16_t lo = sc.read_u16();
+                if (lt == lang_tag) {
+                    chosen_lang_off = lo;
+                    break;
+                }
+            }
+        }
+        if (chosen_lang_off == 0) {
+            chosen_lang_off = default_lang_off;
+        }
+        if (chosen_lang_off == 0 || script_abs + chosen_lang_off + 6u > data.size()) return indices;
+
+        SpanReader lr(data.subspan(script_abs + chosen_lang_off));
+        lr.skip(2); // lookupOrderOffset (reserved)
+        uint16_t req_feat_idx = lr.read_u16();
+        uint16_t feat_idx_count = lr.read_u16();
+        if (req_feat_idx != 0xFFFFu) {
+            indices.push_back(req_feat_idx);
+        }
+        indices.reserve(indices.size() + feat_idx_count);
+        for (uint16_t i = 0; i < feat_idx_count; ++i) {
+            if (!lr.can_read(2)) break;
+            indices.push_back(lr.read_u16());
+        }
+        return indices;
+    }
+
+    struct ResolvedLookup {
+        uint16_t lookup_index{0};
+        uint32_t value{1};
+    };
+
+    std::vector<ResolvedLookup> get_lookups_for_script_features(
+        std::span<const FontFeature> requested_features,
+        uint32_t script_tag,
+        uint32_t lang_tag
+    ) const {
+        std::vector<ResolvedLookup> result;
+        if (feature_list_offset + 2u > data.size()) return result;
+
+        SpanReader fr_hdr(data.subspan(feature_list_offset));
+        uint16_t feature_count = fr_hdr.read_u16();
+        if (feature_count == 0) return result;
+
+        std::vector<uint16_t> allowed_indices;
+        if (script_tag != 0 || lang_tag != 0) {
+            allowed_indices = get_langsys_feature_indices(script_tag, lang_tag);
+        }
+        const bool filter_by_script = !allowed_indices.empty();
+
+        auto find_requested_value = [&](uint32_t tag) -> std::optional<uint32_t> {
+            for (const auto& f : requested_features) {
+                if (f.tag == tag) return f.value;
+            }
+            return std::nullopt;
+        };
+
+        auto add_feature_record = [&](uint16_t feat_idx) {
+            if (feat_idx >= feature_count) return;
+            const size_t rec_off = feature_list_offset + 2u + static_cast<size_t>(feat_idx) * 6u;
+            if (rec_off + 6u > data.size()) return;
+            const uint32_t tag = read_u32_be(data.data() + rec_off);
+            const uint16_t feat_offset = read_u16_be(data.data() + rec_off + 4u);
+
+            auto req_val = find_requested_value(tag);
+            if (!req_val.has_value() || *req_val == 0) return;
+
+            if (feature_list_offset + feat_offset + 4u <= data.size()) {
+                SpanReader tr(data.subspan(feature_list_offset + feat_offset));
+                tr.skip(2); // featureParams
+                uint16_t count = tr.read_u16();
+                for (uint16_t k = 0; k < count; ++k) {
+                    if (!tr.can_read(2)) break;
+                    uint16_t l_idx = tr.read_u16();
+                    bool exists = false;
+                    for (const auto& existing : result) {
+                        if (existing.lookup_index == l_idx) { exists = true; break; }
+                    }
+                    if (!exists) {
+                        result.push_back(ResolvedLookup{l_idx, *req_val});
+                    }
+                }
+            }
+        };
+
+        if (filter_by_script) {
+            for (uint16_t feat_idx : allowed_indices) {
+                add_feature_record(feat_idx);
+            }
+        } else {
+            for (uint16_t feat_idx = 0; feat_idx < feature_count; ++feat_idx) {
+                add_feature_record(feat_idx);
+            }
+        }
+
+        std::sort(result.begin(), result.end(), [](const ResolvedLookup& a, const ResolvedLookup& b) {
+            return a.lookup_index < b.lookup_index;
+        });
+        return result;
+    }
+
     std::vector<uint16_t> get_lookups_for_features(std::span<const uint32_t> requested_tags) const {
         std::vector<uint16_t> lookup_indices;
         if (feature_list_offset + 2u > data.size()) return lookup_indices;
@@ -333,7 +475,7 @@ struct OpenTypeGsub::Impl {
         return glyph_id;
     }
 
-    void apply_lookup(uint16_t lookup_idx, std::vector<uint16_t>& glyphs, int depth = 0) const {
+    void apply_lookup(uint16_t lookup_idx, std::vector<uint16_t>& glyphs, int depth = 0, uint32_t feature_value = 1) const {
         if (depth > 4 || lookup_list_offset >= data.size()) return;
         SpanReader lr(data.subspan(lookup_list_offset));
         uint16_t total_lookups = lr.read_u16();
@@ -416,7 +558,7 @@ struct OpenTypeGsub::Impl {
                     }
                     i += glyph_count - 1;
                 }
-            } else if (effective_type == 3) { // Alternate Substitution (use first alternate)
+            } else if (effective_type == 3) { // Alternate Substitution (1-based feature_value index)
                 uint16_t subst_format = sr.read_u16();
                 if (subst_format != 1) continue;
                 uint16_t cov_offset = sr.read_u16();
@@ -432,7 +574,12 @@ struct OpenTypeGsub::Impl {
                     if (alt_offset + 4u <= sub_span.size()) {
                         uint16_t alt_count = read_u16_be(sub_span.data() + alt_offset);
                         if (alt_count > 0) {
-                            g = read_u16_be(sub_span.data() + alt_offset + 2);
+                            const uint32_t alt_idx = (feature_value > 0 && feature_value <= alt_count)
+                                ? (feature_value - 1u)
+                                : 0u;
+                            if (alt_offset + 2u + (alt_idx + 1u) * 2u <= sub_span.size()) {
+                                g = read_u16_be(sub_span.data() + alt_offset + 2u + alt_idx * 2u);
+                            }
                         }
                     }
                 }
@@ -546,6 +693,56 @@ bool OpenTypeGsub::apply_features(std::vector<uint16_t>& glyphs, std::span<const
     return true;
 }
 
+bool OpenTypeGsub::apply_features_for_script(
+    std::vector<uint16_t>& glyphs,
+    std::span<const FontFeature> features,
+    uint32_t script_tag,
+    uint32_t lang_tag
+) const {
+    if (!is_valid_ || !impl_ || glyphs.empty() || features.empty()) return false;
+    auto lookups = impl_->get_lookups_for_script_features(features, script_tag, lang_tag);
+    if (lookups.empty()) return false;
+    for (const auto& rl : lookups) {
+        impl_->apply_lookup(rl.lookup_index, glyphs, 0, rl.value);
+    }
+    return true;
+}
+
+uint32_t OpenTypeGsub::bcp47_to_ot_lang_tag(std::string_view bcp47_locale) noexcept {
+    if (bcp47_locale.empty()) return 0;
+    std::string norm;
+    norm.reserve(bcp47_locale.size());
+    for (char c : bcp47_locale) {
+        if (c == '_') norm.push_back('-');
+        else if (c >= 'A' && c <= 'Z') norm.push_back(static_cast<char>(c - 'A' + 'a'));
+        else norm.push_back(c);
+    }
+    if (norm.starts_with("zh-hant") || norm.starts_with("zh-tw") || norm.starts_with("zh-hk") || norm.starts_with("zh-mo")) {
+        return make_tag('Z', 'H', 'T', ' ');
+    }
+    if (norm.starts_with("zh")) return make_tag('Z', 'H', 'S', ' ');
+    if (norm.starts_with("ja")) return make_tag('J', 'A', 'N', ' ');
+    if (norm.starts_with("ko")) return make_tag('K', 'O', 'R', ' ');
+    if (norm.starts_with("ur")) return make_tag('U', 'R', 'D', ' ');
+    if (norm.starts_with("fa")) return make_tag('F', 'A', 'R', ' ');
+    if (norm.starts_with("ar")) return make_tag('A', 'R', 'A', ' ');
+    if (norm.starts_with("he") || norm.starts_with("iw")) return make_tag('I', 'W', 'R', ' ');
+    if (norm.starts_with("ro")) return make_tag('R', 'O', 'M', ' ');
+    if (norm.starts_with("mo")) return make_tag('M', 'O', 'L', ' ');
+    if (norm.starts_with("ca")) return make_tag('C', 'A', 'T', ' ');
+    if (norm.starts_with("tr")) return make_tag('T', 'R', 'K', ' ');
+    if (norm.starts_with("az")) return make_tag('A', 'Z', 'E', ' ');
+    if (norm.starts_with("sr")) return make_tag('S', 'R', 'B', ' ');
+    if (norm.starts_with("bg")) return make_tag('B', 'G', 'R', ' ');
+    if (norm.starts_with("ru")) return make_tag('R', 'U', 'S', ' ');
+    if (norm.starts_with("de")) return make_tag('D', 'E', 'U', ' ');
+    if (norm.starts_with("fr")) return make_tag('F', 'R', 'A', ' ');
+    if (norm.starts_with("nl")) return make_tag('N', 'L', 'D', ' ');
+    if (norm.starts_with("pl")) return make_tag('P', 'L', 'K', ' ');
+    if (norm.starts_with("en")) return make_tag('E', 'N', 'G', ' ');
+    return 0;
+}
+
 bool OpenTypeGsub::apply_ligatures(std::vector<uint16_t>& glyphs) const {
     const uint32_t standard_features[] = {
         make_tag('r', 'l', 'i', 'g'),
@@ -556,13 +753,19 @@ bool OpenTypeGsub::apply_ligatures(std::vector<uint16_t>& glyphs) const {
     return apply_features(glyphs, standard_features);
 }
 
-uint16_t OpenTypeGsub::apply_single_glyph_feature(uint16_t glyph_id, uint32_t feature_tag) const noexcept {
-    if (!is_valid_ || !impl_ || glyph_id == 0) return glyph_id;
-    const uint32_t tags[1] = { feature_tag };
-    auto lookups = impl_->get_lookups_for_features(tags);
+uint16_t OpenTypeGsub::apply_single_glyph_feature(
+    uint16_t glyph_id,
+    uint32_t feature_tag,
+    uint32_t script_tag,
+    uint32_t lang_tag,
+    uint32_t feature_value
+) const noexcept {
+    if (!is_valid_ || !impl_ || glyph_id == 0 || feature_value == 0) return glyph_id;
+    const FontFeature feats[1] = { FontFeature{feature_tag, feature_value} };
+    auto lookups = impl_->get_lookups_for_script_features(feats, script_tag, lang_tag);
     uint16_t cur = glyph_id;
-    for (uint16_t l_idx : lookups) {
-        uint16_t next = impl_->apply_single_on_glyph(l_idx, cur);
+    for (const auto& rl : lookups) {
+        uint16_t next = impl_->apply_single_on_glyph(rl.lookup_index, cur);
         if (next != cur) return next;
     }
     return cur;

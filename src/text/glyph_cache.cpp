@@ -13,7 +13,9 @@ const CachedGlyph* GlyphCache::get_or_render(
     float x,
     float y,
     bool synthetic_bold,
-    bool synthetic_italic
+    bool synthetic_italic,
+    std::span<const FontVariation> variations,
+    uint64_t variation_hash
 ) {
     auto [int_x, x_bin] = compute_subpixel_bin(x);
     auto [int_y, y_bin] = compute_subpixel_bin(y);
@@ -22,7 +24,7 @@ const CachedGlyph* GlyphCache::get_or_render(
     std::memcpy(&size_bits, &font_size, sizeof(float));
 
     uint8_t sflags = (synthetic_bold ? 1u : 0u) | (synthetic_italic ? 2u : 0u);
-    CacheKey key{font_id, glyph_id, size_bits, x_bin, y_bin, sflags};
+    CacheKey key{font_id, glyph_id, size_bits, x_bin, y_bin, sflags, variation_hash};
 
     auto it = cache_.find(key);
     if (it != cache_.end()) {
@@ -35,9 +37,14 @@ const CachedGlyph* GlyphCache::get_or_render(
 
     // Rasterize outline
     Path glyph_path;
-    bool ok = (sflags == 0)
-        ? font.get_glyph_path(glyph_id, glyph_path, font_size)
-        : font.get_glyph_path_styled(glyph_id, glyph_path, font_size, synthetic_bold, synthetic_italic);
+    bool ok = false;
+    if (!variations.empty() && font.is_variable_font()) {
+        ok = font.get_glyph_path_varied(glyph_id, glyph_path, font_size, variations, synthetic_bold, synthetic_italic);
+    } else {
+        ok = (sflags == 0)
+            ? font.get_glyph_path(glyph_id, glyph_path, font_size)
+            : font.get_glyph_path_styled(glyph_id, glyph_path, font_size, synthetic_bold, synthetic_italic);
+    }
 
     if (!ok || glyph_path.is_empty()) {
         CachedGlyph empty_glyph{0, 0, 0, 0, {}};

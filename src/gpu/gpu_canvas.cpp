@@ -390,6 +390,15 @@ void GpuCanvas::clear(nisaba::Color color) {
     ensure_frame();
 }
 
+bool GpuCanvas::resize(uint32_t width, uint32_t height) {
+    if (!surface_ || !surface_->resize_screen(width, height)) {
+        return false;
+    }
+    scissor_clip_ = ScreenIntRect::from_xywh(0, 0, width, height);
+    invalidate_backdrop_cache();
+    return true;
+}
+
 void GpuCanvas::save() {
     if (context_) context_->save();
     state_stack_.push_back(GpuCanvasState{
@@ -1919,15 +1928,277 @@ void GpuCanvas::draw_text(float x, float y, std::string_view text, const nisaba:
 void GpuCanvas::draw_text_buffer(const text::Buffer& buffer, text::FontSystem& fonts, Point pos, nisaba::Color default_color) {
     if (!context_) return;
     ensure_frame();
-    context_->drawTextBuffer(buffer, fonts, pos, default_color);
+
+    bool need_shaping = false;
+    for (const auto& line : buffer.lines()) {
+        if (!line.is_shaped()) {
+            need_shaping = true;
+            break;
+        }
+    }
+    if (need_shaping) {
+        const_cast<text::Buffer&>(buffer).shape_until_scroll(fonts);
+    }
+
+    auto runs = buffer.layout_runs();
+    if (runs.empty()) return;
+
+    bool has_rich_bg = false;
+    bool has_rich_fg = false;
+    for (const auto& run : runs) {
+        for (const auto& g : run.glyphs) {
+            if (g.background_paint_opt != nullptr) has_rich_bg = true;
+            if (!g.is_placeholder && g.foreground_paint_opt != nullptr &&
+                text::paint_requires_vector_path(*g.foreground_paint_opt)) {
+                has_rich_fg = true;
+            }
+        }
+    }
+
+    if (!has_rich_bg && !has_rich_fg) {
+        context_->drawTextBuffer(buffer, fonts, pos, default_color);
+        return;
+    }
+
+    // Pass 1: Span-merged backgrounds (handles both rich Paint and solid TextColor)
+    for (const auto& run : runs) {
+        if (run.line_height <= 0.0f) continue;
+        bool bg_active = false;
+        float bg_x0 = 0.0f, bg_x1 = 0.0f;
+        const nisaba::Paint* bg_paint_ptr = nullptr;
+        bool bg_has_solid = false;
+        text::TextColor bg_solid{};
+
+        auto flush_bg = [&]() {
+            if (!bg_active || bg_x1 <= bg_x0) return;
+            if (auto r = nisaba::Rect::from_xywh(bg_x0, pos.y + run.line_top, bg_x1 - bg_x0, run.line_height)) {
+                if (bg_paint_ptr != nullptr) {
+                    fill_rect(*r, *bg_paint_ptr);
+                } else if (bg_has_solid) {
+                    fill_rect(*r, nisaba::Paint(bg_solid.to_color()));
+                }
+            }
+            bg_active = false;
+            bg_paint_ptr = nullptr;
+            bg_has_solid = false;
+        };
+
+        for (const auto& glyph : run.glyphs) {
+            if (glyph.is_mark && glyph.w <= 0.0f) continue;
+            const bool has_bg = (glyph.background_paint_opt != nullptr || glyph.background_color_opt.has_value()) && glyph.w > 0.0f;
+            if (!has_bg) {
+                flush_bg();
+                continue;
+            }
+            const float gx0 = pos.x + glyph.x;
+            const float gx1 = pos.x + glyph.x + glyph.w;
+            const nisaba::Paint* gp = glyph.background_paint_opt.get();
+            const bool g_has_solid = (gp == nullptr && glyph.background_color_opt.has_value());
+            const text::TextColor gs = g_has_solid ? *glyph.background_color_opt : text::TextColor{};
+            if (!bg_active) {
+                bg_active = true;
+                bg_x0 = gx0;
+                bg_x1 = gx1;
+                bg_paint_ptr = gp;
+                bg_has_solid = g_has_solid;
+                bg_solid = gs;
+            } else if (gx0 <= bg_x1 + 1.5f && gx1 >= bg_x0 - 1.5f &&
+                       bg_paint_ptr == gp && bg_has_solid == g_has_solid && (!g_has_solid || bg_solid == gs)) {
+                bg_x0 = std::min(bg_x0, gx0);
+                bg_x1 = std::max(bg_x1, gx1);
+            } else {
+                flush_bg();
+                bg_active = true;
+                bg_x0 = gx0;
+                bg_x1 = gx1;
+                bg_paint_ptr = gp;
+                bg_has_solid = g_has_solid;
+                bg_solid = gs;
+            }
+        }
+        flush_bg();
+    }
+
+    // Pass 1.5 + 2a: Shadows and solid-color glyphs via GlyphAtlas batch
+    context_->drawTextBuffer(buffer, fonts, pos, default_color, 0x02u | 0x04u);
+
+    // Pass 2b: Rich Paint foreground glyphs via GPU vector path pipeline
+    if (has_rich_fg) {
+        std::vector<text::ColorGlyphLayer> color_layers;
+        for (const auto& run : runs) {
+            const float baseline_offset = (run.max_ascent > 0.0f) ? run.max_ascent : buffer.metrics().font_size;
+            const float line_baseline = pos.y + run.line_top + baseline_offset;
+            for (const auto& glyph : run.glyphs) {
+                if (glyph.is_placeholder || glyph.glyph_id == 0 || !glyph.foreground_paint_opt) continue;
+                const nisaba::Paint& fg_paint = *glyph.foreground_paint_opt;
+                if (!text::paint_requires_vector_path(fg_paint)) continue;
+                const text::TtfFont* font = fonts.get_font(glyph.font_id);
+                if (!font && fonts.default_font_id()) {
+                    font = fonts.get_font(*fonts.default_font_id());
+                }
+                if (!font) continue;
+
+                const float gx = pos.x + glyph.x + glyph.x_offset;
+                const float gy = line_baseline + glyph.y + glyph.y_offset;
+                const nisaba::Stroke stroke = glyph.foreground_stroke_opt
+                    ? *glyph.foreground_stroke_opt
+                    : nisaba::Stroke(fg_paint.get_stroke_width());
+                const std::span<const text::FontVariation> vars = glyph.variation_coords_opt
+                    ? std::span<const text::FontVariation>(*glyph.variation_coords_opt)
+                    : std::span<const text::FontVariation>{};
+
+                if (font->has_color_glyphs() && font->get_color_glyph_layers(glyph.glyph_id, color_layers)) {
+                    for (const auto& layer : color_layers) {
+                        nisaba::Path lpath;
+                        const bool ok = (!vars.empty() && font->is_variable_font())
+                            ? font->get_glyph_path_varied(layer.glyph_id, lpath, glyph.font_size, vars,
+                                                          glyph.synthetic_bold, glyph.synthetic_italic)
+                            : font->get_glyph_path_styled(layer.glyph_id, lpath, glyph.font_size,
+                                                          glyph.synthetic_bold, glyph.synthetic_italic);
+                        if (!ok) continue;
+                        lpath.apply_transform(nisaba::Transform::from_translate(gx, gy));
+                        if (layer.use_foreground) {
+                            draw_path(lpath, fg_paint, stroke, nisaba::FillRule::Winding);
+                        } else {
+                            nisaba::Paint lp(layer.color.to_color());
+                            lp.blend_mode = fg_paint.blend_mode;
+                            fill_path(lpath, lp, nisaba::FillRule::Winding);
+                        }
+                    }
+                    continue;
+                }
+
+                nisaba::Path gpath;
+                const bool ok = (!vars.empty() && font->is_variable_font())
+                    ? font->get_glyph_path_varied(glyph.glyph_id, gpath, glyph.font_size, vars,
+                                                  glyph.synthetic_bold, glyph.synthetic_italic)
+                    : font->get_glyph_path_styled(glyph.glyph_id, gpath, glyph.font_size,
+                                                  glyph.synthetic_bold, glyph.synthetic_italic);
+                if (!ok) continue;
+                gpath.apply_transform(nisaba::Transform::from_translate(gx, gy));
+                draw_path(gpath, fg_paint, stroke, nisaba::FillRule::Winding);
+            }
+        }
+    }
+
+    // Pass 3: Decorations on top (with DecorationMode::Gaps)
+    context_->drawTextBuffer(buffer, fonts, pos, default_color, 0x08u);
 }
 
 void GpuCanvas::draw_text_buffer(const text::Buffer& buffer, text::FontSystem& fonts, Point pos, const nisaba::Paint& paint) {
     if (!context_) return;
     ensure_frame();
-    ScopedBlendMode scopedBlend(context_.get(), paint.blend_mode);
-    apply_fill_paint(paint);
-    context_->drawTextBuffer(buffer, fonts, pos, paint.shader.solid_color());
+
+    if (!text::paint_requires_vector_path(paint)) {
+        draw_text_buffer(buffer, fonts, pos, paint.shader.solid_color());
+        return;
+    }
+
+    bool need_shaping = false;
+    for (const auto& line : buffer.lines()) {
+        if (!line.is_shaped()) {
+            need_shaping = true;
+            break;
+        }
+    }
+    if (need_shaping) {
+        const_cast<text::Buffer&>(buffer).shape_until_scroll(fonts);
+    }
+
+    auto runs = buffer.layout_runs();
+    if (runs.empty()) return;
+
+    const nisaba::Color fallback_color = paint.is_solid_color() ? paint.shader.solid_color() : nisaba::Color::WHITE;
+
+    // Pass 1: Span-merged backgrounds
+    for (const auto& run : runs) {
+        if (run.line_height <= 0.0f) continue;
+        bool bg_active = false;
+        float bg_x0 = 0.0f, bg_x1 = 0.0f;
+        const nisaba::Paint* bg_paint_ptr = nullptr;
+        bool bg_has_solid = false;
+        text::TextColor bg_solid{};
+        auto flush_bg = [&]() {
+            if (!bg_active || bg_x1 <= bg_x0) return;
+            if (auto r = nisaba::Rect::from_xywh(bg_x0, pos.y + run.line_top, bg_x1 - bg_x0, run.line_height)) {
+                if (bg_paint_ptr != nullptr) fill_rect(*r, *bg_paint_ptr);
+                else if (bg_has_solid) fill_rect(*r, nisaba::Paint(bg_solid.to_color()));
+            }
+            bg_active = false;
+            bg_paint_ptr = nullptr;
+            bg_has_solid = false;
+        };
+        for (const auto& glyph : run.glyphs) {
+            if (glyph.is_mark && glyph.w <= 0.0f) continue;
+            const bool has_bg = (glyph.background_paint_opt != nullptr || glyph.background_color_opt.has_value()) && glyph.w > 0.0f;
+            if (!has_bg) { flush_bg(); continue; }
+            const float gx0 = pos.x + glyph.x;
+            const float gx1 = pos.x + glyph.x + glyph.w;
+            const nisaba::Paint* gp = glyph.background_paint_opt.get();
+            const bool g_has_solid = (gp == nullptr && glyph.background_color_opt.has_value());
+            const text::TextColor gs = g_has_solid ? *glyph.background_color_opt : text::TextColor{};
+            if (!bg_active) {
+                bg_active = true; bg_x0 = gx0; bg_x1 = gx1; bg_paint_ptr = gp; bg_has_solid = g_has_solid; bg_solid = gs;
+            } else if (gx0 <= bg_x1 + 1.5f && gx1 >= bg_x0 - 1.5f &&
+                       bg_paint_ptr == gp && bg_has_solid == g_has_solid && (!g_has_solid || bg_solid == gs)) {
+                bg_x0 = std::min(bg_x0, gx0); bg_x1 = std::max(bg_x1, gx1);
+            } else {
+                flush_bg();
+                bg_active = true; bg_x0 = gx0; bg_x1 = gx1; bg_paint_ptr = gp; bg_has_solid = g_has_solid; bg_solid = gs;
+            }
+        }
+        flush_bg();
+    }
+
+    // Pass 1.5: Shadows
+    context_->drawTextBuffer(buffer, fonts, pos, fallback_color, 0x02u);
+
+    // Pass 2: Glyphs (span Paint overrides default Paint; span solid TextColor uses solid fill)
+    std::vector<text::ColorGlyphLayer> color_layers;
+    for (const auto& run : runs) {
+        const float baseline_offset = (run.max_ascent > 0.0f) ? run.max_ascent : buffer.metrics().font_size;
+        const float line_baseline = pos.y + run.line_top + baseline_offset;
+        for (const auto& glyph : run.glyphs) {
+            if (glyph.is_placeholder || glyph.glyph_id == 0) continue;
+            const text::TtfFont* font = fonts.get_font(glyph.font_id);
+            if (!font && fonts.default_font_id()) font = fonts.get_font(*fonts.default_font_id());
+            if (!font) continue;
+
+            const float gx = pos.x + glyph.x + glyph.x_offset;
+            const float gy = line_baseline + glyph.y + glyph.y_offset;
+
+            nisaba::Paint solid_span_paint;
+            const nisaba::Paint* active_paint = nullptr;
+            if (glyph.foreground_paint_opt) {
+                active_paint = glyph.foreground_paint_opt.get();
+            } else if (glyph.color_opt.has_value()) {
+                solid_span_paint.set_color(glyph.color_opt->to_color());
+                active_paint = &solid_span_paint;
+            } else {
+                active_paint = &paint;
+            }
+
+            const nisaba::Stroke stroke = glyph.foreground_stroke_opt
+                ? *glyph.foreground_stroke_opt
+                : nisaba::Stroke(active_paint->get_stroke_width());
+            const std::span<const text::FontVariation> vars = glyph.variation_coords_opt
+                ? std::span<const text::FontVariation>(*glyph.variation_coords_opt)
+                : std::span<const text::FontVariation>{};
+
+            nisaba::Path gpath;
+            const bool ok = (!vars.empty() && font->is_variable_font())
+                ? font->get_glyph_path_varied(glyph.glyph_id, gpath, glyph.font_size, vars,
+                                              glyph.synthetic_bold, glyph.synthetic_italic)
+                : font->get_glyph_path_styled(glyph.glyph_id, gpath, glyph.font_size,
+                                              glyph.synthetic_bold, glyph.synthetic_italic);
+            if (!ok) continue;
+            gpath.apply_transform(nisaba::Transform::from_translate(gx, gy));
+            draw_path(gpath, *active_paint, stroke, nisaba::FillRule::Winding);
+        }
+    }
+
+    // Pass 3: Decorations
+    context_->drawTextBuffer(buffer, fonts, pos, fallback_color, 0x08u);
 }
 
 int GpuCanvas::create_font(const char* name, const char* filename) {
