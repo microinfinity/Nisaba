@@ -10,9 +10,11 @@
 #include "nisaba/path/path.hpp"
 #include "nisaba/path/stroker.hpp"
 #include "nisaba/shaders/shader.hpp"
+#include "nisaba/math/rect.hpp"
 
 #include <vector>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -38,6 +40,10 @@ public:
     virtual void collect_geometry(float frame, Path& out_path) const { (void)frame; (void)out_path; }
     virtual void modify_paths(float frame, std::vector<Path>& paths) const { (void)frame; (void)paths; }
     virtual void render(RenderContext& ctx, float frame) const { (void)ctx; (void)frame; }
+    [[nodiscard]] virtual std::optional<Rect> compute_bounds(float frame) const;
+    [[nodiscard]] virtual uint64_t visual_fingerprint(float frame) const noexcept;
+    [[nodiscard]] virtual size_t count_animators() const noexcept { return is_animated() ? 1 : 0; }
+    void bind_expression_manager(ExpressionManager& mgr);
 
     static std::shared_ptr<LottieShapeItem> parse(const json::JsonValue& val);
 };
@@ -52,6 +58,9 @@ public:
     [[nodiscard]] bool is_animated() const noexcept override;
     void render(RenderContext& ctx, float frame) const override;
     void collect_geometry(float frame, Path& out_path) const override;
+    [[nodiscard]] std::optional<Rect> compute_bounds(float frame) const override;
+    [[nodiscard]] uint64_t visual_fingerprint(float frame) const noexcept override;
+    [[nodiscard]] size_t count_animators() const noexcept override;
 
     static std::shared_ptr<ShapeGroup> parse(const json::JsonValue& val);
 };
@@ -370,5 +379,18 @@ public:
 
     [[nodiscard]] Path get_trimmed_path(float frame) const;
 };
+
+/// Evaluates and renders a flat list of Lottie shape items (used by both ShapeGroup and root ShapeLayer).
+void render_shape_items(
+    const std::vector<std::shared_ptr<LottieShapeItem>>& items,
+    RenderContext& ctx,
+    float frame
+);
+
+/// Computes tight bounds of a flat list of Lottie shape items (handling repeaters, modifiers, and stroke pads).
+[[nodiscard]] std::optional<Rect> compute_shape_items_bounds(
+    const std::vector<std::shared_ptr<LottieShapeItem>>& items,
+    float frame
+);
 
 } // namespace nisaba::lottie

@@ -1,7 +1,8 @@
 /// @file showcase_lottie.cpp
-/// @brief Live interactive 60 FPS native window showcase of Nisaba's 100% sovereign Lottie vector engine.
+/// @brief Interactive CPU Software-Rasterized 3x2 Bento Showcase of Nisaba Lottie Engine (Phases 1-4).
 
 #include "nisaba/nisaba.hpp"
+#include "lottie_showcase_scenes.hpp"
 
 #ifdef NISABA_HAS_BACKEND_OS
 #  include "nisaba/backend_os/platform.hpp"
@@ -15,28 +16,35 @@
 #  endif
 #endif
 
-#include <iostream>
-#include <fstream>
-#include <vector>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
-#include <iomanip>
-#include <sstream>
-#include <cstring>
-#include <algorithm>
+#include <vector>
 
 using namespace nisaba;
 using namespace nisaba::lottie;
 using namespace nisaba::effects;
 using namespace nisaba::text;
 using namespace nisaba::vspr;
+using namespace nisaba::showcase;
 
 namespace {
 
-constexpr uint32_t WIN_WIDTH = 1280;
-constexpr uint32_t WIN_HEIGHT = 760;
+constexpr uint32_t WIN_WIDTH = 1340;
+constexpr uint32_t WIN_HEIGHT = 780;
+constexpr float MARGIN_X = 36.0f;
+constexpr float GAP_X = 16.0f;
+constexpr float CARD_W = 412.0f;
+constexpr float CARD_H = 290.0f;
+constexpr float ROW0_Y = 102.0f;
+constexpr float ROW1_Y = 408.0f;
 
 std::string resolve_font(std::string_view filename) {
     std::vector<std::string> candidates = {
@@ -51,223 +59,6 @@ std::string resolve_font(std::string_view filename) {
     return candidates[0];
 }
 
-// 1. Loading Spinner Lottie JSON (Rotating dashed arc)
-constexpr std::string_view SPINNER_LOTTIE = R"({
-    "v": "5.7.4", "fr": 60, "ip": 0, "op": 60, "w": 200, "h": 200, "nm": "Spinner",
-    "layers": [
-        {
-            "ind": 1, "ty": 4, "nm": "Ring", "ip": 0, "op": 60, "st": 0,
-            "ks": {
-                "o": {"a": 0, "k": 100},
-                "r": {
-                    "a": 1,
-                    "k": [
-                        {"t": 0, "s": [0], "e": [360], "o": {"x": 0.4, "y": 0.0}, "i": {"x": 0.6, "y": 1.0}},
-                        {"t": 60, "s": [360]}
-                    ]
-                },
-                "p": {"a": 0, "k": [100, 100]},
-                "a": {"a": 0, "k": [0, 0]},
-                "s": {"a": 0, "k": [100, 100]}
-            },
-            "shapes": [
-                {
-                    "ty": "gr", "nm": "Circle",
-                    "it": [
-                        {
-                            "ty": "el", "nm": "Ellipse",
-                            "p": {"a": 0, "k": [0, 0]},
-                            "s": {"a": 0, "k": [120, 120]}
-                        },
-                        {
-                            "ty": "tm", "nm": "Trim",
-                            "s": {"a": 0, "k": 10},
-                            "e": {
-                                "a": 1,
-                                "k": [
-                                    {"t": 0, "s": [20], "e": [85]},
-                                    {"t": 30, "s": [85], "e": [20]},
-                                    {"t": 60, "s": [20]}
-                                ]
-                            },
-                            "o": {"a": 0, "k": 0},
-                            "m": 1
-                        },
-                        {
-                            "ty": "st", "nm": "Stroke",
-                            "c": {"a": 0, "k": [0.0, 0.85, 1.0, 1.0]},
-                            "o": {"a": 0, "k": 100},
-                            "w": {"a": 0, "k": 14},
-                            "lc": 2, "lj": 2
-                        },
-                        {
-                            "ty": "tr", "p": {"a": 0, "k": [0, 0]}, "a": {"a": 0, "k": [0, 0]},
-                            "s": {"a": 0, "k": [100, 100]}, "r": {"a": 0, "k": 0}, "o": {"a": 0, "k": 100}
-                        }
-                    ]
-                }
-            ]
-        }
-    ]
-})";
-
-// 2. Success Checkmark with Circle Pop Lottie JSON
-constexpr std::string_view CHECKMARK_LOTTIE = R"({
-    "v": "5.7.4", "fr": 60, "ip": 0, "op": 60, "w": 200, "h": 200, "nm": "Checkmark",
-    "layers": [
-        {
-            "ind": 1, "ty": 4, "nm": "Check", "ip": 15, "op": 60, "st": 0,
-            "ks": {
-                "o": {"a": 0, "k": 100}, "r": {"a": 0, "k": 0},
-                "p": {"a": 0, "k": [100, 100]}, "a": {"a": 0, "k": [0, 0]},
-                "s": {"a": 0, "k": [100, 100]}
-            },
-            "shapes": [
-                {
-                    "ty": "gr", "nm": "CheckPath",
-                    "it": [
-                        {
-                            "ty": "sh", "nm": "Tick",
-                            "ks": {
-                                "a": 0,
-                                "k": {
-                                    "c": false,
-                                    "v": [[-35, 5], [-10, 30], [40, -25]],
-                                    "i": [[0, 0], [0, 0], [0, 0]],
-                                    "o": [[0, 0], [0, 0], [0, 0]]
-                                }
-                            }
-                        },
-                        {
-                            "ty": "tm", "nm": "Trim",
-                            "s": {"a": 0, "k": 0},
-                            "e": {
-                                "a": 1,
-                                "k": [
-                                    {"t": 15, "s": [0], "e": [100], "o": {"x": 0.2, "y": 0.0}, "i": {"x": 0.2, "y": 1.0}},
-                                    {"t": 45, "s": [100]}
-                                ]
-                            },
-                            "o": {"a": 0, "k": 0}, "m": 1
-                        },
-                        {
-                            "ty": "st", "nm": "Stroke",
-                            "c": {"a": 0, "k": [0.0, 1.0, 0.6, 1.0]},
-                            "o": {"a": 0, "k": 100},
-                            "w": {"a": 0, "k": 12},
-                            "lc": 2, "lj": 2
-                        },
-                        {
-                            "ty": "tr", "p": {"a": 0, "k": [0, 0]}, "a": {"a": 0, "k": [0, 0]},
-                            "s": {"a": 0, "k": [100, 100]}, "r": {"a": 0, "k": 0}, "o": {"a": 0, "k": 100}
-                        }
-                    ]
-                }
-            ]
-        },
-        {
-            "ind": 2, "ty": 4, "nm": "CircleBg", "ip": 0, "op": 60, "st": 0,
-            "ks": {
-                "o": {"a": 0, "k": 100}, "r": {"a": 0, "k": 0},
-                "p": {"a": 0, "k": [100, 100]}, "a": {"a": 0, "k": [0, 0]},
-                "s": {
-                    "a": 1,
-                    "k": [
-                        {"t": 0, "s": [0, 0], "e": [115, 115], "o": {"x": 0.175, "y": 0.885}, "i": {"x": 0.32, "y": 1.275}},
-                        {"t": 25, "s": [115, 115], "e": [100, 100]},
-                        {"t": 40, "s": [100, 100]}
-                    ]
-                }
-            },
-            "shapes": [
-                {
-                    "ty": "gr", "nm": "CircleGroup",
-                    "it": [
-                        {
-                            "ty": "el", "nm": "Circle",
-                            "p": {"a": 0, "k": [0, 0]},
-                            "s": {"a": 0, "k": [130, 130]}
-                        },
-                        {
-                            "ty": "st", "nm": "RingStroke",
-                            "c": {"a": 0, "k": [0.0, 1.0, 0.6, 0.4]},
-                            "o": {"a": 0, "k": 100},
-                            "w": {"a": 0, "k": 6}
-                        },
-                        {
-                            "ty": "fl", "nm": "CircleFill",
-                            "c": {"a": 0, "k": [0.05, 0.25, 0.18, 0.8]},
-                            "o": {"a": 0, "k": 100}
-                        },
-                        {
-                            "ty": "tr", "p": {"a": 0, "k": [0, 0]}, "a": {"a": 0, "k": [0, 0]},
-                            "s": {"a": 0, "k": [100, 100]}, "r": {"a": 0, "k": 0}, "o": {"a": 0, "k": 100}
-                        }
-                    ]
-                }
-            ]
-        }
-    ]
-})";
-
-// 3. Pulsing Heart Lottie JSON
-constexpr std::string_view HEART_LOTTIE = R"({
-    "v": "5.7.4", "fr": 60, "ip": 0, "op": 60, "w": 200, "h": 200, "nm": "PulsingHeart",
-    "layers": [
-        {
-            "ind": 1, "ty": 4, "nm": "HeartLayer", "ip": 0, "op": 60, "st": 0,
-            "ks": {
-                "o": {"a": 0, "k": 100}, "r": {"a": 0, "k": 0},
-                "p": {"a": 0, "k": [100, 105]}, "a": {"a": 0, "k": [0, 0]},
-                "s": {
-                    "a": 1,
-                    "k": [
-                        {"t": 0, "s": [90, 90], "e": [125, 125]},
-                        {"t": 15, "s": [125, 125], "e": [95, 95]},
-                        {"t": 30, "s": [95, 95], "e": [120, 120]},
-                        {"t": 45, "s": [120, 120], "e": [90, 90]},
-                        {"t": 60, "s": [90, 90]}
-                    ]
-                }
-            },
-            "shapes": [
-                {
-                    "ty": "gr", "nm": "HeartShapeGroup",
-                    "it": [
-                        {
-                            "ty": "sh", "nm": "HeartPath",
-                            "ks": {
-                                "a": 0,
-                                "k": {
-                                    "c": true,
-                                    "v": [[0, 35], [-45, -5], [-25, -45], [0, -25], [25, -45], [45, -5]],
-                                    "i": [[20, 0], [-10, 20], [-15, 0], [-10, -10], [10, -10], [15, 0]],
-                                    "o": [[-20, 0], [10, -20], [10, 10], [10, -10], [15, 0], [-10, 20]]
-                                }
-                            }
-                        },
-                        {
-                            "ty": "fl", "nm": "Fill",
-                            "c": {"a": 0, "k": [1.0, 0.15, 0.35, 1.0]},
-                            "o": {"a": 0, "k": 100}
-                        },
-                        {
-                            "ty": "st", "nm": "GlowStroke",
-                            "c": {"a": 0, "k": [1.0, 0.4, 0.6, 0.7]},
-                            "o": {"a": 0, "k": 100},
-                            "w": {"a": 0, "k": 6}
-                        },
-                        {
-                            "ty": "tr", "p": {"a": 0, "k": [0, 0]}, "a": {"a": 0, "k": [0, 0]},
-                            "s": {"a": 0, "k": [100, 100]}, "r": {"a": 0, "k": 0}, "o": {"a": 0, "k": 100}
-                        }
-                    ]
-                }
-            ]
-        }
-    ]
-})";
-
 } // namespace
 
 int main(int argc, char** argv) {
@@ -277,203 +68,196 @@ int main(int argc, char** argv) {
         if (arg == "--headless") {
             run_headless = true;
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: showcase_lottie [options]\n\n"
-                      << "Options:\n"
-                      << "  --headless   Run in headless mode (no GUI window, saves PNG snapshot)\n"
-                      << "  --help, -h   Display this help message\n\n"
-                      << "Interactive Window Controls:\n"
-                      << "  [SPACE]      Play / Pause animations\n"
-                      << "  [R]          Restart all animations from frame 0\n"
-                      << "  [S]          Cycle speed (0.25x -> 0.5x -> 1.0x -> 2.0x)\n"
-                      << "  [L]          Toggle looping on/off\n"
-                      << "  [1 / 2 / 3]  Replay individual card (Spinner, Checkmark, Heart)\n"
-                      << "  [CLICK]      Click any card directly with mouse to replay\n"
-                      << "  [ESC] / [Q]  Exit showcase\n";
+            std::cout << "Usage: showcase_lottie [--headless]\n"
+                      << "Controls: [SPACE] Pause | [R] Restart | [S] Speed | [D] DirtyBox | [C] Handle | [E] ColorFX | [W] WipeFX | [F] DistortFX | [ESC] Exit\n";
             return 0;
         }
     }
 
-    std::cout << "========================================================\n"
-              << "   NISABA SOVEREIGN LOTTIE VECTOR ENGINE LIVE SHOWCASE\n"
-              << "========================================================\n";
+    std::cout << "====================================================================\n"
+              << "   NISABA LOTTIE FULL-CAPABILITY CPU SHOWCASE (PHASES 1 - 4)\n"
+              << "====================================================================\n";
 
-    // 1. Framebuffer allocation
     auto fb = Pixmap::create(WIN_WIDTH, WIN_HEIGHT);
     if (!fb) {
-        std::cerr << "[-] Error: Failed to allocate framebuffer." << std::endl;
+        std::cerr << "[-] Failed to allocate framebuffer.\n";
         return 1;
     }
     Canvas canvas(*fb);
 
-    // 2. Text rendering setup
-    FontSystem font_system;
-    font_system.load_font_file(resolve_font("Inter-Regular.ttf"));
-    font_system.load_font_file(resolve_font("FiraMono-Medium.ttf"));
-    GlyphCache cache;
+    auto font_system = std::make_shared<FontSystem>();
+    font_system->load_font_file(resolve_font("Inter-Regular.ttf"));
+    font_system->load_font_file(resolve_font("FiraMono-Medium.ttf"));
+    GlyphCache glyph_cache;
 
-    auto draw_text = [&](Canvas& c, float x, float y, std::string_view text, float font_size, float line_height,
-                         TextColor color, std::optional<float> max_w = std::nullopt) {
-        Buffer buf(Metrics(font_size, line_height));
-        if (max_w) buf.set_size(*max_w, std::nullopt);
-        buf.set_wrap(Wrap::Word);
+    auto draw_text = [&](Canvas& c, float x, float y, std::string_view txt, float sz, float lh, TextColor col) {
+        Buffer buf(Metrics(sz, lh));
         Attrs attrs;
-        attrs.set_color(color);
-        buf.set_text(text, attrs);
-        buf.draw(c, cache, font_system, Color::WHITE, x, y);
+        attrs.set_color(col);
+        buf.set_text(txt, attrs);
+        buf.draw(c, glyph_cache, *font_system, Color::WHITE, x, y);
     };
 
-    // 3. Pre-render Background Wallpaper
-    std::cout << "[*] Pre-rendering cosmic background environment..." << std::endl;
+    // Pre-render cosmic wallpaper + frosted BackdropBlurCache
     auto wallpaper = Pixmap::create(WIN_WIDTH, WIN_HEIGHT);
     {
-        Canvas wall_canvas(*wallpaper);
-        std::vector<GradientStop> bg_stops = {
-            GradientStop::create(0.0f, Color::from_rgba8(9, 12, 22, 255)),
-            GradientStop::create(0.5f, Color::from_rgba8(16, 20, 36, 255)),
-            GradientStop::create(1.0f, Color::from_rgba8(7, 9, 16, 255))
-        };
-        auto bg_grad = LinearGradient::create(Point::from_xy(0.0f, 0.0f), Point::from_xy(WIN_WIDTH, WIN_HEIGHT), bg_stops);
-        Paint bg_paint;
-        if (bg_grad) bg_paint.shader = Shader(*bg_grad);
-        wall_canvas.fill_rect(*Rect::from_xywh(0.0f, 0.0f, WIN_WIDTH, WIN_HEIGHT), bg_paint);
-
-        // Nebulae glows
-        if (auto g_cyan = RadialGradient::create(Point::from_xy(250.0f, 150.0f), 350.0f, {
-            GradientStop::create(0.0f, Color::from_rgba8(0, 242, 254, 35)),
-            GradientStop::create(1.0f, Color::from_rgba8(0, 242, 254, 0))
-        })) {
-            Paint p; p.shader = Shader(*g_cyan);
-            wall_canvas.fill_rect(*Rect::from_xywh(0.0f, 0.0f, 600.0f, 500.0f), p);
+        Canvas wc(*wallpaper);
+        if (auto bg = LinearGradient::create(
+                Point::from_xy(0.0f, 0.0f), Point::from_xy(WIN_WIDTH, WIN_HEIGHT),
+                {GradientStop::create(0.0f, Color::from_rgba8(8, 12, 24, 255)),
+                 GradientStop::create(0.5f, Color::from_rgba8(15, 20, 38, 255)),
+                 GradientStop::create(1.0f, Color::from_rgba8(7, 10, 18, 255))})) {
+            wc.fill_rect(*Rect::from_xywh(0.0f, 0.0f, WIN_WIDTH, WIN_HEIGHT), Paint(Shader(*bg)));
         }
-
-        if (auto g_pink = RadialGradient::create(Point::from_xy(1050.0f, 400.0f), 400.0f, {
-            GradientStop::create(0.0f, Color::from_rgba8(255, 45, 115, 30)),
-            GradientStop::create(1.0f, Color::from_rgba8(255, 45, 115, 0))
-        })) {
-            Paint p; p.shader = Shader(*g_pink);
-            wall_canvas.fill_rect(*Rect::from_xywh(650.0f, 50.0f, 630.0f, 700.0f), p);
+        if (auto n1 = RadialGradient::create(Point::from_xy(260.0f, 140.0f), 360.0f, {
+                GradientStop::create(0.0f, Color::from_rgba8(0, 220, 255, 34)),
+                GradientStop::create(1.0f, Color::from_rgba8(0, 220, 255, 0))})) {
+            wc.fill_rect(*Rect::from_xywh(0.0f, 0.0f, 650.0f, 520.0f), Paint(Shader(*n1)));
+        }
+        if (auto n2 = RadialGradient::create(Point::from_xy(1080.0f, 520.0f), 380.0f, {
+                GradientStop::create(0.0f, Color::from_rgba8(180, 60, 255, 32)),
+                GradientStop::create(1.0f, Color::from_rgba8(180, 60, 255, 0))})) {
+            wc.fill_rect(*Rect::from_xywh(680.0f, 160.0f, 660.0f, 620.0f), Paint(Shader(*n2)));
         }
     }
+    BackdropBlurCache blur_cache(*wallpaper, 12.0f, true);
 
-    // 4. Initialize BackdropBlurCache for instantaneous zero-cost frosted glass apertures
-    std::cout << "[*] Pre-blurring cosmic wallpaper into BackdropBlurCache (one-time setup)...\n";
-    auto t_b0 = std::chrono::high_resolution_clock::now();
-    BackdropBlurCache blur_cache(*wallpaper, 14.0f, true);
-    auto t_b1 = std::chrono::high_resolution_clock::now();
-    double init_blur_ms = std::chrono::duration<double, std::milli>(t_b1 - t_b0).count();
-    std::cout << "    Blur cache ready in " << std::fixed << std::setprecision(2) << init_blur_ms << " ms.\n\n";
-
-    // 5. Load Animations and build Players
-    std::cout << "[*] Initializing Lottie Players..." << std::endl;
-    auto anim_spinner = Animation::load_from_data(SPINNER_LOTTIE);
-    auto anim_checkmark = Animation::load_from_data(CHECKMARK_LOTTIE);
-    auto anim_heart = Animation::load_from_data(HEART_LOTTIE);
-
-    if (!anim_spinner || !anim_checkmark || !anim_heart) {
-        std::cerr << "[-] Error parsing Lottie animations." << std::endl;
+    ShowcaseDeck deck;
+    if (!deck.init(font_system)) {
+        std::cerr << "[-] Failed to initialize showcase deck.\n";
         return 1;
     }
 
-    Player player_spinner(anim_spinner);
-    Player player_checkmark(anim_checkmark);
-    Player player_heart(anim_heart);
+    // Pre-bake static UI chrome (wallpaper + 8 glass panels + card headers + footer) and only re-bake on mode switch!
+    auto baked_chrome = Pixmap::create(WIN_WIDTH, WIN_HEIGHT);
+    bool chrome_dirty = true;
 
-    float current_speed = 1.0f;
-    bool is_looping = true;
-    bool is_paused = false;
+    auto bake_static_chrome = [&]() {
+        std::memcpy(baked_chrome->pixels_mut(), wallpaper->pixels(), wallpaper->data_len());
+        Canvas cc(*baked_chrome);
 
-    // 5. Initialize Native Window if backend_os is available
+        if (auto hr = Rect::from_xywh(MARGIN_X, 18.0f, static_cast<float>(WIN_WIDTH) - MARGIN_X * 2.0f, 68.0f)) {
+            GlassParams hg;
+            hg.blur_sigma = 12.0f;
+            hg.tint_color = Color::from_rgba8(14, 20, 36, 210);
+            hg.border_color = Color::from_rgba8(0, 235, 255, 95);
+            hg.border_width = 1.2f;
+            blur_cache.draw_glass_aperture(cc, *hr, 14.0f, 14.0f, hg);
+        }
+        draw_text(cc, 54.0f, 28.0f, "NISABA LOTTIE ENGINE — CPU REFERENCE LAB (PHASES 1-4)", 18.5f, 22.0f, TextColor::rgb(245, 250, 255));
+        draw_text(cc, 54.0f, 54.0f, "1:1 Software Parity • Damage Tracking • External Precomp • 20+ Effects • Expressions • Text-on-Path • Audio", 11.0f, 14.0f, TextColor::rgb(145, 175, 215));
+
+        auto bake_card_chrome = [&](int row, int col, std::string_view tag, std::string_view title,
+                                    std::string_view subtitle, Color accent) {
+            const float cx = MARGIN_X + static_cast<float>(col) * (CARD_W + GAP_X);
+            const float cy = (row == 0) ? ROW0_Y : ROW1_Y;
+            const auto card_r = *Rect::from_xywh(cx, cy, CARD_W, CARD_H);
+
+            GlassParams cg;
+            cg.blur_sigma = 12.0f;
+            cg.tint_color = Color::from_rgba8(14, 19, 34, 215);
+            cg.border_color = Color::from_rgba_unchecked(accent.red(), accent.green(), accent.blue(), 0.42f);
+            cg.border_width = 1.2f;
+            blur_cache.draw_glass_aperture(cc, card_r, 14.0f, 14.0f, cg);
+
+            const TextColor acc_tc = TextColor::rgb(
+                static_cast<uint8_t>(accent.red() * 255.0f),
+                static_cast<uint8_t>(accent.green() * 255.0f),
+                static_cast<uint8_t>(accent.blue() * 255.0f));
+            draw_text(cc, cx + 16.0f, cy + 10.0f, tag, 10.0f, 13.0f, acc_tc);
+            draw_text(cc, cx + 16.0f, cy + 26.0f, title, 14.0f, 18.0f, TextColor::rgb(242, 247, 255));
+            draw_text(cc, cx + 16.0f, cy + 46.0f, subtitle, 10.5f, 14.0f, TextColor::rgb(145, 168, 200));
+
+            const auto stage_r = *Rect::from_xywh(cx + 16.0f, cy + 68.0f, CARD_W - 32.0f, 186.0f);
+            cc.fill_round_rect(stage_r, 10.0f, 10.0f, Paint(Color::from_rgba8(8, 11, 20, 240)));
+            cc.stroke_round_rect(stage_r, 10.0f, 10.0f, Paint(Color::from_rgba8(42, 58, 86, 140)), Stroke(1.2f));
+        };
+
+        bake_card_chrome(0, 0, "01 // PHASE 1: DAMAGE + HANDLES + GIF", "INVALIDATION & O(1) HANDLES",
+                         deck.show_damage_overlay ? "Click/[C] O(1) Handle • [D] DirtyBox=ON" : "Click/[C] O(1) Handle • [D] DirtyBox=OFF",
+                         Color::from_rgba8(0, 232, 255, 255));
+        bake_card_chrome(0, 1, "02 // PHASE 2.1: PRECOMP INTERCEPTOR", "LIVE EMBEDDED EXTERNAL WIDGET",
+                         "CallbackExternalLayer radar+wave inside Lottie hierarchy", Color::from_rgba8(0, 245, 165, 255));
+        bake_card_chrome(0, 2, "03 // PHASE 2.2: COLOR & TONE FX", "NATIVE COLOR PIPELINE",
+                         std::string("Active [E]: ") + std::string(COLOR_FX_NAMES[deck.color_fx_variant]),
+                         Color::from_rgba8(255, 185, 45, 255));
+        bake_card_chrome(1, 0, "04 // PHASE 3.1: WIPE & TILING FX", "TRANSITIONS & MOTION TILE",
+                         std::string("Active [W]: ") + std::string(WIPE_FX_NAMES[deck.wipe_fx_variant]),
+                         Color::from_rgba8(140, 130, 255, 255));
+        bake_card_chrome(1, 1, "05 // PHASE 3.2: DISTORT & NOISE", "WARP, BLUR & FRACTAL NOISE",
+                         std::string("Active [F]: ") + std::string(DISTORT_FX_NAMES[deck.distort_fx_variant]),
+                         Color::from_rgba8(255, 75, 145, 255));
+        bake_card_chrome(1, 2, "06 // PHASE 4: EXPR + TEXT + AUDIO", "EXPRESSIONS, PATH TEXT & VU",
+                         "ExprMgr + Bezier Text-on-Path + Live AudioTrack VU", Color::from_rgba8(55, 215, 255, 255));
+
+        if (auto bot = Rect::from_xywh(MARGIN_X, 712.0f, static_cast<float>(WIN_WIDTH) - MARGIN_X * 2.0f, 50.0f)) {
+            GlassParams bg;
+            bg.blur_sigma = 12.0f;
+            bg.tint_color = Color::from_rgba8(12, 17, 30, 215);
+            bg.border_color = Color::from_rgba8(70, 95, 140, 80);
+            bg.border_width = 1.0f;
+            blur_cache.draw_glass_aperture(cc, *bot, 11.0f, 11.0f, bg);
+        }
+        draw_text(cc, 54.0f, 728.0f,
+                  "[SPACE] Pause | [R] Restart | [S] Speed | [D] Dirty-Rect | [C/1] Handle | [E/3] Color FX | [W/4] Wipe FX | [F/5] Distort FX | [CLICK] Card | [ESC] Exit",
+                  11.0f, 15.0f, TextColor::rgb(188, 210, 240));
+        chrome_dirty = false;
+    };
+
 #ifdef NISABA_HAS_BACKEND_OS
     std::unique_ptr<backend_os::Platform> platform;
     std::unique_ptr<backend_os::Window> window;
     std::unique_ptr<nisaba::gpu::Context> gpu_ctx;
-    int gpu_texture_id = 0;
+    int gpu_tex_id = 0;
     bool g_running = true;
 
     if (!run_headless) {
-        auto p_res = backend_os::Platform::create();
-        if (p_res.isOk()) {
+        if (auto p_res = backend_os::Platform::create(); p_res.isOk()) {
             platform = std::move(p_res).value();
             backend_os::WindowConfig cfg;
-            cfg.title = "NISABA LOTTIE LIVE SHOWCASE — 60 FPS Sovereign Vector Animation Player";
+            cfg.title = "NISABA LOTTIE CPU SHOWCASE — Phases 1-4 Sovereign Reference";
             cfg.width = WIN_WIDTH;
             cfg.height = WIN_HEIGHT;
-            cfg.vsync = true;
-            auto w_res = backend_os::Window::create(*platform, cfg);
-            if (w_res.isOk()) {
+            cfg.vsync = false;
+            if (auto w_res = backend_os::Window::create(*platform, cfg); w_res.isOk()) {
                 window = std::move(w_res).value();
 #ifdef NISABA_GLEW
                 glewInit();
 #endif
                 gpu_ctx = nisaba::gpu::createContextGL3(nisaba::gpu::CreateFlags::Antialias);
                 if (gpu_ctx) {
-                    gpu_texture_id = gpu_ctx->createImageRGBA(WIN_WIDTH, WIN_HEIGHT, 0, fb->data());
-                    std::cout << "[+] Native OS GUI window created successfully (1280x760).\n";
-
-                    window->onClose().connect([&]() {
-                        g_running = false;
+                    gpu_tex_id = gpu_ctx->createImageRGBA(WIN_WIDTH, WIN_HEIGHT, 0, fb->data());
+                    window->onClose().connect([&]() { g_running = false; });
+                    platform->onKeyDown().connect([&](int key, int) {
+                        if (key == 27 || key == 'q' || key == 'Q') g_running = false;
+                        else if (key == 32) deck.toggle_pause();
+                        else if (key == 'r' || key == 'R') deck.restart_all();
+                        else if (key == 's' || key == 'S') deck.cycle_speed();
+                        else if (key == 'd' || key == 'D') { deck.show_damage_overlay = !deck.show_damage_overlay; chrome_dirty = true; }
+                        else if (key == 'c' || key == 'C' || key == '1') deck.cycle_p1_handle_mutation();
+                        else if (key == '2') { deck.p2.seek_frame(0.0f); if (!deck.paused) deck.p2.play(); }
+                        else if (key == 'e' || key == 'E' || key == '3') { deck.reload_color_fx(deck.color_fx_variant + 1); chrome_dirty = true; }
+                        else if (key == 'w' || key == 'W' || key == '4') { deck.reload_wipe_fx(deck.wipe_fx_variant + 1); chrome_dirty = true; }
+                        else if (key == 'f' || key == 'F' || key == '5') { deck.reload_distort_fx(deck.distort_fx_variant + 1); chrome_dirty = true; }
+                        else if (key == '6') { deck.p6.seek_frame(0.0f); if (!deck.paused) deck.p6.play(); }
                     });
-
-                    platform->onKeyDown().connect([&](int key, int mods) {
-                        (void)mods;
-                        if (key == 27 || key == 'q' || key == 'Q') {
-                            g_running = false;
-                        } else if (key == 32) { // Space
-                            is_paused = !is_paused;
-                            if (is_paused) {
-                                player_spinner.pause();
-                                player_checkmark.pause();
-                                player_heart.pause();
-                            } else {
-                                player_spinner.play();
-                                player_checkmark.play();
-                                player_heart.play();
-                            }
-                        } else if (key == 'r' || key == 'R') {
-                            player_spinner.seek_frame(0.0f);
-                            player_checkmark.seek_frame(0.0f);
-                            player_heart.seek_frame(0.0f);
-                        } else if (key == 's' || key == 'S') {
-                            if (current_speed == 1.0f) current_speed = 2.0f;
-                            else if (current_speed == 2.0f) current_speed = 0.5f;
-                            else if (current_speed == 0.5f) current_speed = 0.25f;
-                            else current_speed = 1.0f;
-
-                            player_spinner.set_speed(current_speed);
-                            player_checkmark.set_speed(current_speed);
-                            player_heart.set_speed(current_speed);
-                        } else if (key == 'l' || key == 'L') {
-                            is_looping = !is_looping;
-                            player_spinner.set_loop(is_looping);
-                            player_checkmark.set_loop(is_looping);
-                            player_heart.set_loop(is_looping);
-                        } else if (key == '1') {
-                            player_spinner.seek_frame(0.0f);
-                            player_spinner.play();
-                        } else if (key == '2') {
-                            player_checkmark.seek_frame(0.0f);
-                            player_checkmark.play();
-                        } else if (key == '3') {
-                            player_heart.seek_frame(0.0f);
-                            player_heart.play();
+                    platform->onMouseDown().connect([&](float mx, float my, int) {
+                        int row = (my >= ROW0_Y && my <= ROW0_Y + CARD_H) ? 0
+                                : ((my >= ROW1_Y && my <= ROW1_Y + CARD_H) ? 1 : -1);
+                        if (row < 0) return;
+                        int col = -1;
+                        for (int c = 0; c < 3; ++c) {
+                            const float x0 = MARGIN_X + static_cast<float>(c) * (CARD_W + GAP_X);
+                            if (mx >= x0 && mx <= x0 + CARD_W) { col = c; break; }
                         }
-                    });
-
-                    platform->onMouseDown().connect([&](float mx, float my, int btn) {
-                        (void)btn;
-                        // Click cards to replay
-                        if (my >= 130.0f && my <= 620.0f) {
-                            if (mx >= 40.0f && mx <= 420.0f) {
-                                player_spinner.seek_frame(0.0f);
-                                player_spinner.play();
-                            } else if (mx >= 450.0f && mx <= 830.0f) {
-                                player_checkmark.seek_frame(0.0f);
-                                player_checkmark.play();
-                            } else if (mx >= 860.0f && mx <= 1240.0f) {
-                                player_heart.seek_frame(0.0f);
-                                player_heart.play();
-                            }
-                        }
+                        if (col < 0) return;
+                        const int idx = row * 3 + col;
+                        if (idx == 0) deck.cycle_p1_handle_mutation();
+                        else if (idx == 1) { deck.p2.seek_frame(0.0f); if (!deck.paused) deck.p2.play(); }
+                        else if (idx == 2) { deck.reload_color_fx(deck.color_fx_variant + 1); chrome_dirty = true; }
+                        else if (idx == 3) { deck.reload_wipe_fx(deck.wipe_fx_variant + 1); chrome_dirty = true; }
+                        else if (idx == 4) { deck.reload_distort_fx(deck.distort_fx_variant + 1); chrome_dirty = true; }
+                        else if (idx == 5) { deck.p6.seek_frame(0.0f); if (!deck.paused) deck.p6.play(); }
                     });
                 }
             }
@@ -481,209 +265,110 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    // 6. Live Render Loop
-    std::cout << "[*] Entering real-time animation loop..." << std::endl;
-
     double last_time = 0.0;
     auto start_tp = std::chrono::high_resolution_clock::now();
-    uint32_t frame_count = 0;
+    uint32_t fps_frames = 0;
     double fps_accum = 0.0;
     double measured_fps = 60.0;
-    double measured_latency_ms = 0.5;
+    double measured_ms = 5.0;
 
-    // Number of iterations in headless mode
-    uint32_t max_frames = run_headless ? 60 : 10000000;
+    const uint32_t max_frames = run_headless ? 42 : 10000000;
 
     for (uint32_t f = 0; f < max_frames; ++f) {
+        auto t0 = std::chrono::high_resolution_clock::now();
 #ifdef NISABA_HAS_BACKEND_OS
         if (platform && window) {
-            if (!platform->pollEvents() || !g_running) {
-                break;
-            }
+            if (!platform->pollEvents() || !g_running) break;
         }
 #endif
-        auto now_tp = std::chrono::high_resolution_clock::now();
-        double now_sec = std::chrono::duration<double>(now_tp - start_tp).count();
-        double dt = (last_time > 0.0) ? (now_sec - last_time) : (1.0 / 60.0);
+        const double now_sec = std::chrono::duration<double>(t0 - start_tp).count();
+        double dt = run_headless ? (1.0 / 60.0) : ((last_time > 0.0) ? (now_sec - last_time) : (1.0 / 60.0));
         last_time = now_sec;
-        if (dt > 0.1) dt = 0.1; // Clamp big hitch
+        if (dt > 0.05) dt = 0.05;
 
-        auto t0 = std::chrono::high_resolution_clock::now();
+        if (chrome_dirty) bake_static_chrome();
+        std::memcpy(fb->pixels_mut(), baked_chrome->pixels(), baked_chrome->data_len());
+        deck.advance_all(static_cast<float>(dt));
 
-        // 1. Blit pre-rendered background
-        std::memcpy(fb->pixels_mut(), wallpaper->pixels(), wallpaper->data_len());
-
-        // 2. Advance Lottie players
-        if (!is_paused) {
-            player_spinner.advance(static_cast<float>(dt));
-            player_checkmark.advance(static_cast<float>(dt));
-            player_heart.advance(static_cast<float>(dt));
-        }
-
-        // 3. Render Header Panel
+        // Dynamic top-right FPS readout
         {
-            effects::GlassParams header_glass;
-            header_glass.blur_sigma = 14.0f;
-            header_glass.tint_color = Color::from_rgba8(16, 22, 38, 200);
-            header_glass.border_color = Color::from_rgba8(0, 242, 254, 80);
-            header_glass.border_width = 1.2f;
-            header_glass.shadow = DropShadow(0.0f, 6.0f, 14.0f, Color::from_rgba8(0, 0, 0, 140));
-            if (auto h_rect = Rect::from_xywh(40.0f, 25.0f, 1200.0f, 85.0f)) {
-                blur_cache.draw_glass_aperture(canvas, *h_rect, 14.0f, 14.0f, header_glass);
-            }
-
-            draw_text(canvas, 60.0f, 40.0f, "NISABA LOTTIE LIVE SHOWCASE", 22.0f, 26.0f, TextColor::rgb(255, 255, 255));
-            draw_text(canvas, 60.0f, 72.0f, "100% Sovereign Vector Animation Engine | Pure C++20 | Native Bodymovin Parser", 11.5f, 15.0f, TextColor::rgb(140, 165, 205));
-
-            // Status badges
-            std::ostringstream ss_stat;
-            ss_stat << std::fixed << std::setprecision(1) << measured_fps << " FPS | "
-                    << std::setprecision(3) << measured_latency_ms << " ms | Speed: "
-                    << current_speed << "x | " << (is_paused ? "PAUSED" : "PLAYING");
-
-            effects::GlassParams badge_glass;
-            badge_glass.blur_sigma = 14.0f;
-            badge_glass.tint_color = Color::from_rgba8(0, 242, 254, 30);
-            badge_glass.border_color = Color::from_rgba8(0, 242, 254, 150);
-            badge_glass.border_width = 1.0f;
-            if (auto b_rect = Rect::from_xywh(870.0f, 42.0f, 350.0f, 42.0f)) {
-                blur_cache.draw_glass_aperture(canvas, *b_rect, 12.0f, 12.0f, badge_glass);
-            }
-            draw_text(canvas, 885.0f, 54.0f, ss_stat.str(), 11.5f, 15.0f, TextColor::rgb(0, 242, 254));
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(1) << measured_fps << " FPS | "
+               << std::setprecision(2) << measured_ms << " ms | " << deck.speed << "x";
+            draw_text(canvas, 1020.0f, 44.0f, ss.str(), 11.5f, 15.0f, TextColor::rgb(80, 245, 255));
         }
 
-        // 4. Render 3 Live Animation Cards (3 Columns)
-        auto render_card = [&](float cx, std::string_view num_str, std::string_view title,
-                               std::string_view desc, Player& player, TextColor accent_col,
-                               uint8_t r_b, uint8_t g_b, uint8_t b_b) {
+        auto draw_card_stage = [&](int row, int col, Player& player, Color accent,
+                                   std::function<void(const Rect&, const Rect&)> post_overlay = nullptr) {
+            const float cx = MARGIN_X + static_cast<float>(col) * (CARD_W + GAP_X);
+            const float cy = (row == 0) ? ROW0_Y : ROW1_Y;
+            const auto stage_r = *Rect::from_xywh(cx + 16.0f, cy + 68.0f, CARD_W - 32.0f, 186.0f);
+            const auto lottie_r = *Rect::from_xywh(stage_r.left() + 6.0f, stage_r.top() + 6.0f,
+                                                   stage_r.width() - 12.0f, stage_r.height() - 12.0f);
+            canvas.save();
+            canvas.clip_rect(stage_r);
+            player.render(canvas, lottie_r, true);
+            if (post_overlay) post_overlay(stage_r, lottie_r);
+            canvas.restore();
 
-            float card_w = 380.0f;
-            float card_h = 510.0f;
-            float cy = 130.0f;
-
-            effects::GlassParams card_glass;
-            card_glass.blur_sigma = 14.0f;
-            card_glass.tint_color = Color::from_rgba8(14, 18, 32, 210);
-            card_glass.border_color = Color::from_rgba8(r_b, g_b, b_b, 80);
-            card_glass.border_width = 1.2f;
-            card_glass.shadow = DropShadow(0.0f, 8.0f, 16.0f, Color::from_rgba8(0, 0, 0, 160));
-            if (auto c_rect = Rect::from_xywh(cx, cy, card_w, card_h)) {
-                blur_cache.draw_glass_aperture(canvas, *c_rect, 16.0f, 16.0f, card_glass);
+            const float prog = player.progress();
+            const float bar_y = cy + 262.0f;
+            const float bar_w = CARD_W - 32.0f;
+            canvas.fill_round_rect(*Rect::from_xywh(cx + 16.0f, bar_y, bar_w, 4.5f), 2.2f, 2.2f,
+                                   Paint(Color::from_rgba8(22, 30, 50, 255)));
+            if (prog > 0.002f) {
+                canvas.fill_round_rect(*Rect::from_xywh(cx + 16.0f, bar_y, bar_w * prog, 4.5f), 2.2f, 2.2f,
+                                       Paint(accent));
             }
-
-            // Header of Card
-            draw_text(canvas, cx + 25.0f, cy + 22.0f, num_str, 12.0f, 15.0f, accent_col);
-            draw_text(canvas, cx + 25.0f, cy + 42.0f, title, 16.0f, 20.0f, TextColor::rgb(240, 245, 255));
-            draw_text(canvas, cx + 25.0f, cy + 68.0f, desc, 11.0f, 15.0f, TextColor::rgb(130, 150, 180), card_w - 50.0f);
-
-            // Large Live Animation Stage Container
-            float stage_x = cx + 30.0f;
-            float stage_y = cy + 115.0f;
-            float stage_size = 320.0f;
-
-            Paint stage_bg;
-            stage_bg.set_color(Color::from_rgba8(8, 11, 20, 230));
-            canvas.fill_round_rect(*Rect::from_xywh(stage_x, stage_y, stage_size, stage_size), 14.0f, 14.0f, stage_bg);
-
-            Paint stage_border;
-            stage_border.set_color(Color::from_rgba8(40, 55, 80, 120));
-            canvas.stroke_round_rect(*Rect::from_xywh(stage_x, stage_y, stage_size, stage_size), 14.0f, 14.0f, stage_border, Stroke(1.5f));
-
-            // Render live Lottie player inside stage
-            auto lottie_rect = Rect::from_xywh(stage_x + 20.0f, stage_y + 20.0f, stage_size - 40.0f, stage_size - 40.0f);
-            if (lottie_rect) {
-                player.render(canvas, *lottie_rect, true);
-            }
-
-            // Progress bar & Frame counter beneath stage
-            float prog = player.progress();
-            float bar_y = cy + 455.0f;
-            float bar_w = card_w - 50.0f;
-
-            Paint bar_bg(Color::from_rgba8(20, 26, 45, 255));
-            canvas.fill_round_rect(*Rect::from_xywh(cx + 25.0f, bar_y, bar_w, 6.0f), 3.0f, 3.0f, bar_bg);
-
-            if (prog > 0.001f) {
-                Paint bar_fill(Color::from_rgba8(r_b, g_b, b_b, 255));
-                canvas.fill_round_rect(*Rect::from_xywh(cx + 25.0f, bar_y, bar_w * prog, 6.0f), 3.0f, 3.0f, bar_fill);
-            }
-
-            std::ostringstream ss_info;
-            ss_info << "Frame: " << std::fixed << std::setprecision(1) << player.current_frame()
-                    << " / " << (player.animation() ? player.animation()->out_point() : 60.0f)
-                    << "  (" << static_cast<int>(prog * 100.0f) << "%)";
-            draw_text(canvas, cx + 25.0f, bar_y + 16.0f, ss_info.str(), 10.5f, 14.0f, TextColor::rgb(130, 155, 190));
         };
 
-        // Col 1: Spinner
-        render_card(
-            40.0f,
-            "01 // VECTOR ROTATION & TRIM PATH",
-            "DYNAMIC RADIAL SPINNER",
-            "Trim Path modifier [tm] + Bezier rotation [r] with 60 FPS elastic easing curve.",
-            player_spinner,
-            TextColor::rgb(0, 242, 254),
-            0, 242, 254
-        );
+        draw_card_stage(0, 0, deck.p1, Color::from_rgba8(0, 232, 255, 255),
+                        [&](const Rect&, const Rect& lr) {
+                            if (!deck.show_damage_overlay || !deck.p1_last_dirty.has_value()) return;
+                            const float sc = std::min(lr.width() / 240.0f, lr.height() / 160.0f);
+                            const float ox = lr.left() + (lr.width() - 240.0f * sc) * 0.5f;
+                            const float oy = lr.top() + (lr.height() - 160.0f * sc) * 0.5f;
+                            const Rect& d = *deck.p1_last_dirty;
+                            if (auto dr = Rect::from_ltrb(ox + d.left() * sc, oy + d.top() * sc,
+                                                          ox + d.right() * sc, oy + d.bottom() * sc)) {
+                                Stroke dst(1.8f);
+                                dst.dash = StrokeDash::create({6.0f, 4.0f}, 0.0f);
+                                canvas.stroke_rect(*dr, Paint(Color::from_rgba8(0, 255, 190, 240)), dst);
+                            }
+                        });
 
-        // Col 2: Checkmark
-        render_card(
-            450.0f,
-            "02 // ANTICIPATION & STROKE DRAW",
-            "CONFIRMATION CHECKMARK",
-            "Anticipation scale pop [s] + Cubic Bezier tick draw stroke [sh + tm].",
-            player_checkmark,
-            TextColor::rgb(0, 255, 153),
-            0, 255, 153
-        );
-
-        // Col 3: Heart
-        render_card(
-            860.0f,
-            "03 // BIOMEDICAL PULSE & GLOW",
-            "CARDIAC PULSE (HEART)",
-            "Freeform Bezier vector path [sh] + Harmonic double-pulse scale & glow stroke [st].",
-            player_heart,
-            TextColor::rgb(255, 45, 115),
-            255, 45, 115
-        );
-
-        // 5. Bottom Instructions Bar
-        {
-            float by = 660.0f;
-            effects::GlassParams bot_glass;
-            bot_glass.blur_sigma = 14.0f;
-            bot_glass.tint_color = Color::from_rgba8(12, 16, 28, 210);
-            bot_glass.border_color = Color::from_rgba8(60, 80, 120, 60);
-            bot_glass.border_width = 1.0f;
-            bot_glass.shadow = DropShadow(0.0f, 4.0f, 10.0f, Color::from_rgba8(0, 0, 0, 120));
-            if (auto bot_rect = Rect::from_xywh(40.0f, by, 1200.0f, 75.0f)) {
-                blur_cache.draw_glass_aperture(canvas, *bot_rect, 12.0f, 12.0f, bot_glass);
-            }
-
-            draw_text(canvas, 60.0f, by + 18.0f, "INTERACTIVE CONTROLS:", 11.5f, 15.0f, TextColor::rgb(0, 242, 254));
-            draw_text(canvas, 60.0f, by + 40.0f,
-                      "[SPACE] Play/Pause   |   [R] Restart All   |   [S] Toggle Speed (0.25x / 0.5x / 1.0x / 2.0x)   |   [L] Loop On/Off   |   [1 / 2 / 3] Replay Card   |   [CLICK] Replay   |   [ESC] Exit",
-                      11.0f, 15.0f, TextColor::rgb(180, 200, 230));
-        }
+        draw_card_stage(0, 1, deck.p2, Color::from_rgba8(0, 245, 165, 255));
+        draw_card_stage(0, 2, deck.p3, Color::from_rgba8(255, 185, 45, 255));
+        draw_card_stage(1, 0, deck.p4, Color::from_rgba8(140, 130, 255, 255));
+        draw_card_stage(1, 1, deck.p5, Color::from_rgba8(255, 75, 145, 255));
+        draw_card_stage(1, 2, deck.p6, Color::from_rgba8(55, 215, 255, 255),
+                        [&](const Rect& sr, const Rect&) {
+                            const float l_norm = std::clamp((deck.audio_meter.left_db + 24.0f) / 24.0f, 0.0f, 1.0f);
+                            const float r_norm = std::clamp((deck.audio_meter.right_db + 24.0f) / 24.0f, 0.0f, 1.0f);
+                            const float vx = sr.left() + 12.0f;
+                            const float vw = sr.width() - 24.0f;
+                            const float vy = sr.bottom() - 22.0f;
+                            canvas.fill_round_rect(*Rect::from_xywh(vx, vy, vw, 6.0f), 3.0f, 3.0f, Paint(Color::from_rgba8(24, 34, 54, 220)));
+                            if (l_norm > 0.01f) canvas.fill_round_rect(*Rect::from_xywh(vx, vy, vw * l_norm, 6.0f), 3.0f, 3.0f, Paint(Color::from_rgba8(40, 240, 165, 240)));
+                            canvas.fill_round_rect(*Rect::from_xywh(vx, vy + 9.0f, vw, 6.0f), 3.0f, 3.0f, Paint(Color::from_rgba8(24, 34, 54, 220)));
+                            if (r_norm > 0.01f) canvas.fill_round_rect(*Rect::from_xywh(vx, vy + 9.0f, vw * r_norm, 6.0f), 3.0f, 3.0f, Paint(Color::from_rgba8(60, 195, 255, 240)));
+                        });
 
         auto t1 = std::chrono::high_resolution_clock::now();
-        measured_latency_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-        frame_count++;
+        measured_ms = measured_ms * 0.9 + std::chrono::duration<double, std::milli>(t1 - t0).count() * 0.1;
+        ++fps_frames;
         fps_accum += dt;
         if (fps_accum >= 0.5) {
-            measured_fps = static_cast<double>(frame_count) / fps_accum;
-            frame_count = 0;
+            measured_fps = static_cast<double>(fps_frames) / fps_accum;
+            fps_frames = 0;
             fps_accum = 0.0;
         }
 
 #ifdef NISABA_HAS_BACKEND_OS
-        // 6. Present framebuffer to Native OS Window
         if (gpu_ctx && window) {
-            gpu_ctx->updateImage(gpu_texture_id, fb->data());
+            gpu_ctx->updateImage(gpu_tex_id, fb->data());
             gpu_ctx->beginFrame(WIN_WIDTH, WIN_HEIGHT, 1.0f);
-            auto p = gpu_ctx->imagePattern(0, 0, WIN_WIDTH, WIN_HEIGHT, 0, gpu_texture_id, 1.0f);
+            auto p = gpu_ctx->imagePattern(0, 0, WIN_WIDTH, WIN_HEIGHT, 0, gpu_tex_id, 1.0f);
             gpu_ctx->beginPath();
             gpu_ctx->rect(0, 0, WIN_WIDTH, WIN_HEIGHT);
             gpu_ctx->fillPaint(p);
@@ -695,19 +380,12 @@ int main(int argc, char** argv) {
     }
 
 #ifdef NISABA_HAS_BACKEND_OS
-    if (gpu_ctx && gpu_texture_id != 0) {
-        gpu_ctx->deleteImage(gpu_texture_id);
-    }
+    if (gpu_ctx && gpu_tex_id != 0) gpu_ctx->deleteImage(gpu_tex_id);
 #endif
 
-    // Save final screenshot
     const std::string out_png = "nisaba_lottie_showcase.png";
     if (fb->save_png(out_png)) {
-        std::cout << "\n[+] Saved live showcase snapshot to: " << out_png << "\n";
+        std::cout << "[+] Saved CPU showcase snapshot to: " << out_png << "\n";
     }
-
-    std::cout << "========================================================\n"
-              << "   NISABA LIVE LOTTIE SHOWCASE FINISHED\n"
-              << "========================================================\n";
     return 0;
 }

@@ -3553,6 +3553,537 @@ static void test_gpu_phase3_and_phase4_2_parity() {
     std::cout << "  -> Phase 3.1, Phase 3.2 & Phase 4.2 CPU-vs-OpenGL Parity OK" << std::endl;
 }
 
+static void test_gpu_lottie_phase1_parity_and_damage() {
+    std::cout << "[TEST] Lottie Phase 1 (InvalidationController + GpuCanvas::flush(damage_rect), Multi-frame ImageAsset & PropertyObserver) CPU-vs-GPU Parity..." << std::endl;
+
+    // 1. Build a 2-frame custom ImageAsset (frame 0 cyan, frame 1 magenta) via MemoryResourceProvider
+    auto f0 = Pixmap::create(24, 24);
+    auto f1 = Pixmap::create(24, 24);
+    assert(f0.has_value() && f1.has_value());
+    f0->fill(Color::from_rgba8(0, 220, 230, 255));
+    f1->fill(Color::from_rgba8(230, 40, 200, 255));
+
+    std::vector<lottie::DecodedImageAsset::TimedFrame> frames;
+    frames.push_back({std::move(*f0), 0.5f});
+    frames.push_back({std::move(*f1), 0.5f});
+    auto multi_img = lottie::DecodedImageAsset::from_frames(std::move(frames));
+
+    auto mem_rp = std::make_shared<lottie::MemoryResourceProvider>();
+    mem_rp->add_image_asset("img_vid", multi_img);
+
+    struct Phase1Observer final : public lottie::PropertyObserver {
+        std::unique_ptr<lottie::ColorHandle> fill_h;
+        std::unique_ptr<lottie::TransformHandle> tr_h;
+        void on_color_property(std::string_view kp, const std::function<std::unique_ptr<lottie::ColorHandle>()>& fn) override {
+            if (kp == "Dot.Grp.Fill") fill_h = fn();
+        }
+        void on_transform_property(std::string_view kp, const std::function<std::unique_ptr<lottie::TransformHandle>()>& fn) override {
+            if (kp == "Dot") tr_h = fn();
+        }
+    };
+    auto obs = std::make_shared<Phase1Observer>();
+    lottie::Stats stats{};
+
+    const std::string json = R"({
+        "v": "5.9.0", "fr": 60, "ip": 0, "op": 60, "w": 200, "h": 160,
+        "assets": [{"id": "img_vid", "w": 48, "h": 48, "u": "", "p": "vid.webp"}],
+        "layers": [
+            {
+                "ind": 1, "ty": 4, "nm": "Dot", "ip": 0, "op": 60, "st": 0,
+                "ks": {
+                    "p": {"a": 1, "k": [{"t": 0, "s": [40, 80, 0], "e": [160, 80, 0]}, {"t": 60, "s": [160, 80, 0]}]},
+                    "a": {"a": 0, "k": [0, 0, 0]}, "s": {"a": 0, "k": [100, 100, 100]}, "o": {"a": 0, "k": 100}
+                },
+                "shapes": [
+                    {"ty": "gr", "nm": "Grp", "it": [
+                        {"ty": "rc", "p": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [36, 36]}, "r": {"a": 0, "k": 6}},
+                        {"ty": "fl", "nm": "Fill", "c": {"a": 0, "k": [1, 0.2, 0.2, 1]}, "o": {"a": 0, "k": 100}},
+                        {"ty": "tr"}
+                    ]}
+                ]
+            },
+            {
+                "ind": 2, "ty": 2, "nm": "VidLayer", "refId": "img_vid", "ip": 0, "op": 60, "st": 0,
+                "ks": {"p": {"a": 0, "k": [12, 12, 0]}, "a": {"a": 0, "k": [0, 0, 0]}, "s": {"a": 0, "k": [100, 100, 100]}, "o": {"a": 0, "k": 100}}
+            },
+            {
+                "ind": 3, "ty": 1, "nm": "StaticBackdrop", "ip": 0, "op": 60, "st": 0,
+                "sw": 200, "sh": 160, "sc": "#141824",
+                "ks": {"p": {"a": 0, "k": [0, 0, 0]}, "a": {"a": 0, "k": [0, 0, 0]}, "s": {"a": 0, "k": [100, 100, 100]}, "o": {"a": 0, "k": 100}}
+            }
+        ]
+    })";
+
+    auto anim = lottie::AnimationBuilder()
+        .set_resource_provider(mem_rp)
+        .set_property_observer(obs)
+        .set_stats(&stats)
+        .make(json);
+    assert(anim != nullptr);
+    assert(obs->fill_h && obs->fill_h->is_valid());
+    assert(obs->tr_h && obs->tr_h->is_valid());
+
+    // Mutate fill via O(1) handle -> golden yellow
+    obs->fill_h->set(Color::from_rgba8(245, 200, 30, 255));
+
+    // Render frame 0 on CPU & GPU, then advance to frame 40 (moving dot + multi-frame image flips cyan -> magenta)
+    // using partial damage flush on GPU and verify 1:1 CPU vs GPU pixel parity!
+    auto gpu_dev = gpu::GpuDevice::create_headless();
+    if (!gpu_dev || !gpu_dev->is_valid()) {
+        std::cout << "  [SKIP] Headless GPU device unavailable." << std::endl;
+        return;
+    }
+    constexpr uint32_t W = 200, H = 160;
+    auto gpu_surf = gpu::GpuSurface::create(gpu_dev, W, H, 1);
+    assert(gpu_surf != nullptr);
+    gpu::GpuCanvas gpu_canvas(gpu_surf);
+
+    auto cpu_pm = Pixmap::create(W, H);
+    assert(cpu_pm.has_value());
+    Canvas cpu_canvas(*cpu_pm);
+
+    lottie::InvalidationController ic;
+    anim->seek_frame(0.0f, &ic);
+    gpu_canvas.clear(Color::TRANSPARENT);
+    anim->render(gpu_canvas, 0.0f);
+    gpu_canvas.flush();
+
+    // Now seek to frame 40 and flush ONLY the InvalidationController dirty rect on GPU!
+    gpu_surf->set_preserve_contents(true);
+    ic.reset();
+    anim->seek_frame(40.0f, &ic);
+    auto dmg = ic.to_screen_int_rect(W, H);
+    assert(dmg.has_value());
+    assert(dmg->width() < W || dmg->height() < H); // Smaller than full surface!
+
+    gpu_canvas.save();
+    gpu_canvas.clip_rect(*dmg);
+    gpu_canvas.clear_rect(*dmg, Color::TRANSPARENT);
+    anim->render(gpu_canvas, 40.0f);
+    gpu_canvas.restore();
+    gpu_canvas.flush(*dmg);
+
+    auto gpu_readback = gpu_surf->to_pixmap();
+    assert(gpu_readback.has_value());
+
+    cpu_pm->fill(Color::TRANSPARENT);
+    anim->render(cpu_canvas, 40.0f);
+
+    // Compare CPU full frame vs GPU incremental damage-flushed frame across the entire 200x160 surface!
+    double sum_diff = 0.0;
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            auto cp = cpu_pm->as_ref().pixel(x, y);
+            auto gp = gpu_readback->as_ref().pixel(x, y);
+            assert(cp.has_value() && gp.has_value());
+            int dr = std::abs(static_cast<int>(cp->red()) - static_cast<int>(gp->red()));
+            int dg = std::abs(static_cast<int>(cp->green()) - static_cast<int>(gp->green()));
+            int db = std::abs(static_cast<int>(cp->blue()) - static_cast<int>(gp->blue()));
+            int da = std::abs(static_cast<int>(cp->alpha()) - static_cast<int>(gp->alpha()));
+            sum_diff += static_cast<double>(dr + dg + db + da) * 0.25;
+        }
+    }
+    const double mean_diff = sum_diff / static_cast<double>(W * H);
+    assert(mean_diff < 1.5);
+
+    // Spot-check interior pixels against CPU:
+    // - (30, 30): multi-frame image flipped to magenta
+    // - (120, 80): Dot moved here & mutated to golden yellow via O(1) ColorHandle
+    // - (40, 80): old Dot location cleanly erased back to StaticBackdrop (#141824)
+    // - (190, 150): untouched corner preserved outside damage_rect (#141824)
+    const std::pair<uint32_t, uint32_t> spot_pts[] = {{30, 30}, {120, 80}, {40, 80}, {190, 150}};
+    for (auto [px, py] : spot_pts) {
+        auto cp = cpu_pm->as_ref().pixel(px, py);
+        auto gp = gpu_readback->as_ref().pixel(px, py);
+        assert(cp.has_value() && gp.has_value());
+        assert(std::abs(static_cast<int>(cp->red()) - static_cast<int>(gp->red())) <= 4);
+        assert(std::abs(static_cast<int>(cp->green()) - static_cast<int>(gp->green())) <= 4);
+        assert(std::abs(static_cast<int>(cp->blue()) - static_cast<int>(gp->blue())) <= 4);
+        assert(std::abs(static_cast<int>(cp->alpha()) - static_cast<int>(gp->alpha())) <= 4);
+    }
+
+    auto vid_px = gpu_readback->as_ref().pixel(30, 30);
+    assert(vid_px.has_value() && vid_px->red() > 200 && vid_px->blue() > 170 && vid_px->green() < 70);
+    auto dot_px = gpu_readback->as_ref().pixel(120, 80);
+    assert(dot_px.has_value() && dot_px->red() > 210 && dot_px->green() > 170 && dot_px->blue() < 60);
+    auto old_px = gpu_readback->as_ref().pixel(40, 80);
+    assert(old_px.has_value() && old_px->red() < 35 && old_px->green() < 35 && old_px->blue() < 55);
+
+    std::cout << "  -> Lottie Phase 1 CPU-vs-GPU Parity & Damage Flush OK (mean_diff=" << mean_diff << ")" << std::endl;
+}
+
+static void test_gpu_lottie_phase2_precomp_and_color_effects_parity() {
+    std::cout << "[TEST] Lottie Phase 2 (ExternalLayer/PrecompInterceptor & All 10 Color/Tone Effects) CPU-vs-GPU Parity..." << std::endl;
+
+    auto dev = gpu::GpuDevice::create_headless();
+    if (!dev || !dev->is_valid()) {
+        std::cout << "  [SKIP] Headless GPU device unavailable." << std::endl;
+        return;
+    }
+
+    constexpr uint32_t W = 240, H = 180;
+    const Color bg = Color::from_rgba8(14, 18, 28, 255);
+
+    auto verify_parity = [&](const char* label, const std::shared_ptr<lottie::Animation>& anim, float frame) {
+        auto cpu_pm = Pixmap::create(W, H);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(bg);
+        {
+            Canvas cpu(*cpu_pm);
+            anim->render(cpu, frame);
+        }
+
+        auto surf = gpu::GpuSurface::create(dev, W, H, 1);
+        assert(surf != nullptr);
+        gpu::GpuCanvas gpu(surf);
+        gpu.clear(bg);
+        anim->render(gpu, frame);
+        gpu.flush();
+        auto gpu_pm = surf->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        double sum_diff = 0.0;
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cpu_pm->as_ref().pixel(x, y);
+                auto gp = gpu_pm->as_ref().pixel(x, y);
+                assert(cp.has_value() && gp.has_value());
+                sum_diff += (std::abs(int(cp->red()) - int(gp->red())) +
+                             std::abs(int(cp->green()) - int(gp->green())) +
+                             std::abs(int(cp->blue()) - int(gp->blue())) +
+                             std::abs(int(cp->alpha()) - int(gp->alpha()))) * 0.25;
+            }
+        }
+        const double mean_diff = sum_diff / double(W * H);
+        if (mean_diff >= 2.0) {
+            std::cerr << "  [FAIL] " << label << " mean_diff=" << mean_diff << std::endl;
+        }
+        assert(mean_diff < 2.0);
+    };
+
+    // 1. Multi-tile scene exercising ExternalLayer + all Phase 2 Color & Tone effects natively on CPU & GPU!
+    const std::string phase2_json = R"({
+        "v": "5.9.0", "fr": 60, "ip": 0, "op": 60, "w": 240, "h": 180,
+        "layers": [
+            {
+                "ind": 1, "ty": 0, "nm": "ExternalCard", "refId": "ext_card", "w": 70, "h": 70,
+                "ip": 0, "op": 60, "st": 0,
+                "ks": {"p": {"a": 0, "k": [10, 10]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "o": {"a": 0, "k": 90}}
+            },
+            {
+                "ind": 2, "ty": 1, "nm": "TileBC", "sw": 70, "sh": 70, "sc": "#405070",
+                "ip": 0, "op": 60, "st": 0,
+                "ks": {"p": {"a": 0, "k": [85, 10]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "o": {"a": 0, "k": 100}},
+                "ef": [{"ty": 5, "mn": "ADBE Brightness & Contrast 2", "en": 1, "ef": [{"ty": 0, "v": {"a": 0, "k": 35}}, {"ty": 0, "v": {"a": 0, "k": 25}}]}]
+            },
+            {
+                "ind": 3, "ty": 1, "nm": "TileHueSat", "sw": 70, "sh": 70, "sc": "#e03030",
+                "ip": 0, "op": 60, "st": 0,
+                "ks": {"p": {"a": 0, "k": [160, 10]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "o": {"a": 0, "k": 100}},
+                "ef": [{"ty": 5, "mn": "ADBE HUE SATURATION", "en": 1, "ef": [{"ty": 0, "v": {"a": 0, "k": 140}}, {"ty": 0, "v": {"a": 0, "k": 10}}, {"ty": 0, "v": {"a": 0, "k": 5}}]}]
+            },
+            {
+                "ind": 4, "ty": 1, "nm": "TileBW", "sw": 50, "sh": 70, "sc": "#ff4020",
+                "ip": 0, "op": 60, "st": 0,
+                "ks": {"p": {"a": 0, "k": [10, 95]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "o": {"a": 0, "k": 100}},
+                "ef": [{"ty": 5, "mn": "ADBE Black&White", "en": 1, "ef": [{"ty": 0, "v": {"a": 0, "k": 75}}, {"ty": 0, "v": {"a": 0, "k": 60}}, {"ty": 0, "v": {"a": 0, "k": 40}}, {"ty": 0, "v": {"a": 0, "k": 60}}, {"ty": 0, "v": {"a": 0, "k": 20}}, {"ty": 0, "v": {"a": 0, "k": 80}}]}]
+            },
+            {
+                "ind": 5, "ty": 1, "nm": "TileInvertShift", "sw": 50, "sh": 70, "sc": "#f03060",
+                "ip": 0, "op": 60, "st": 0,
+                "ks": {"p": {"a": 0, "k": [65, 95]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "o": {"a": 0, "k": 100}},
+                "ef": [
+                    {"ty": 5, "mn": "ADBE Invert", "en": 1, "ef": [{"ty": 7, "v": {"a": 0, "k": 1}}, {"ty": 0, "v": {"a": 0, "k": 15}}]},
+                    {"ty": 5, "mn": "ADBE Shift Channels", "en": 1, "ef": [{"ty": 7, "v": {"a": 0, "k": 1}}, {"ty": 7, "v": {"a": 0, "k": 4}}, {"ty": 7, "v": {"a": 0, "k": 2}}, {"ty": 7, "v": {"a": 0, "k": 3}}]}
+                ]
+            },
+            {
+                "ind": 6, "ty": 1, "nm": "TileLevelsToner", "sw": 50, "sh": 70, "sc": "#888888",
+                "ip": 0, "op": 60, "st": 0,
+                "ks": {"p": {"a": 0, "k": [120, 95]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "o": {"a": 0, "k": 100}},
+                "ef": [
+                    {"ty": 5, "mn": "ADBE Easy Levels2", "en": 1, "ef": [{"ty": 7, "v": {"a": 0, "k": 1}}, {"ty": 0, "v": {"a": 0, "k": 0.1}}, {"ty": 0, "v": {"a": 0, "k": 0.9}}, {"ty": 0, "v": {"a": 0, "k": 1.4}}, {"ty": 0, "v": {"a": 0, "k": 0}}, {"ty": 0, "v": {"a": 0, "k": 1}}]},
+                    {"ty": 5, "mn": "CC Toner", "en": 1, "ef": [{"ty": 7, "v": {"a": 0, "k": 2}}, {"ty": 2, "v": {"a": 0, "k": [1, 0.95, 0.8, 1]}}, {"ty": 2, "v": {"a": 0, "k": [0.8, 0.8, 0.8, 1]}}, {"ty": 2, "v": {"a": 0, "k": [0.1, 0.6, 0.9, 1]}}, {"ty": 2, "v": {"a": 0, "k": [0.2, 0.2, 0.2, 1]}}, {"ty": 2, "v": {"a": 0, "k": [0.05, 0.1, 0.2, 1]}}, {"ty": 0, "v": {"a": 0, "k": 0}}]}
+                ]
+            },
+            {
+                "ind": 7, "ty": 1, "nm": "TileRamp", "sw": 55, "sh": 70, "sc": "#ffffff",
+                "ip": 0, "op": 60, "st": 0,
+                "ks": {"p": {"a": 0, "k": [175, 95]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "o": {"a": 0, "k": 100}},
+                "ef": [{"ty": 5, "mn": "ADBE Ramp", "en": 1, "ef": [{"ty": 3, "v": {"a": 0, "k": [175, 95]}}, {"ty": 2, "v": {"a": 0, "k": [1, 0.2, 0.1, 1]}}, {"ty": 3, "v": {"a": 0, "k": [230, 165]}}, {"ty": 2, "v": {"a": 0, "k": [0.1, 0.3, 1, 1]}}, {"ty": 7, "v": {"a": 0, "k": 1}}, {"ty": 0, "v": {"a": 0, "k": 0}}, {"ty": 0, "v": {"a": 0, "k": 0}}]}]
+            }
+        ]
+    })";
+
+    auto interceptor = std::make_shared<lottie::CallbackPrecompInterceptor>(
+        [](std::string_view id, std::string_view, Size) -> std::shared_ptr<lottie::ExternalLayer> {
+            if (id == "ext_card") {
+                return std::make_shared<lottie::CallbackExternalLayer>([](ICanvas& c, float) {
+                    c.fill_rect(*Rect::from_xywh(0.0f, 0.0f, 70.0f, 70.0f), Paint(Color::from_rgba8(30, 190, 140, 255)));
+                    c.fill_rect(*Rect::from_xywh(15.0f, 15.0f, 40.0f, 40.0f), Paint(Color::from_rgba8(240, 220, 60, 255)));
+                });
+            }
+            return nullptr;
+        }
+    );
+
+    auto anim = lottie::AnimationBuilder().set_precomp_interceptor(interceptor).make(phase2_json);
+    assert(anim != nullptr);
+    verify_parity("Lottie Phase 2 ExternalLayer + Color Effects", anim, 0.0f);
+
+    // 2. Threshold + FourColorGradient CPU-vs-GPU parity
+    const std::string phase2_extra = R"({
+        "v": "5.9.0", "fr": 60, "ip": 0, "op": 60, "w": 240, "h": 180,
+        "layers": [
+            {
+                "ind": 1, "ty": 1, "nm": "ThrTile", "sw": 90, "sh": 120, "sc": "#b8b8b8",
+                "ip": 0, "op": 60, "st": 0,
+                "ks": {"p": {"a": 0, "k": [15, 30]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "o": {"a": 0, "k": 100}},
+                "ef": [{"ty": 5, "mn": "ADBE Threshold2", "en": 1, "ef": [{"ty": 0, "v": {"a": 0, "k": 128}}]}]
+            },
+            {
+                "ind": 2, "ty": 1, "nm": "FourColTile", "sw": 100, "sh": 120, "sc": "#000000",
+                "ip": 0, "op": 60, "st": 0,
+                "ks": {"p": {"a": 0, "k": [125, 30]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "o": {"a": 0, "k": 100}},
+                "ef": [{"ty": 5, "mn": "ADBE 4ColorGradient", "en": 1, "ef": [
+                    {"ty": 3, "v": {"a": 0, "k": [125, 30]}}, {"ty": 2, "v": {"a": 0, "k": [1, 0, 0, 1]}},
+                    {"ty": 3, "v": {"a": 0, "k": [225, 30]}}, {"ty": 2, "v": {"a": 0, "k": [0, 1, 0, 1]}},
+                    {"ty": 3, "v": {"a": 0, "k": [125, 150]}}, {"ty": 2, "v": {"a": 0, "k": [0, 0, 1, 1]}},
+                    {"ty": 3, "v": {"a": 0, "k": [225, 150]}}, {"ty": 2, "v": {"a": 0, "k": [1, 1, 0, 1]}},
+                    {"ty": 0, "v": {"a": 0, "k": 20}}, {"ty": 0, "v": {"a": 0, "k": 0}}, {"ty": 0, "v": {"a": 0, "k": 100}}
+                ]}]
+            }
+        ]
+    })";
+    auto anim2 = lottie::Animation::load_from_data(phase2_extra);
+    assert(anim2 != nullptr);
+    verify_parity("Lottie Phase 2 Threshold + 4-Color Gradient", anim2, 0.0f);
+
+    std::cout << "  -> Lottie Phase 2 ExternalLayer & All 10 Color/Tone Effects CPU-vs-GPU Parity OK" << std::endl;
+}
+
+static void test_gpu_lottie_phase3_distortion_wipe_and_blur_parity() {
+    std::cout << "[TEST] Lottie Phase 3 (LinearWipe, VenetianBlinds, MotionTile, TransformFX, CornerPin, Bulge, Sphere, DirBlur, Sharpen, FractalNoise) CPU-vs-GPU Parity..." << std::endl;
+
+    auto dev = gpu::GpuDevice::create_headless();
+    if (!dev || !dev->is_valid()) {
+        std::cout << "  [SKIP] Headless GPU device unavailable." << std::endl;
+        return;
+    }
+
+    constexpr uint32_t W = 120, H = 120;
+    const Color bg = Color::from_rgba8(16, 20, 30, 255);
+
+    auto verify_case = [&](const char* label, const std::string& json, double max_mean_diff = 3.0) {
+        auto anim = lottie::Animation::load_from_data(json);
+        assert(anim != nullptr);
+
+        auto cpu_pm = Pixmap::create(W, H);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(bg);
+        {
+            Canvas cpu(*cpu_pm);
+            anim->render(cpu, 0.0f);
+        }
+
+        auto surf = gpu::GpuSurface::create(dev, W, H, 1);
+        assert(surf != nullptr);
+        gpu::GpuCanvas gpu(surf);
+        gpu.clear(bg);
+        anim->render(gpu, 0.0f);
+        gpu.flush();
+        auto gpu_pm = surf->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        double sum_diff = 0.0;
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cpu_pm->as_ref().pixel(x, y);
+                auto gp = gpu_pm->as_ref().pixel(x, y);
+                assert(cp.has_value() && gp.has_value());
+                sum_diff += (std::abs(int(cp->red()) - int(gp->red())) +
+                             std::abs(int(cp->green()) - int(gp->green())) +
+                             std::abs(int(cp->blue()) - int(gp->blue())) +
+                             std::abs(int(cp->alpha()) - int(gp->alpha()))) * 0.25;
+            }
+        }
+        const double mean_diff = sum_diff / double(W * H);
+        if (mean_diff >= max_mean_diff) {
+            std::cerr << "  [FAIL] Phase 3 parity '" << label << "' mean_diff=" << mean_diff << std::endl;
+        }
+        assert(mean_diff < max_mean_diff);
+    };
+
+    auto make_doc = [](std::string_view layer_body, std::string_view ef_json) {
+        std::string s = R"({"v":"5.9.0","fr":60,"ip":0,"op":60,"w":120,"h":120,"layers":[{)";
+        s += layer_body;
+        s += R"(,"ip":0,"op":60,"st":0,"ks":{"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"o":{"a":0,"k":100}},"ef":[)";
+        s += ef_json;
+        s += R"(]}]})";
+        return s;
+    };
+
+    const std::string_view card =
+        R"("ind":1,"ty":4,"nm":"Card","shapes":[{"ty":"rc","p":{"a":0,"k":[60,60]},"s":{"a":0,"k":[80,80]},"r":{"a":0,"k":0}},{"ty":"fl","c":{"a":0,"k":[0.92,0.38,0.22,1]},"o":{"a":0,"k":100}}])";
+    const std::string_view full_solid =
+        R"("ind":1,"ty":1,"nm":"Solid","sw":120,"sh":120,"sc":"#3080e0")";
+
+    verify_case("LinearWipe", make_doc(full_solid,
+        R"({"ty":5,"mn":"ADBE Linear Wipe","en":1,"ef":[{"ty":0,"v":{"a":0,"k":45}},{"ty":0,"v":{"a":0,"k":60}},{"ty":0,"v":{"a":0,"k":12}}]})"));
+    verify_case("VenetianBlinds", make_doc(full_solid,
+        R"({"ty":5,"mn":"ADBE Venetian Blinds","en":1,"ef":[{"ty":0,"v":{"a":0,"k":40}},{"ty":0,"v":{"a":0,"k":15}},{"ty":0,"v":{"a":0,"k":24}},{"ty":0,"v":{"a":0,"k":4}}]})"));
+    verify_case("MotionTile", make_doc(card,
+        R"({"ty":5,"mn":"ADBE Tile","en":1,"ef":[{"ty":3,"v":{"a":0,"k":[60,60]}},{"ty":0,"v":{"a":0,"k":50}},{"ty":0,"v":{"a":0,"k":50}},{"ty":0,"v":{"a":0,"k":100}},{"ty":0,"v":{"a":0,"k":100}},{"ty":7,"v":{"a":0,"k":1}}]})"));
+    verify_case("TransformEffect", make_doc(card,
+        R"({"ty":5,"mn":"ADBE Geometry2","en":1,"ef":[{"ty":3,"v":{"a":0,"k":[60,60]}},{"ty":3,"v":{"a":0,"k":[65,55]}},{"ty":7,"v":{"a":0,"k":1}},{"ty":0,"v":{"a":0,"k":85}},{"ty":0,"v":{"a":0,"k":85}},{"ty":0,"v":{"a":0,"k":10}},{"ty":0,"v":{"a":0,"k":0}},{"ty":0,"v":{"a":0,"k":18}},{"ty":0,"v":{"a":0,"k":85}}]})"));
+    verify_case("CornerPin", make_doc(full_solid,
+        R"({"ty":5,"mn":"ADBE Corner Pin","en":1,"ef":[{"ty":3,"v":{"a":0,"k":[20,15]}},{"ty":3,"v":{"a":0,"k":[105,10]}},{"ty":3,"v":{"a":0,"k":[10,105]}},{"ty":3,"v":{"a":0,"k":[110,110]}}]})"));
+    verify_case("Bulge", make_doc(card,
+        R"({"ty":5,"mn":"ADBE Bulge","en":1,"ef":[{"ty":0,"v":{"a":0,"k":50}},{"ty":0,"v":{"a":0,"k":50}},{"ty":3,"v":{"a":0,"k":[60,60]}},{"ty":0,"v":{"a":0,"k":1.5}}]})"));
+    verify_case("Sphere", make_doc(card,
+        R"({"ty":5,"mn":"ADBE Spherize","en":1,"ef":[{"ty":0,"v":{"a":0,"k":48}},{"ty":3,"v":{"a":0,"k":[60,60]}}]})"));
+    verify_case("DirectionalBlur", make_doc(card,
+        R"({"ty":5,"mn":"ADBE Motion Blur","en":1,"ef":[{"ty":0,"v":{"a":0,"k":45}},{"ty":0,"v":{"a":0,"k":18}}]})"));
+    verify_case("Sharpen", make_doc(card,
+        R"({"ty":5,"mn":"ADBE Sharpen","en":1,"ef":[{"ty":0,"v":{"a":0,"k":60}}]})"));
+    verify_case("FractalNoise", make_doc(full_solid,
+        R"({"ty":5,"mn":"ADBE Fractal Noise","en":1,"ef":[{"ty":7,"v":{"a":0,"k":1}},{"ty":7,"v":{"a":0,"k":2}},{"ty":7,"v":{"a":0,"k":0}},{"ty":0,"v":{"a":0,"k":140}},{"ty":0,"v":{"a":0,"k":0}},{"ty":7,"v":{"a":0,"k":1}},{"ty":0,"v":{"a":0,"k":24}},{"ty":0,"v":{"a":0,"k":3}},{"ty":0,"v":{"a":0,"k":50}},{"ty":0,"v":{"a":0,"k":50}},{"ty":0,"v":{"a":0,"k":30}},{"ty":0,"v":{"a":0,"k":100}}]})"));
+
+    std::cout << "  -> Lottie Phase 3 All 10 Transition/Distortion/Blur/Procedural Effects CPU-vs-GPU Parity OK" << std::endl;
+}
+
+static void test_gpu_lottie_phase4_expressions_and_text_on_path_parity() {
+    std::cout << "[TEST] Lottie Phase 4 (ExpressionManager, Multi-Selector Word/Line TextAnimator & Cubic Bezier Text-on-Path) CPU-vs-GPU Parity..." << std::endl;
+
+    auto dev = gpu::GpuDevice::create_headless();
+    if (!dev || !dev->is_valid()) {
+        std::cout << "  [SKIP] Headless GPU device unavailable." << std::endl;
+        return;
+    }
+
+    constexpr uint32_t W = 240, H = 160;
+    const Color bg = Color::from_rgba8(14, 18, 28, 255);
+
+    auto expr_mgr = std::make_shared<lottie::CallbackExpressionManager>();
+    expr_mgr->number_factory = [](std::string_view expr) -> std::shared_ptr<lottie::ExpressionEvaluator<float>> {
+        if (expr == "rot_spin") {
+            return std::make_shared<lottie::CallbackExpressionEvaluator<float>>([](float t) { return t * 90.0f; });
+        }
+        return nullptr;
+    };
+    expr_mgr->array_factory = [](std::string_view expr) -> std::shared_ptr<lottie::ExpressionEvaluator<std::vector<float>>> {
+        if (expr == "badge_pos") {
+            return std::make_shared<lottie::CallbackExpressionEvaluator<std::vector<float>>>([](float t) {
+                return std::vector<float>{30.0f + t * 40.0f, 34.0f};
+            });
+        }
+        if (expr == "badge_col") {
+            return std::make_shared<lottie::CallbackExpressionEvaluator<std::vector<float>>>([](float) {
+                return std::vector<float>{0.15f, 0.85f, 0.92f, 1.0f};
+            });
+        }
+        return nullptr;
+    };
+    expr_mgr->string_factory = [](std::string_view expr) -> std::shared_ptr<lottie::ExpressionEvaluator<std::string>> {
+        if (expr == "arch_str") {
+            return std::make_shared<lottie::CallbackExpressionEvaluator<std::string>>([](float) {
+                return std::string("NISABA GPU");
+            });
+        }
+        return nullptr;
+    };
+
+    const std::string phase4_json = R"({
+        "v": "5.9.0", "fr": 60, "ip": 0, "op": 60, "w": 240, "h": 160,
+        "layers": [
+            {
+                "ind": 1, "ty": 4, "nm": "ExprBadge", "ip": 0, "op": 60, "st": 0,
+                "ks": {
+                    "p": {"a": 0, "k": [10, 10], "x": "badge_pos"},
+                    "a": {"a": 0, "k": [0, 0]},
+                    "s": {"a": 0, "k": [100, 100]},
+                    "r": {"a": 0, "k": 0, "x": "rot_spin"},
+                    "o": {"a": 0, "k": 92}
+                },
+                "shapes": [
+                    {"ty": "rc", "p": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [28, 28]}, "r": {"a": 0, "k": 6}},
+                    {"ty": "fl", "c": {"a": 0, "k": [1, 0, 0, 1], "x": "badge_col"}, "o": {"a": 0, "k": 100}}
+                ]
+            },
+            {
+                "ind": 2, "ty": 5, "nm": "ArchText", "ip": 0, "op": 60, "st": 0,
+                "ks": {"p": {"a": 0, "k": [0, 0]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "o": {"a": 0, "k": 100}},
+                "masksProperties": [{
+                    "mode": "n",
+                    "pt": {
+                        "a": 0,
+                        "k": {
+                            "c": false,
+                            "v": [[24, 130], [216, 130]],
+                            "i": [[0, 0], [0, -90]],
+                            "o": [[0, -90], [0, 0]]
+                        }
+                    },
+                    "o": {"a": 0, "k": 100}
+                }],
+                "t": {
+                    "d": {"x": "arch_str", "k": [{"t": 0, "s": {"t": "FALLBACK", "s": 20, "fc": [1, 0.85, 0.2], "f": "Sans", "j": 1, "lh": 24}}]},
+                    "p": {"m": 0, "f": {"a": 0, "k": 10}, "l": {"a": 0, "k": 10}, "p": 1, "r": 0, "a": 1},
+                    "a": [{
+                        "nm": "WordAccent",
+                        "s": {"s": {"a": 0, "k": 1}, "e": {"a": 0, "k": 2}, "r": 2, "b": 3, "sh": 1, "sm": {"a": 0, "k": 100}},
+                        "a": {"fc": {"a": 0, "k": [0.3, 0.95, 0.5, 1]}, "s": {"a": 0, "k": [115, 115]}}
+                    }]
+                }
+            }
+        ]
+    })";
+
+    auto anim = lottie::AnimationBuilder().set_expression_manager(expr_mgr).make(phase4_json);
+    assert(anim != nullptr);
+
+    auto cpu_pm = Pixmap::create(W, H);
+    assert(cpu_pm.has_value());
+    cpu_pm->fill(bg);
+    {
+        Canvas cpu(*cpu_pm);
+        anim->render(cpu, 30.0f);
+    }
+
+    auto surf = gpu::GpuSurface::create(dev, W, H, 1);
+    assert(surf != nullptr);
+    gpu::GpuCanvas gpu(surf);
+    gpu.clear(bg);
+    anim->render(gpu, 30.0f);
+    gpu.flush();
+    auto gpu_pm = surf->to_pixmap();
+    assert(gpu_pm.has_value());
+
+    double sum_diff = 0.0;
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            auto cp = cpu_pm->as_ref().pixel(x, y);
+            auto gp = gpu_pm->as_ref().pixel(x, y);
+            assert(cp.has_value() && gp.has_value());
+            sum_diff += (std::abs(int(cp->red()) - int(gp->red())) +
+                         std::abs(int(cp->green()) - int(gp->green())) +
+                         std::abs(int(cp->blue()) - int(gp->blue())) +
+                         std::abs(int(cp->alpha()) - int(gp->alpha()))) * 0.25;
+        }
+    }
+    const double mean_diff = sum_diff / double(W * H);
+    if (mean_diff >= 2.5) {
+        std::cerr << "  [FAIL] Lottie Phase 4 parity mean_diff=" << mean_diff << std::endl;
+    }
+    assert(mean_diff < 2.5);
+
+    // Spot-check the expression-driven cyan badge at (50, 34) on both CPU & GPU
+    auto bp = gpu_pm->as_ref().pixel(50, 34);
+    assert(bp.has_value() && bp->green() > 170 && bp->blue() > 190);
+
+    std::cout << "  -> Lottie Phase 4 Expressions, TextAnimator & Text-on-Path CPU-vs-GPU Parity OK (mean_diff=" << mean_diff << ")" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "Running Nisaba GPU Rendering Pipeline Test Suite" << std::endl;
@@ -3593,9 +4124,13 @@ int main() {
     test_gpu_runtime_shader_image_filter_parity();
     test_gpu_phase2_and_lighting_filters_parity();
     test_gpu_phase3_and_phase4_2_parity();
+    test_gpu_lottie_phase1_parity_and_damage();
+    test_gpu_lottie_phase2_precomp_and_color_effects_parity();
+    test_gpu_lottie_phase3_distortion_wipe_and_blur_parity();
+    test_gpu_lottie_phase4_expressions_and_text_on_path_parity();
 
     std::cout << "========================================" << std::endl;
-    std::cout << "All Nisaba GPU pipeline tests PASSED (35/35)!" << std::endl;
+    std::cout << "All Nisaba GPU pipeline tests PASSED (39/39)!" << std::endl;
     std::cout << "========================================" << std::endl;
 
     return 0;

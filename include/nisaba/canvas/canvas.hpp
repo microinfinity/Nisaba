@@ -116,7 +116,17 @@ public:
         layer_stack_.pop_back();
         pixmap_ = layer.saved_pixmap;
 
+        auto recycle_backing = [&]() {
+            if (layer.backing_pixmap.width() == pixmap_.width() &&
+                layer.backing_pixmap.height() == pixmap_.height() &&
+                layer.backing_pixmap.format() == pixmap_.format() &&
+                recycled_layers_.size() < 4) {
+                recycled_layers_.push_back(std::move(layer.backing_pixmap));
+            }
+        };
+
         if (!layer.device_bounds.has_value()) {
+            recycle_backing();
             return;
         }
 
@@ -181,6 +191,7 @@ public:
             composite_clip = composite_clip->intersect(*scissor_clip_);
         }
         if (!composite_clip.has_value()) {
+            recycle_backing();
             return;
         }
 
@@ -203,6 +214,7 @@ public:
                 m ? m->data() : nullptr,
                 m ? m->width() : 0u
             );
+            recycle_backing();
             return;
         }
 
@@ -210,6 +222,7 @@ public:
             pixmap_, 0, 0, layer.backing_pixmap.as_ref(), px_paint,
             Transform(), current_mask(), composite_clip
         );
+        recycle_backing();
     }
 
     void reset_transform() noexcept {
@@ -1291,7 +1304,27 @@ private:
             return;
         }
 
-        auto off = Pixmap::allocate(width(), height(), pixmap_.format());
+        const ScreenIntRect b = *dev_bounds;
+        std::optional<Pixmap> off;
+        for (size_t ri = recycled_layers_.size(); ri > 0; --ri) {
+            auto& cand = recycled_layers_[ri - 1];
+            if (cand.width() == width() && cand.height() == height() && cand.format() == pixmap_.format()) {
+                off = std::move(cand);
+                recycled_layers_.erase(recycled_layers_.begin() + static_cast<std::ptrdiff_t>(ri - 1));
+                // Clear ONLY the active device_bounds ROI instead of the entire framebuffer
+                auto off_mut = off->as_mut();
+                const size_t bpp = off_mut.bytes_per_pixel();
+                const size_t row_bytes = static_cast<size_t>(b.width()) * bpp;
+                const size_t x_off = static_cast<size_t>(b.x()) * bpp;
+                for (uint32_t y = 0; y < b.height(); ++y) {
+                    std::memset(off_mut.row_raw(b.y() + y) + x_off, 0, row_bytes);
+                }
+                break;
+            }
+        }
+        if (!off.has_value()) {
+            off = Pixmap::allocate(width(), height(), pixmap_.format());
+        }
         if (!off.has_value()) {
             layer_stack_.push_back(CanvasLayerState{
                 .backing_pixmap = Pixmap{},
@@ -1301,8 +1334,6 @@ private:
             });
             return;
         }
-
-        const ScreenIntRect b = *dev_bounds;
         if (with_backdrop) {
             const size_t bpp = pixmap_.bytes_per_pixel();
             if (blur_sigma > 0.001f) {
@@ -1362,6 +1393,7 @@ private:
     Transform current_transform_{};
     std::vector<CanvasState> state_stack_{};
     std::vector<CanvasLayerState> layer_stack_{};
+    std::vector<Pixmap> recycled_layers_{};
     std::shared_ptr<Mask> active_clip_mask_{};
     std::shared_ptr<Mask> recycled_mask_{};
     const Mask* external_mask_ptr_{nullptr};

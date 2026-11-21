@@ -4,11 +4,17 @@
 /// @brief Lottie layer hierarchy, masks, track mattes, effects, images, typography, 3D, and rendering.
 
 #include "nisaba/lottie/lottie_types.hpp"
+#include "nisaba/lottie/resources.hpp"
+#include "nisaba/lottie/external_layer.hpp"
+#include "nisaba/lottie/expression.hpp"
+#include "nisaba/lottie/audio.hpp"
 #include "nisaba/lottie/property.hpp"
+#include "nisaba/lottie/effects.hpp"
 #include "nisaba/lottie/shape.hpp"
 #include "nisaba/canvas/canvas.hpp"
 #include "nisaba/canvas/pixmap.hpp"
 #include "nisaba/color/color.hpp"
+#include "nisaba/math/rect.hpp"
 #include "nisaba/math/transform.hpp"
 #include "nisaba/math/transform4x4.hpp"
 #include "nisaba/text/font_system.hpp"
@@ -33,6 +39,28 @@ struct LottieImageAsset {
     float height = 0.0f;
     bool embedded = false; // "e" == 1
     std::optional<Pixmap> pixmap;
+    std::shared_ptr<ImageAsset> asset;
+
+    [[nodiscard]] bool is_multi_frame() const noexcept {
+        return asset && asset->is_multi_frame();
+    }
+
+    [[nodiscard]] std::optional<PixmapRef> resolve_frame(float t_seconds) const {
+        if (asset) {
+            return asset->get_frame(t_seconds);
+        }
+        if (pixmap.has_value()) {
+            return pixmap->as_ref();
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] uint64_t frame_token(float t_seconds) const noexcept {
+        if (asset) {
+            return asset->frame_token(t_seconds);
+        }
+        return pixmap.has_value() ? 1u : 0u;
+    }
 };
 
 struct LottieFontDef {
@@ -57,10 +85,12 @@ struct LottieAssetRegistry {
     std::unordered_map<std::string, std::vector<std::shared_ptr<LottieLayer>>> precomps;
     std::unordered_map<std::string, LottieImageAsset> images;
     std::unordered_map<std::string, LottieFontDef> fonts;
+    std::unordered_map<std::string, std::shared_ptr<AudioAsset>> audio_assets;
     std::vector<LottieGlyphChar> chars;
     std::shared_ptr<text::FontSystem> font_system;
     float comp_width = 512.0f;
     float comp_height = 512.0f;
+    float frame_rate = 60.0f;
 
     [[nodiscard]] const LottieGlyphChar* find_char(std::string_view ch, std::string_view family, std::string_view style) const noexcept;
 };
@@ -78,29 +108,7 @@ struct Mask {
     static Mask parse(const json::JsonValue& val);
 };
 
-// ── Layer Effects ("ef") ──────────────────────────────────────────────────
-
-struct LayerEffect {
-    EffectType type = EffectType::Unknown;
-    std::string name;
-    bool enabled = true;
-
-    // Effect parameters
-    FloatProperty blurriness{0.0f};        // Blur (ty=29)
-    int blur_dimensions = 1;               // 1=Both, 2=Horizontal, 3=Vertical
-    ColorProperty shadow_color{Color::BLACK}; // DropShadow (ty=25) & Fill (ty=21)
-    FloatProperty shadow_opacity{100.0f};  // DropShadow (0..255 or 0..100) / Fill (0..1)
-    FloatProperty shadow_direction{135.0f};// DropShadow angle in degrees
-    FloatProperty shadow_distance{5.0f};   // DropShadow distance
-    FloatProperty shadow_softness{5.0f};   // DropShadow blur radius
-
-    ColorProperty tint_black{Color::BLACK};   // Tint (ty=20) / Tritone shadows (ty=23)
-    ColorProperty tint_mid{Color::from_rgba8(128, 128, 128, 255)}; // Tritone midtones (ty=23)
-    ColorProperty tint_white{Color::WHITE};   // Tint (ty=20) / Tritone highlights (ty=23)
-    FloatProperty tint_amount{100.0f};        // Tint / Tritone blend amount [0..100]
-
-    static LayerEffect parse(const json::JsonValue& val);
-};
+// ── Layer Effects ("ef") are defined in nisaba/lottie/effects.hpp ─────────
 
 // ── Text Document & Animators ("ty": 5) ───────────────────────────────────
 
@@ -123,20 +131,47 @@ struct TextDocument {
 };
 
 struct TextRangeSelector {
-    FloatProperty start{0.0f};     // "s" [0..100]
-    FloatProperty end{100.0f};     // "e" [0..100]
-    FloatProperty offset{0.0f};    // "o" [-100..100]
-    int units = 1;                 // "r": 1 = Percentage, 2 = Index
-    int based_on = 1;              // "b": 1 = Characters, 2 = Characters excluding spaces, 3 = Words, 4 = Lines
-    int shape = 1;                 // "sh": 1 = Square, 2 = Ramp Up, 3 = Ramp Down, 4 = Triangle, 5 = Round, 6 = Smooth
+    FloatProperty start{0.0f};      // "s" [0..100]
+    FloatProperty end{100.0f};      // "e" [0..100]
+    FloatProperty offset{0.0f};     // "o" [-100..100]
+    FloatProperty smoothness{100.0f}; // "sm" [0..100]%
+    FloatProperty max_amount{100.0f}; // "a" [-100..100]%
+    FloatProperty max_ease{0.0f};   // "xe" [-100..100]
+    FloatProperty min_ease{0.0f};   // "ne" [-100..100]
+    int units = 1;                  // "r": 1 = Percentage, 2 = Index
+    int based_on = 1;               // "b": 1 = Characters, 2 = Chars excl. spaces, 3 = Words, 4 = Lines
+    int shape = 1;                  // "sh": 1 = Square, 2 = Ramp Up, 3 = Ramp Down, 4 = Triangle, 5 = Round, 6 = Smooth
+    int mode = 1;                   // "m": 1=Add, 2=Subtract, 3=Intersect, 4=Min, 5=Max, 6=Difference
 
     [[nodiscard]] float compute_factor(size_t index, size_t total_count, float frame) const noexcept;
+    [[nodiscard]] bool is_animated() const noexcept;
+    void bind_expression_manager(ExpressionManager& mgr);
     static TextRangeSelector parse(const json::JsonValue& val);
+};
+
+struct TextPathOptions {
+    bool enabled = false;
+    int mask_index = -1;            // "m": 0-based index into layer.masks
+    FloatProperty first_margin{0.0f}; // "f": arc-length start offset along path
+    FloatProperty last_margin{0.0f};  // "l": arc-length end offset along path
+    bool perpendicular_to_path = true; // "p": rotate glyphs perpendicular to tangent
+    bool reverse_path = false;         // "r": traverse path in reverse
+    bool force_alignment = false;      // "a": spread glyphs evenly along available span
+
+    [[nodiscard]] bool is_animated() const noexcept {
+        return enabled && (first_margin.is_animated() || last_margin.is_animated());
+    }
+    void bind_expression_manager(ExpressionManager& mgr) {
+        first_margin.bind_expression_manager(mgr);
+        last_margin.bind_expression_manager(mgr);
+    }
+    static TextPathOptions parse(const json::JsonValue& val);
 };
 
 struct TextAnimator {
     std::string name;
     TextRangeSelector selector;
+    std::vector<TextRangeSelector> selectors;
     PointProperty position{Point::zero()};
     PointProperty scale{Point::from_xy(100.0f, 100.0f)};
     FloatProperty rotation{0.0f};
@@ -155,6 +190,7 @@ struct TextAnimator {
     bool has_stroke_width = false;
     bool has_tracking = false;
 
+    void bind_expression_manager(ExpressionManager& mgr);
     static TextAnimator parse(const json::JsonValue& val);
 };
 
@@ -219,6 +255,24 @@ public:
     /// @brief Collect global vector bounds / paths for hit-testing.
     virtual bool hit_test(float x, float y, float frame, const LottieAssetRegistry& assets, std::string& out_hit_name) const;
 
+    /// @brief Returns true if any property, shape, mask, effect, or referenced asset on this layer is animated.
+    [[nodiscard]] virtual bool is_layer_animated(const LottieAssetRegistry& assets) const noexcept;
+
+    /// @brief Computes tight local/global content bounds in composition coordinates at `frame`.
+    [[nodiscard]] virtual std::optional<Rect> compute_bounds(float frame, const LottieAssetRegistry& assets) const;
+
+    /// @brief Computes full visual bounds including 3D projection, layer effects (blur/drop shadow), and AA padding.
+    [[nodiscard]] std::optional<Rect> compute_complete_bounds(float frame, const LottieAssetRegistry& assets) const;
+
+    /// @brief Computes a deterministic content fingerprint at `frame` for incremental dirty tracking.
+    [[nodiscard]] virtual uint64_t visual_fingerprint(float frame, const LottieAssetRegistry& assets) const noexcept;
+
+    /// @brief Counts animated properties / animators owned by this layer (for build statistics).
+    [[nodiscard]] virtual size_t count_animators() const noexcept;
+
+    /// @brief Binds a pluggable ExpressionManager to all properties on this layer.
+    virtual void bind_expression_manager(ExpressionManager& mgr);
+
     static std::shared_ptr<LottieLayer> parse(const json::JsonValue& val);
 };
 
@@ -233,6 +287,11 @@ public:
         const LottieAssetRegistry& assets) const override;
 
     bool hit_test(float x, float y, float frame, const LottieAssetRegistry& assets, std::string& out_hit_name) const override;
+    [[nodiscard]] bool is_layer_animated(const LottieAssetRegistry& assets) const noexcept override;
+    [[nodiscard]] std::optional<Rect> compute_bounds(float frame, const LottieAssetRegistry& assets) const override;
+    [[nodiscard]] uint64_t visual_fingerprint(float frame, const LottieAssetRegistry& assets) const noexcept override;
+    [[nodiscard]] size_t count_animators() const noexcept override;
+    void bind_expression_manager(ExpressionManager& mgr) override;
 
     static std::shared_ptr<ShapeLayer> parse(const json::JsonValue& val);
 };
@@ -251,6 +310,8 @@ public:
         const LottieAssetRegistry& assets) const override;
 
     bool hit_test(float x, float y, float frame, const LottieAssetRegistry& assets, std::string& out_hit_name) const override;
+    [[nodiscard]] std::optional<Rect> compute_bounds(float frame, const LottieAssetRegistry& assets) const override;
+    [[nodiscard]] uint64_t visual_fingerprint(float frame, const LottieAssetRegistry& assets) const noexcept override;
 
     static std::shared_ptr<SolidLayer> parse(const json::JsonValue& val);
 };
@@ -263,6 +324,7 @@ public:
     float height = 0.0f;
     FloatProperty time_remap{0.0f};
     bool has_time_remap = false;
+    std::shared_ptr<ExternalLayer> external_layer;
 
     void render_with_assets(
         RenderContext& ctx,
@@ -270,6 +332,11 @@ public:
         const LottieAssetRegistry& assets) const override;
 
     bool hit_test(float x, float y, float frame, const LottieAssetRegistry& assets, std::string& out_hit_name) const override;
+    [[nodiscard]] bool is_layer_animated(const LottieAssetRegistry& assets) const noexcept override;
+    [[nodiscard]] std::optional<Rect> compute_bounds(float frame, const LottieAssetRegistry& assets) const override;
+    [[nodiscard]] uint64_t visual_fingerprint(float frame, const LottieAssetRegistry& assets) const noexcept override;
+    [[nodiscard]] size_t count_animators() const noexcept override;
+    void bind_expression_manager(ExpressionManager& mgr) override;
 
     static std::shared_ptr<PrecompLayer> parse(const json::JsonValue& val);
 };
@@ -296,6 +363,9 @@ public:
         const LottieAssetRegistry& assets) const override;
 
     bool hit_test(float x, float y, float frame, const LottieAssetRegistry& assets, std::string& out_hit_name) const override;
+    [[nodiscard]] bool is_layer_animated(const LottieAssetRegistry& assets) const noexcept override;
+    [[nodiscard]] std::optional<Rect> compute_bounds(float frame, const LottieAssetRegistry& assets) const override;
+    [[nodiscard]] uint64_t visual_fingerprint(float frame, const LottieAssetRegistry& assets) const noexcept override;
 
     static std::shared_ptr<ImageLayer> parse(const json::JsonValue& val);
 };
@@ -306,7 +376,11 @@ public:
     std::vector<Keyframe<TextDocument>> keyframes;
     TextDocument static_doc;
     std::optional<std::string> text_override;
+    std::optional<TextDocument> doc_override;
     std::vector<TextAnimator> animators;
+    TextPathOptions path_options;
+    std::string text_expression;
+    std::shared_ptr<ExpressionEvaluator<std::string>> text_evaluator;
 
     [[nodiscard]] const TextDocument& evaluate_document(float frame) const noexcept;
 
@@ -316,8 +390,34 @@ public:
         const LottieAssetRegistry& assets) const override;
 
     bool hit_test(float x, float y, float frame, const LottieAssetRegistry& assets, std::string& out_hit_name) const override;
+    [[nodiscard]] bool is_layer_animated(const LottieAssetRegistry& assets) const noexcept override;
+    [[nodiscard]] std::optional<Rect> compute_bounds(float frame, const LottieAssetRegistry& assets) const override;
+    [[nodiscard]] uint64_t visual_fingerprint(float frame, const LottieAssetRegistry& assets) const noexcept override;
+    [[nodiscard]] size_t count_animators() const noexcept override;
+    void bind_expression_manager(ExpressionManager& mgr) override;
 
     static std::shared_ptr<TextLayer> parse(const json::JsonValue& val);
+
+private:
+    struct TextRenderCache;
+    mutable std::shared_ptr<TextRenderCache> render_cache_;
+};
+
+// Audio Layer ("ty": 6)
+class AudioLayer : public LottieLayer {
+public:
+    std::string ref_id;
+    PointProperty level{Point::zero()}; // "au.lv" stereo dB levels [left, right]
+
+    void render_with_assets(
+        RenderContext&,
+        float,
+        const LottieAssetRegistry&) const override {}
+
+    [[nodiscard]] size_t count_animators() const noexcept override;
+    void bind_expression_manager(ExpressionManager& mgr) override;
+
+    static std::shared_ptr<AudioLayer> parse(const json::JsonValue& val);
 };
 
 /// @brief Pre-link parent_ptr and matte_layer_ptr across a layer list once at load time.

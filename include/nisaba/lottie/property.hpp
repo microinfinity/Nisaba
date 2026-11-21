@@ -4,6 +4,7 @@
 /// @brief Animatable properties, spatial/temporal Bezier evaluators, expressions, and transforms for Lottie.
 
 #include "nisaba/lottie/lottie_types.hpp"
+#include "nisaba/lottie/expression.hpp"
 #include "nisaba/json/json.hpp"
 #include "nisaba/math/point.hpp"
 #include "nisaba/math/transform.hpp"
@@ -86,7 +87,9 @@ public:
     explicit Property(T static_val) : static_value_(std::move(static_val)), is_animated_(false) {}
 
     [[nodiscard]] bool is_animated() const noexcept {
-        return !has_override_ && (is_animated_ || expression_.type == LottieExpression::Type::Wiggle);
+        return !has_override_ &&
+               (is_animated_ || expression_.type == LottieExpression::Type::Wiggle ||
+                number_eval_ != nullptr || array_eval_ != nullptr);
     }
     [[nodiscard]] const std::vector<Keyframe<T>>& keyframes() const noexcept { return keyframes_; }
     [[nodiscard]] const std::string& slot_id() const noexcept { return slot_id_; }
@@ -94,6 +97,12 @@ public:
 
     [[nodiscard]] const LottieExpression& expression() const noexcept { return expression_; }
     void set_expression(LottieExpression expr) noexcept { expression_ = expr; }
+
+    [[nodiscard]] const std::string& raw_expression() const noexcept { return raw_expression_; }
+    void set_raw_expression(std::string expr_str) { raw_expression_ = std::move(expr_str); }
+
+    /// Binds a pluggable ExpressionEvaluator from `mgr` when `raw_expression_` is non-empty.
+    void bind_expression_manager(ExpressionManager& mgr);
 
     void set_static(T val) {
         static_value_ = std::move(val);
@@ -127,7 +136,10 @@ private:
     T override_value_{};
     std::vector<Keyframe<T>> keyframes_;
     std::string slot_id_;
+    std::string raw_expression_;
     LottieExpression expression_{};
+    std::shared_ptr<ExpressionEvaluator<float>> number_eval_;
+    std::shared_ptr<ExpressionEvaluator<std::vector<float>>> array_eval_;
     mutable size_t last_kf_hint_ = 0; // O(1) sequential frame evaluation cursor
     bool is_animated_ = false;
     bool has_override_ = false;
@@ -183,6 +195,7 @@ struct LottieTransform {
     [[nodiscard]] Transform4x4 matrix_3d(float frame, float comp_w = 500.0f, float comp_h = 500.0f) const;
     [[nodiscard]] float eval_opacity(float frame) const;
     [[nodiscard]] bool is_animated() const noexcept;
+    void bind_expression_manager(ExpressionManager& mgr);
 };
 
 } // namespace nisaba::lottie

@@ -1,9 +1,11 @@
 #pragma once
 
 /// @file player.hpp
-/// @brief Interactive playback controller, state machine, marker segments, and hit-testing for Lottie animations.
+/// @brief Interactive playback controller, state machine, marker segments, dirty tracking, and hit-testing for Lottie animations.
 
 #include "nisaba/lottie/animation.hpp"
+#include "nisaba/lottie/invalidation.hpp"
+#include "nisaba/lottie/audio.hpp"
 
 #include <memory>
 #include <functional>
@@ -39,6 +41,10 @@ public:
     void set_speed(float speed) noexcept { speed_ = speed; }
     [[nodiscard]] float speed() const noexcept { return speed_; }
 
+    /// @brief Attach an `AudioTrack` playback hook for synchronized `LayerType::Audio` layers.
+    void set_audio_track(std::shared_ptr<AudioTrack> track) { audio_track_ = std::move(track); }
+    [[nodiscard]] std::shared_ptr<AudioTrack> audio_track() const noexcept { return audio_track_; }
+
     /// @brief Restrict playback to a custom frame segment [start_frame, end_frame].
     void set_segment(float start_frame, float end_frame) noexcept;
 
@@ -48,11 +54,15 @@ public:
     /// @brief Play a named marker segment ("cm") defined in the Lottie document.
     bool play_marker(std::string_view marker_name) noexcept;
 
-    /// @brief Seek directly to a frame number.
-    void seek_frame(float frame) noexcept;
+    /// @brief Seek directly to a frame number and optionally record dirty regions into `ic`.
+    void seek_frame(float frame, InvalidationController* ic = nullptr) noexcept;
+
+    /// @brief Seek directly to a frame number and output the minimal dirty bounding box into `*out_dirty_rect`.
+    /// @return True if any visible region changed (and `*out_dirty_rect` was populated).
+    bool seek_frame(float frame, Rect* out_dirty_rect) noexcept;
 
     /// @brief Seek to a normalized progress [0.0, 1.0] within the active segment.
-    void seek_progress(float progress) noexcept;
+    void seek_progress(float progress, InvalidationController* ic = nullptr) noexcept;
 
     /// @brief Current frame being displayed.
     [[nodiscard]] float current_frame() const noexcept { return current_frame_; }
@@ -60,9 +70,12 @@ public:
     /// @brief Current normalized playback progress in [0.0, 1.0].
     [[nodiscard]] float progress() const noexcept;
 
-    /// @brief Advance playback by delta time in seconds.
+    /// @brief Advance playback by delta time in seconds and optionally record dirty regions into `ic`.
     /// @return True if animation is still active/playing.
-    bool advance(float delta_time_seconds);
+    bool advance(float delta_time_seconds, InvalidationController* ic = nullptr);
+
+    /// @brief Advance playback by delta time in seconds and output minimal dirty bounding box into `*out_dirty_rect`.
+    bool advance(float delta_time_seconds, Rect* out_dirty_rect);
 
     /// @brief Render current frame to canvas (1:1 scale).
     void render(ICanvas& canvas) const;
@@ -115,6 +128,7 @@ private:
     float current_frame_ = 0.0f;
     std::optional<float> segment_in_;
     std::optional<float> segment_out_;
+    std::shared_ptr<AudioTrack> audio_track_;
 };
 
 } // namespace nisaba::lottie

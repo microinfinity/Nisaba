@@ -208,6 +208,10 @@ endif
 if get_option('enable_lottie')
   nisaba_sources += files(
     'src/json/json.cpp',
+    'src/lottie/invalidation.cpp',
+    'src/lottie/resources.cpp',
+    'src/lottie/diagnostics.cpp',
+    'src/lottie/effects.cpp',
     'src/lottie/property.cpp',
     'src/lottie/shape.cpp',
     'src/lottie/layer.cpp',

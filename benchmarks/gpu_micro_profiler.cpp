@@ -3749,11 +3749,52 @@ int main(int argc, char** argv) {
 		]
 	})JSON";
 
+	const char* kLottieEffectsJson = R"JSON({
+		"v":"5.9.0","fr":60,"ip":0,"op":60,"w":400,"h":400,"nm":"ParityFX","ddd":0,"assets":[],
+		"layers":[
+			{"ddd":0,"ind":1,"ty":1,"nm":"RampBG","sw":400,"sh":400,"sc":"#ffffff","ip":0,"op":60,"st":0,
+			 "ks":{"o":{"a":0,"k":100},"r":{"a":0,"k":0},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]}},
+			 "ef":[{"ty":5,"mn":"ADBE Ramp","en":1,"ef":[
+				{"ty":3,"v":{"a":0,"k":[0,0]}},{"ty":2,"v":{"a":0,"k":[0.12,0.18,0.45,1]}},
+				{"ty":3,"v":{"a":0,"k":[400,400]}},{"ty":2,"v":{"a":0,"k":[0.85,0.22,0.42,1]}},
+				{"ty":7,"v":{"a":0,"k":1}},{"ty":0,"v":{"a":0,"k":0}},{"ty":0,"v":{"a":0,"k":0}}
+			 ]}]},
+			{"ddd":0,"ind":2,"ty":4,"nm":"WipedCard","ip":0,"op":60,"st":0,
+			 "ks":{"o":{"a":0,"k":100},"r":{"a":0,"k":0},"p":{"a":0,"k":[200,200]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]}},
+			 "shapes":[
+				{"ty":"rc","p":{"a":0,"k":[0,0]},"s":{"a":0,"k":[220,220]},"r":{"a":0,"k":24}},
+				{"ty":"fl","c":{"a":0,"k":[0.95,0.72,0.2,1]},"o":{"a":0,"k":100}}
+			 ],
+			 "ef":[
+				{"ty":5,"mn":"ADBE HUE SATURATION","en":1,"ef":[{"ty":0,"v":{"a":1,"k":[{"t":0,"s":[0],"e":[180]},{"t":60,"s":[180]}]}},{"ty":0,"v":{"a":0,"k":15}},{"ty":0,"v":{"a":0,"k":0}}]},
+				{"ty":5,"mn":"ADBE Linear Wipe","en":1,"ef":[{"ty":0,"v":{"a":1,"k":[{"t":0,"s":[15],"e":[65]},{"t":60,"s":[65]}]}},{"ty":0,"v":{"a":0,"k":45}},{"ty":0,"v":{"a":0,"k":16}}]}
+			 ]}
+		]
+	})JSON";
+	const char* kLottieTextPathJson = R"JSON({
+		"v":"5.9.0","fr":60,"ip":0,"op":60,"w":400,"h":240,"nm":"TextPath","ddd":0,"assets":[],
+		"layers":[
+			{"ddd":0,"ind":1,"ty":5,"nm":"Arch","ip":0,"op":60,"st":0,
+			 "ks":{"o":{"a":0,"k":100},"r":{"a":0,"k":0},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]}},
+			 "masksProperties":[{"mode":"n","pt":{"a":0,"k":{"c":false,"v":[[30,180],[370,180]],"i":[[0,0],[0,-140]],"o":[[0,-140],[0,0]]}},"o":{"a":0,"k":100}}],
+			 "t":{
+				"d":{"k":[{"t":0,"s":{"t":"NISABA ENGINE GPU","s":28,"fc":[1,0.92,0.35],"f":"Sans","j":1,"lh":34}}]},
+				"p":{"m":0,"f":{"a":1,"k":[{"t":0,"s":[0],"e":[40]},{"t":60,"s":[40]}]},"l":{"a":0,"k":0},"p":1,"r":0,"a":0},
+				"a":[{"nm":"Wave","s":{"s":{"a":0,"k":0},"e":{"a":0,"k":100},"o":{"a":1,"k":[{"t":0,"s":[0],"e":[50]},{"t":60,"s":[50]}]},"r":1,"b":1,"sh":5,"sm":{"a":0,"k":100}},
+					  "a":{"p":{"a":0,"k":[0,-14]},"fc":{"a":0,"k":[0.25,0.9,0.95,1]}}}]
+			 }}
+		]
+	})JSON";
+
 	auto nisabaLottieSimple = nisaba::lottie::Animation::load_from_data(kLottieSimpleJson);
 	auto nisabaLottieComplex = nisaba::lottie::Animation::load_from_data(kLottieComplexJson);
+	auto nisabaLottieEffects = nisaba::lottie::Animation::load_from_data(kLottieEffectsJson);
+	auto nisabaLottieTextPath = nisaba::lottie::Animation::load_from_data(kLottieTextPathJson);
 #ifdef HAVE_SKOTTIE
 	auto skiaLottieSimple = skottie::Animation::Make(kLottieSimpleJson, std::strlen(kLottieSimpleJson));
 	auto skiaLottieComplex = skottie::Animation::Make(kLottieComplexJson, std::strlen(kLottieComplexJson));
+	auto skiaLottieEffects = skottie::Animation::Make(kLottieEffectsJson, std::strlen(kLottieEffectsJson));
+	auto skiaLottieTextPath = skottie::Animation::Make(kLottieTextPathJson, std::strlen(kLottieTextPathJson));
 	if (nisabaLottieSimple && skiaLottieSimple) {
 		float nFrame = 0.0f, sFrame = 0.0f;
 		const auto nDst = nisaba::Rect::from_xywh(420.0f, 240.0f, 240.0f, 240.0f).value();
@@ -3803,6 +3844,52 @@ int main(int argc, char** argv) {
 					skiaLottieComplex->seekFrame(std::fmod(sFrame + i * 15.0f, 60.0f));
 					skiaLottieComplex->render(c, &dst);
 				}
+				sFrame = std::fmod(sFrame + 1.0f, 60.0f);
+			}
+		);
+		nisaba::lottie::InvalidationController nIc;
+		benchmark_canvas_op("103b. Lottie Damage-Tracked Seek + Render",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nIc.reset();
+				nisabaLottieComplex->seek_frame(nFrame, &nIc);
+				nisabaLottieComplex->render(c, nFrame, nDst);
+				nFrame = std::fmod(nFrame + 1.0f, 60.0f);
+			},
+			[&](SkCanvas* c) {
+				skiaLottieComplex->seekFrame(sFrame);
+				skiaLottieComplex->render(c, &sDst);
+				sFrame = std::fmod(sFrame + 1.0f, 60.0f);
+			}
+		);
+	}
+	if (nisabaLottieEffects && skiaLottieEffects) {
+		float nFrame = 0.0f, sFrame = 0.0f;
+		const auto nDst = nisaba::Rect::from_xywh(340.0f, 160.0f, 400.0f, 400.0f).value();
+		const SkRect sDst = SkRect::MakeXYWH(340.0f, 160.0f, 400.0f, 400.0f);
+		benchmark_canvas_op("103c. Lottie Color/Tone & LinearWipe FX (GPU)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisabaLottieEffects->render(c, nFrame, nDst);
+				nFrame = std::fmod(nFrame + 1.0f, 60.0f);
+			},
+			[&](SkCanvas* c) {
+				skiaLottieEffects->seekFrame(sFrame);
+				skiaLottieEffects->render(c, &sDst);
+				sFrame = std::fmod(sFrame + 1.0f, 60.0f);
+			}
+		);
+	}
+	if (nisabaLottieTextPath && skiaLottieTextPath) {
+		float nFrame = 0.0f, sFrame = 0.0f;
+		const auto nDst = nisaba::Rect::from_xywh(340.0f, 220.0f, 400.0f, 240.0f).value();
+		const SkRect sDst = SkRect::MakeXYWH(340.0f, 220.0f, 400.0f, 240.0f);
+		benchmark_canvas_op("103d. Lottie TextAnimator & Text-on-Path (GPU)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisabaLottieTextPath->render(c, nFrame, nDst);
+				nFrame = std::fmod(nFrame + 1.0f, 60.0f);
+			},
+			[&](SkCanvas* c) {
+				skiaLottieTextPath->seekFrame(sFrame);
+				skiaLottieTextPath->render(c, &sDst);
 				sFrame = std::fmod(sFrame + 1.0f, 60.0f);
 			}
 		);

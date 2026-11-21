@@ -95,6 +95,28 @@ enum class EffectType : int {
     DisplacementMap = 27,
     Matte3 = 28,
     GaussianBlur = 29,
+    // Extended Color & Tone Effects
+    BrightnessContrast = 100,
+    HueSaturation = 101,
+    BlackAndWhite = 102,
+    Invert = 103,
+    Threshold = 104,
+    ShiftChannels = 105,
+    CCToner = 106,
+    EasyLevels = 107,
+    GradientRamp = 108,
+    FourColorGradient = 109,
+    // Transition, Tiling, Distortion, Blur & Procedural Effects
+    LinearWipe = 110,
+    VenetianBlinds = 111,
+    MotionTile = 112,
+    TransformEffect = 113,
+    CornerPin = 114,
+    Bulge = 115,
+    Sphere = 116,
+    DirectionalBlur = 117,
+    Sharpen = 118,
+    FractalNoise = 119,
     Unknown = -1
 };
 

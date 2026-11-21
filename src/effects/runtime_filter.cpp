@@ -1183,6 +1183,24 @@ std::shared_ptr<RuntimeFilterSpec> parse_runtime_filter_source(
     return spec;
 }
 
+std::shared_ptr<RuntimeFilterSpec> clone_runtime_filter_with_uniforms(
+    const RuntimeFilterSpec& base_spec,
+    const RuntimeFilterUniforms& overrides,
+    CpuRuntimeFilterFn cpu_eval
+) {
+    auto spec = std::make_shared<RuntimeFilterSpec>(base_spec);
+    const auto& entries = overrides.entries();
+    for (const auto& u : spec->uniforms) {
+        auto it = entries.find(u.name);
+        if (it != entries.end() && u.offset + u.size_bytes <= spec->uniform_data.size()) {
+            const size_t n = std::min(u.size_bytes, it->second.size());
+            std::memcpy(spec->uniform_data.data() + u.offset, it->second.data(), n);
+        }
+    }
+    spec->cpu_fast_eval = std::move(cpu_eval);
+    return spec;
+}
+
 Pixmap eval_runtime_filter_cpu(
     const RuntimeFilterSpec& spec,
     const Pixmap& src_rgba,
@@ -1197,6 +1215,26 @@ Pixmap eval_runtime_filter_cpu(
     if (!out_opt) return Pixmap{};
     auto out_mut = out_opt->as_mut();
     const auto src_ref = src_rgba.as_ref();
+
+    const auto inv_ts_opt = layer_transform.invert();
+    const Transform inv_ts = inv_ts_opt.value_or(Transform());
+
+    int32_t cx0 = 0, cy0 = 0, cx1 = static_cast<int32_t>(w), cy1 = static_cast<int32_t>(h);
+    if (crop_rect.has_value()) {
+        if (auto dev_crop = crop_rect->transform(layer_transform)) {
+            cx0 = std::clamp(static_cast<int32_t>(std::floor(dev_crop->left())) - roi_origin_x, 0, static_cast<int32_t>(w));
+            cy0 = std::clamp(static_cast<int32_t>(std::floor(dev_crop->top())) - roi_origin_y, 0, static_cast<int32_t>(h));
+            cx1 = std::clamp(static_cast<int32_t>(std::ceil(dev_crop->right())) - roi_origin_x, 0, static_cast<int32_t>(w));
+            cy1 = std::clamp(static_cast<int32_t>(std::ceil(dev_crop->bottom())) - roi_origin_y, 0, static_cast<int32_t>(h));
+        } else {
+            return std::move(*out_opt);
+        }
+    }
+
+    if (spec.cpu_fast_eval) {
+        spec.cpu_fast_eval(src_ref, out_mut, roi_origin_x, roi_origin_y, layer_transform, inv_ts, cx0, cy0, cx1, cy1);
+        return std::move(*out_opt);
+    }
 
     const std::vector<Tok> toks = tokenize(spec.transformed_glsl);
     const auto funcs = parse_functions(toks);
@@ -1249,21 +1287,6 @@ Pixmap eval_runtime_filter_cpu(
                 break;
         }
         uni_map[u.name] = val;
-    }
-
-    const auto inv_ts_opt = layer_transform.invert();
-    const Transform inv_ts = inv_ts_opt.value_or(Transform());
-
-    int32_t cx0 = 0, cy0 = 0, cx1 = static_cast<int32_t>(w), cy1 = static_cast<int32_t>(h);
-    if (crop_rect.has_value()) {
-        if (auto dev_crop = crop_rect->transform(layer_transform)) {
-            cx0 = std::clamp(static_cast<int32_t>(std::floor(dev_crop->left())) - roi_origin_x, 0, static_cast<int32_t>(w));
-            cy0 = std::clamp(static_cast<int32_t>(std::floor(dev_crop->top())) - roi_origin_y, 0, static_cast<int32_t>(h));
-            cx1 = std::clamp(static_cast<int32_t>(std::ceil(dev_crop->right())) - roi_origin_x, 0, static_cast<int32_t>(w));
-            cy1 = std::clamp(static_cast<int32_t>(std::ceil(dev_crop->bottom())) - roi_origin_y, 0, static_cast<int32_t>(h));
-        } else {
-            return std::move(*out_opt);
-        }
     }
 
     const FuncDef& main_fn = main_it->second;

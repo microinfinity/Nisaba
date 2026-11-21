@@ -16,6 +16,7 @@
 #endif
 
 #include <algorithm>
+#include <cstring>
 
 namespace nisaba::lottie {
 
@@ -1512,6 +1513,400 @@ std::shared_ptr<LottieShapeItem> LottieShapeItem::parse(const json::JsonValue& v
     if (ty == "rp") return RepeaterShape::parse(val);
 
     return nullptr;
+}
+
+namespace {
+
+inline uint64_t hash_mix(uint64_t h, uint64_t v) noexcept {
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+}
+
+inline uint64_t hash_f32(uint64_t h, float f) noexcept {
+    uint32_t bits = 0;
+    // Canonicalize -0.0f to +0.0f
+    if (f == 0.0f) f = 0.0f;
+    std::memcpy(&bits, &f, sizeof(bits));
+    return hash_mix(h, static_cast<uint64_t>(bits));
+}
+
+inline uint64_t hash_point(uint64_t h, Point p) noexcept {
+    return hash_f32(hash_f32(h, p.x), p.y);
+}
+
+inline uint64_t hash_color(uint64_t h, Color c) noexcept {
+    h = hash_f32(h, c.red());
+    h = hash_f32(h, c.green());
+    h = hash_f32(h, c.blue());
+    return hash_f32(h, c.alpha());
+}
+
+inline uint64_t hash_transform(uint64_t h, const Transform& tr) noexcept {
+    h = hash_f32(h, tr.sx);
+    h = hash_f32(h, tr.kx);
+    h = hash_f32(h, tr.ky);
+    h = hash_f32(h, tr.sy);
+    h = hash_f32(h, tr.tx);
+    return hash_f32(h, tr.ty);
+}
+
+std::optional<Rect> join_opt_rect(const std::optional<Rect>& a, const std::optional<Rect>& b) noexcept {
+    if (!a.has_value()) return b;
+    if (!b.has_value()) return a;
+    return a->join(*b);
+}
+
+std::optional<Rect> compute_slice_bounds(
+    const std::vector<std::shared_ptr<LottieShapeItem>>& items,
+    size_t start_idx,
+    size_t end_idx,
+    float frame
+) {
+    // Handle Repeater ("rp") in [start_idx, end_idx)
+    for (size_t i = start_idx; i < end_idx; ++i) {
+        const auto& item = items[i];
+        if (!item || item->hidden) continue;
+        if (item->type_name() == "rp") {
+            const auto& rp = static_cast<const RepeaterShape&>(*item);
+            std::optional<Rect> result;
+            const auto base_bounds = compute_slice_bounds(items, start_idx, i, frame);
+            if (base_bounds.has_value()) {
+                const int num_copies = static_cast<int>(std::ceil(rp.copies.evaluate(frame)));
+                const float off = rp.offset.evaluate(frame);
+                for (int c = 0; c < num_copies; ++c) {
+                    const float inst = static_cast<float>(c) + off;
+                    const Transform rep_tr = interpolate_repeater_transform(rp.transform, frame, inst);
+                    if (auto tr_b = base_bounds->transform(rep_tr)) {
+                        result = join_opt_rect(result, tr_b);
+                    }
+                }
+            }
+            if (i + 1 < end_idx) {
+                result = join_opt_rect(result, compute_slice_bounds(items, i + 1, end_idx, frame));
+            }
+            return result;
+        }
+    }
+
+    std::vector<Path> current_paths;
+    std::optional<Rect> child_group_bounds;
+    float max_stroke_pad = 0.0f;
+
+    std::vector<std::shared_ptr<LottieShapeItem>> trailing_modifiers;
+    size_t last_style_idx = start_idx;
+    bool has_styles_or_modifiers = false;
+    for (size_t i = start_idx; i < end_idx; ++i) {
+        if (items[i] && !items[i]->hidden) {
+            if (items[i]->is_style()) {
+                last_style_idx = i;
+                has_styles_or_modifiers = true;
+            } else if (items[i]->is_modifier()) {
+                has_styles_or_modifiers = true;
+            }
+        }
+    }
+    for (size_t i = last_style_idx + 1; i < end_idx; ++i) {
+        if (items[i] && !items[i]->hidden && items[i]->is_modifier()) {
+            trailing_modifiers.push_back(items[i]);
+        }
+    }
+
+    std::optional<Rect> styled_bounds;
+    for (size_t i = start_idx; i < end_idx; ++i) {
+        const auto& item = items[i];
+        if (!item || item->hidden) continue;
+
+        if (item->is_geometry()) {
+            Path p;
+            item->collect_geometry(frame, p);
+            if (!p.is_empty()) current_paths.push_back(std::move(p));
+        } else if (item->type_name() == "gr") {
+            child_group_bounds = join_opt_rect(child_group_bounds, item->compute_bounds(frame));
+            if (has_styles_or_modifiers) {
+                Path p;
+                item->collect_geometry(frame, p);
+                if (!p.is_empty()) current_paths.push_back(std::move(p));
+            }
+        } else if (item->is_modifier() && i <= last_style_idx) {
+            item->modify_paths(frame, current_paths);
+        } else if (item->is_style()) {
+            float pad = 0.0f;
+            if (item->type_name() == "st") {
+                const auto& st = static_cast<const StrokeShape&>(*item);
+                const float w = std::max(0.0f, st.width.evaluate(frame));
+                const float miter = (st.join == LineJoin::Miter) ? std::max(1.0f, st.miter_limit) : 1.0f;
+                pad = w * 0.5f * miter;
+            } else if (item->type_name() == "gs") {
+                const auto& gs = static_cast<const GradientStrokeShape&>(*item);
+                const float w = std::max(0.0f, gs.width.evaluate(frame));
+                const float miter = (gs.join == LineJoin::Miter) ? std::max(1.0f, gs.miter_limit) : 1.0f;
+                pad = w * 0.5f * miter;
+            }
+            max_stroke_pad = std::max(max_stroke_pad, pad);
+
+            std::vector<Path> eval_paths = current_paths;
+            for (const auto& mod : trailing_modifiers) {
+                mod->modify_paths(frame, eval_paths);
+            }
+            for (const auto& ep : eval_paths) {
+                if (ep.is_empty()) continue;
+                Rect b = ep.bounds();
+                if (pad > 0.0f) {
+                    if (auto expanded = b.outset(pad, pad)) b = *expanded;
+                }
+                styled_bounds = join_opt_rect(styled_bounds, b);
+            }
+        }
+    }
+
+    // If a group has geometry without styles (e.g. used as a geometry container), include raw geometry bounds
+    if (!styled_bounds.has_value() && !current_paths.empty()) {
+        for (const auto& ep : current_paths) {
+            if (!ep.is_empty()) {
+                styled_bounds = join_opt_rect(styled_bounds, ep.bounds());
+            }
+        }
+    }
+    (void)max_stroke_pad;
+    return join_opt_rect(child_group_bounds, styled_bounds);
+}
+
+} // anonymous namespace
+
+std::optional<Rect> LottieShapeItem::compute_bounds(float frame) const {
+    if (hidden) return std::nullopt;
+    Path p;
+    collect_geometry(frame, p);
+    if (p.is_empty()) return std::nullopt;
+    return p.bounds();
+}
+
+uint64_t LottieShapeItem::visual_fingerprint(float frame) const noexcept {
+    if (hidden) return 0u;
+    uint64_t h = 1469598103934665603ULL;
+    const std::string_view tn = type_name();
+    for (char c : tn) h = hash_mix(h, static_cast<uint64_t>(static_cast<unsigned char>(c)));
+    h = hash_mix(h, static_cast<uint64_t>(blend_mode));
+
+    if (tn == "rc") {
+        const auto& rc = static_cast<const RectShape&>(*this);
+        h = hash_point(h, rc.position.evaluate(frame));
+        h = hash_point(h, rc.size.evaluate(frame));
+        h = hash_f32(h, rc.roundness.evaluate(frame));
+    } else if (tn == "el") {
+        const auto& el = static_cast<const EllipseShape&>(*this);
+        h = hash_point(h, el.position.evaluate(frame));
+        h = hash_point(h, el.size.evaluate(frame));
+    } else if (tn == "sr") {
+        const auto& sr = static_cast<const StarShape&>(*this);
+        h = hash_f32(h, sr.points.evaluate(frame));
+        h = hash_point(h, sr.position.evaluate(frame));
+        h = hash_f32(h, sr.rotation.evaluate(frame));
+        h = hash_f32(h, sr.inner_radius.evaluate(frame));
+        h = hash_f32(h, sr.outer_radius.evaluate(frame));
+        h = hash_f32(h, sr.inner_roundness.evaluate(frame));
+        h = hash_f32(h, sr.outer_roundness.evaluate(frame));
+    } else if (tn == "sh") {
+        const auto& sh = static_cast<const PathShape&>(*this);
+        BezierData bz = sh.shape.evaluate(frame);
+        h = hash_mix(h, static_cast<uint64_t>(bz.vertices.size()));
+        for (size_t i = 0; i < bz.vertices.size(); ++i) {
+            h = hash_point(h, bz.vertices[i]);
+            if (i < bz.in_tangents.size()) h = hash_point(h, bz.in_tangents[i]);
+            if (i < bz.out_tangents.size()) h = hash_point(h, bz.out_tangents[i]);
+        }
+    } else if (tn == "fl") {
+        const auto& fl = static_cast<const FillShape&>(*this);
+        h = hash_color(h, fl.color.evaluate(frame));
+        h = hash_f32(h, fl.opacity.evaluate(frame));
+    } else if (tn == "st") {
+        const auto& st = static_cast<const StrokeShape&>(*this);
+        h = hash_color(h, st.color.evaluate(frame));
+        h = hash_f32(h, st.opacity.evaluate(frame));
+        h = hash_f32(h, st.width.evaluate(frame));
+        h = hash_f32(h, st.dash_offset.evaluate(frame));
+        for (const auto& d : st.dashes) h = hash_f32(h, d.evaluate(frame));
+    } else if (tn == "gf") {
+        const auto& gf = static_cast<const GradientFillShape&>(*this);
+        h = hash_point(h, gf.start_point.evaluate(frame));
+        h = hash_point(h, gf.end_point.evaluate(frame));
+        h = hash_f32(h, gf.highlight_length.evaluate(frame));
+        h = hash_f32(h, gf.highlight_angle.evaluate(frame));
+        h = hash_f32(h, gf.opacity.evaluate(frame));
+        const auto raw = gf.stops.raw_data.evaluate(frame);
+        for (float v : raw) h = hash_f32(h, v);
+    } else if (tn == "gs") {
+        const auto& gs = static_cast<const GradientStrokeShape&>(*this);
+        h = hash_point(h, gs.start_point.evaluate(frame));
+        h = hash_point(h, gs.end_point.evaluate(frame));
+        h = hash_f32(h, gs.width.evaluate(frame));
+        h = hash_f32(h, gs.opacity.evaluate(frame));
+        h = hash_f32(h, gs.dash_offset.evaluate(frame));
+        const auto raw = gs.stops.raw_data.evaluate(frame);
+        for (float v : raw) h = hash_f32(h, v);
+    } else if (tn == "tm") {
+        const auto& tm = static_cast<const TrimPathShape&>(*this);
+        h = hash_f32(h, tm.start.evaluate(frame));
+        h = hash_f32(h, tm.end.evaluate(frame));
+        h = hash_f32(h, tm.offset.evaluate(frame));
+    } else if (tn == "rd") {
+        h = hash_f32(h, static_cast<const RoundCornersShape&>(*this).radius.evaluate(frame));
+    } else if (tn == "op") {
+        const auto& op = static_cast<const OffsetPathShape&>(*this);
+        h = hash_f32(h, op.amount.evaluate(frame));
+        h = hash_f32(h, op.miter_limit.evaluate(frame));
+    } else if (tn == "pb") {
+        h = hash_f32(h, static_cast<const PuckerBloatShape&>(*this).amount.evaluate(frame));
+    } else if (tn == "zz") {
+        const auto& zz = static_cast<const ZigZagShape&>(*this);
+        h = hash_f32(h, zz.size.evaluate(frame));
+        h = hash_f32(h, zz.ridges.evaluate(frame));
+    } else if (tn == "rp") {
+        const auto& rp = static_cast<const RepeaterShape&>(*this);
+        h = hash_f32(h, rp.copies.evaluate(frame));
+        h = hash_f32(h, rp.offset.evaluate(frame));
+        h = hash_transform(h, rp.transform.matrix(frame));
+        h = hash_f32(h, rp.transform.start_opacity.evaluate(frame));
+        h = hash_f32(h, rp.transform.end_opacity.evaluate(frame));
+    }
+    return h;
+}
+
+std::optional<Rect> ShapeGroup::compute_bounds(float frame) const {
+    if (hidden) return std::nullopt;
+    if (transform.eval_opacity(frame) <= 0.0f) return std::nullopt;
+    auto local_b = compute_slice_bounds(items, 0, items.size(), frame);
+    if (!local_b.has_value()) return std::nullopt;
+    return local_b->transform(transform.matrix(frame));
+}
+
+uint64_t ShapeGroup::visual_fingerprint(float frame) const noexcept {
+    if (hidden) return 0u;
+    uint64_t h = 0x517cc1b727220a95ULL;
+    h = hash_transform(h, transform.matrix(frame));
+    h = hash_f32(h, transform.eval_opacity(frame));
+    for (const auto& item : items) {
+        if (item && !item->hidden) {
+            h = hash_mix(h, item->visual_fingerprint(frame));
+        }
+    }
+    return h;
+}
+
+size_t ShapeGroup::count_animators() const noexcept {
+    size_t n = 0;
+    if (transform.anchor.is_animated()) ++n;
+    if (transform.position.is_animated()) ++n;
+    if (transform.x_pos && transform.x_pos->is_animated()) ++n;
+    if (transform.y_pos && transform.y_pos->is_animated()) ++n;
+    if (transform.scale.is_animated()) ++n;
+    if (transform.rotation.is_animated()) ++n;
+    if (transform.opacity.is_animated()) ++n;
+    if (transform.skew.is_animated()) ++n;
+    if (transform.skew_axis.is_animated()) ++n;
+    for (const auto& item : items) {
+        if (item) n += item->count_animators();
+    }
+    return n;
+}
+
+void LottieShapeItem::bind_expression_manager(ExpressionManager& mgr) {
+    const std::string_view tn = type_name();
+    if (tn == "gr") {
+        auto& grp = static_cast<ShapeGroup&>(*this);
+        grp.transform.bind_expression_manager(mgr);
+        for (auto& child : grp.items) {
+            if (child) child->bind_expression_manager(mgr);
+        }
+    } else if (tn == "rc") {
+        auto& rc = static_cast<RectShape&>(*this);
+        rc.position.bind_expression_manager(mgr);
+        rc.size.bind_expression_manager(mgr);
+        rc.roundness.bind_expression_manager(mgr);
+        if (rc.is_animated()) rc.has_cached_static = false;
+    } else if (tn == "el") {
+        auto& el = static_cast<EllipseShape&>(*this);
+        el.position.bind_expression_manager(mgr);
+        el.size.bind_expression_manager(mgr);
+        if (el.is_animated()) el.has_cached_static = false;
+    } else if (tn == "sr") {
+        auto& sr = static_cast<StarShape&>(*this);
+        sr.points.bind_expression_manager(mgr);
+        sr.position.bind_expression_manager(mgr);
+        sr.rotation.bind_expression_manager(mgr);
+        sr.inner_radius.bind_expression_manager(mgr);
+        sr.inner_roundness.bind_expression_manager(mgr);
+        sr.outer_radius.bind_expression_manager(mgr);
+        sr.outer_roundness.bind_expression_manager(mgr);
+        if (sr.is_animated()) sr.has_cached_static = false;
+    } else if (tn == "fl") {
+        auto& fl = static_cast<FillShape&>(*this);
+        fl.color.bind_expression_manager(mgr);
+        fl.opacity.bind_expression_manager(mgr);
+    } else if (tn == "st") {
+        auto& st = static_cast<StrokeShape&>(*this);
+        st.color.bind_expression_manager(mgr);
+        st.opacity.bind_expression_manager(mgr);
+        st.width.bind_expression_manager(mgr);
+        for (auto& d : st.dashes) d.bind_expression_manager(mgr);
+        st.dash_offset.bind_expression_manager(mgr);
+    } else if (tn == "gf") {
+        auto& gf = static_cast<GradientFillShape&>(*this);
+        gf.start_point.bind_expression_manager(mgr);
+        gf.end_point.bind_expression_manager(mgr);
+        gf.highlight_length.bind_expression_manager(mgr);
+        gf.highlight_angle.bind_expression_manager(mgr);
+        gf.stops.raw_data.bind_expression_manager(mgr);
+        gf.opacity.bind_expression_manager(mgr);
+    } else if (tn == "gs") {
+        auto& gs = static_cast<GradientStrokeShape&>(*this);
+        gs.start_point.bind_expression_manager(mgr);
+        gs.end_point.bind_expression_manager(mgr);
+        gs.highlight_length.bind_expression_manager(mgr);
+        gs.highlight_angle.bind_expression_manager(mgr);
+        gs.stops.raw_data.bind_expression_manager(mgr);
+        gs.opacity.bind_expression_manager(mgr);
+        gs.width.bind_expression_manager(mgr);
+        for (auto& d : gs.dashes) d.bind_expression_manager(mgr);
+        gs.dash_offset.bind_expression_manager(mgr);
+    } else if (tn == "tm") {
+        auto& tm = static_cast<TrimPathShape&>(*this);
+        tm.start.bind_expression_manager(mgr);
+        tm.end.bind_expression_manager(mgr);
+        tm.offset.bind_expression_manager(mgr);
+    } else if (tn == "rd") {
+        static_cast<RoundCornersShape&>(*this).radius.bind_expression_manager(mgr);
+    } else if (tn == "op") {
+        auto& op = static_cast<OffsetPathShape&>(*this);
+        op.amount.bind_expression_manager(mgr);
+        op.miter_limit.bind_expression_manager(mgr);
+    } else if (tn == "pb") {
+        static_cast<PuckerBloatShape&>(*this).amount.bind_expression_manager(mgr);
+    } else if (tn == "zz") {
+        auto& zz = static_cast<ZigZagShape&>(*this);
+        zz.size.bind_expression_manager(mgr);
+        zz.ridges.bind_expression_manager(mgr);
+    } else if (tn == "rp") {
+        auto& rp = static_cast<RepeaterShape&>(*this);
+        rp.copies.bind_expression_manager(mgr);
+        rp.offset.bind_expression_manager(mgr);
+        rp.transform.bind_expression_manager(mgr);
+    }
+}
+
+void render_shape_items(
+    const std::vector<std::shared_ptr<LottieShapeItem>>& items,
+    RenderContext& ctx,
+    float frame
+) {
+    render_shape_slice(items, 0, items.size(), ctx, frame);
+}
+
+std::optional<Rect> compute_shape_items_bounds(
+    const std::vector<std::shared_ptr<LottieShapeItem>>& items,
+    float frame
+) {
+    return compute_slice_bounds(items, 0, items.size(), frame);
 }
 
 Path RenderContext::get_trimmed_path(float frame) const {

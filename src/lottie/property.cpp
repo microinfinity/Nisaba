@@ -345,12 +345,60 @@ BezierData BezierData::interpolate(const BezierData& a, const BezierData& b, flo
 }
 
 template <typename T>
+void Property<T>::bind_expression_manager(ExpressionManager& mgr) {
+    if (raw_expression_.empty()) return;
+    if constexpr (std::is_same_v<T, float>) {
+        if (auto ev = mgr.create_number_expression_evaluator(raw_expression_)) {
+            number_eval_ = std::move(ev);
+        }
+    } else if constexpr (std::is_same_v<T, Point> || std::is_same_v<T, Color> ||
+                         std::is_same_v<T, std::vector<float>>) {
+        if (auto ev = mgr.create_array_expression_evaluator(raw_expression_)) {
+            array_eval_ = std::move(ev);
+        }
+    }
+}
+
+template <typename T>
 T Property<T>::evaluate(float frame, float frame_rate) const {
     if (has_override_) {
         return override_value_;
     }
 
     float time_sec = (frame_rate > 0.0f) ? (frame / frame_rate) : (frame / 60.0f);
+
+    // Pluggable ExpressionManager evaluator takes precedence over built-in/keyframe evaluation
+    if constexpr (std::is_same_v<T, float>) {
+        if (number_eval_) {
+            return number_eval_->evaluate(time_sec);
+        }
+    } else if constexpr (std::is_same_v<T, Point>) {
+        if (array_eval_) {
+            const auto v = array_eval_->evaluate(time_sec);
+            if (v.size() >= 2) return Point::from_xy(v[0], v[1]);
+            if (v.size() == 1) return Point::from_xy(v[0], v[0]);
+        }
+    } else if constexpr (std::is_same_v<T, Color>) {
+        if (array_eval_) {
+            const auto v = array_eval_->evaluate(time_sec);
+            if (v.size() >= 3) {
+                float r = v[0], g = v[1], b = v[2];
+                float a = (v.size() >= 4) ? v[3] : 1.0f;
+                if (r > 1.0f || g > 1.0f || b > 1.0f) {
+                    r /= 255.0f; g /= 255.0f; b /= 255.0f;
+                    if (a > 1.0f) a /= 255.0f;
+                }
+                return Color::from_rgba_unchecked(
+                    std::clamp(r, 0.0f, 1.0f), std::clamp(g, 0.0f, 1.0f),
+                    std::clamp(b, 0.0f, 1.0f), std::clamp(a, 0.0f, 1.0f)
+                );
+            }
+        }
+    } else if constexpr (std::is_same_v<T, std::vector<float>>) {
+        if (array_eval_) {
+            return array_eval_->evaluate(time_sec);
+        }
+    }
 
     if (!is_animated_ || keyframes_.empty()) {
         if (expression_.type == LottieExpression::Type::Wiggle) {
@@ -616,7 +664,10 @@ void parse_common_property_metadata(PropT& prop, const json::JsonValue& val) {
         if (sid->is_string()) prop.set_slot_id(std::string(sid->as_string()));
     }
     if (const auto* expr = val.get("x")) {
-        if (expr->is_string()) prop.set_expression(LottieExpression::parse(expr->as_string()));
+        if (expr->is_string()) {
+            prop.set_raw_expression(std::string(expr->as_string()));
+            prop.set_expression(LottieExpression::parse(expr->as_string()));
+        }
     }
 }
 
@@ -1100,6 +1151,28 @@ bool LottieTransform::is_animated() const noexcept {
            skew_axis.is_animated() || rx.is_animated() || ry.is_animated() ||
            (x_pos.has_value() && x_pos->is_animated()) ||
            (y_pos.has_value() && y_pos->is_animated());
+}
+
+void LottieTransform::bind_expression_manager(ExpressionManager& mgr) {
+    anchor.bind_expression_manager(mgr);
+    position.bind_expression_manager(mgr);
+    scale.bind_expression_manager(mgr);
+    rotation.bind_expression_manager(mgr);
+    opacity.bind_expression_manager(mgr);
+    skew.bind_expression_manager(mgr);
+    skew_axis.bind_expression_manager(mgr);
+    rx.bind_expression_manager(mgr);
+    ry.bind_expression_manager(mgr);
+    rz.bind_expression_manager(mgr);
+    z_pos.bind_expression_manager(mgr);
+    z_anchor.bind_expression_manager(mgr);
+    z_scale.bind_expression_manager(mgr);
+    orientation.bind_expression_manager(mgr);
+    orientation_z.bind_expression_manager(mgr);
+    if (x_pos) x_pos->bind_expression_manager(mgr);
+    if (y_pos) y_pos->bind_expression_manager(mgr);
+    start_opacity.bind_expression_manager(mgr);
+    end_opacity.bind_expression_manager(mgr);
 }
 
 } // namespace nisaba::lottie

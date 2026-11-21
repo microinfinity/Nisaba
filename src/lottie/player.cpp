@@ -1,5 +1,5 @@
 /// @file player.cpp
-/// @brief Implementation of interactive playback controller, marker segments, and bounce mode for Lottie animations.
+/// @brief Implementation of interactive playback controller, marker segments, dirty tracking, and bounce mode for Lottie animations.
 
 #include "nisaba/lottie/player.hpp"
 
@@ -20,6 +20,7 @@ void Player::set_animation(std::shared_ptr<Animation> anim) {
     current_loops_ = 0;
     if (anim_) {
         current_frame_ = anim_->in_point();
+        anim_->reset_invalidation_state();
     } else {
         current_frame_ = 0.0f;
     }
@@ -67,22 +68,45 @@ void Player::stop() noexcept {
     current_loops_ = 0;
     if (anim_) {
         current_frame_ = effective_in_point();
+        if (audio_track_) {
+            anim_->stop_audio(*audio_track_);
+        }
     }
 }
 
-void Player::seek_frame(float frame) noexcept {
+void Player::seek_frame(float frame, InvalidationController* ic) noexcept {
     if (!anim_) return;
     float ip = effective_in_point();
     float op = effective_out_point();
     current_frame_ = std::clamp(frame, ip, op);
+    anim_->seek_frame(current_frame_, ic);
+    if (audio_track_) {
+        anim_->dispatch_audio(current_frame_, *audio_track_, is_playing_);
+    }
 }
 
-void Player::seek_progress(float prog) noexcept {
+bool Player::seek_frame(float frame, Rect* out_dirty_rect) noexcept {
+    if (!anim_) return false;
+    float ip = effective_in_point();
+    float op = effective_out_point();
+    current_frame_ = std::clamp(frame, ip, op);
+    bool dirty = anim_->seek_frame(current_frame_, out_dirty_rect);
+    if (audio_track_) {
+        anim_->dispatch_audio(current_frame_, *audio_track_, is_playing_);
+    }
+    return dirty;
+}
+
+void Player::seek_progress(float prog, InvalidationController* ic) noexcept {
     if (!anim_) return;
     float p = std::clamp(prog, 0.0f, 1.0f);
     float ip = effective_in_point();
     float op = effective_out_point();
     current_frame_ = ip + p * std::max(0.0f, op - ip);
+    anim_->seek_frame(current_frame_, ic);
+    if (audio_track_) {
+        anim_->dispatch_audio(current_frame_, *audio_track_, is_playing_);
+    }
 }
 
 float Player::progress() const noexcept {
@@ -94,7 +118,7 @@ float Player::progress() const noexcept {
     return std::clamp((current_frame_ - ip) / total, 0.0f, 1.0f);
 }
 
-bool Player::advance(float dt) {
+bool Player::advance(float dt, InvalidationController* ic) {
     if (!anim_ || !is_playing_) return false;
     float ip = effective_in_point();
     float op = effective_out_point();
@@ -131,6 +155,8 @@ bool Player::advance(float dt) {
         if (loop_mode_ == LoopMode::Loop) {
             if (!check_repeat_limit()) {
                 current_frame_ = op;
+                anim_->seek_frame(current_frame_, ic);
+                if (audio_track_) anim_->stop_audio(*audio_track_);
                 return false;
             }
             float excess = current_frame_ - op;
@@ -138,6 +164,8 @@ bool Player::advance(float dt) {
         } else if (loop_mode_ == LoopMode::Bounce) {
             if (!check_repeat_limit()) {
                 current_frame_ = op;
+                anim_->seek_frame(current_frame_, ic);
+                if (audio_track_) anim_->stop_audio(*audio_track_);
                 return false;
             }
             float excess = std::fmod(current_frame_ - op, total);
@@ -146,6 +174,8 @@ bool Player::advance(float dt) {
         } else {
             current_frame_ = op;
             is_playing_ = false;
+            anim_->seek_frame(current_frame_, ic);
+            if (audio_track_) anim_->stop_audio(*audio_track_);
             if (on_complete) on_complete();
             return false;
         }
@@ -153,6 +183,8 @@ bool Player::advance(float dt) {
         if (loop_mode_ == LoopMode::Loop) {
             if (!check_repeat_limit()) {
                 current_frame_ = ip;
+                anim_->seek_frame(current_frame_, ic);
+                if (audio_track_) anim_->stop_audio(*audio_track_);
                 return false;
             }
             float deficit = ip - current_frame_;
@@ -160,6 +192,8 @@ bool Player::advance(float dt) {
         } else if (loop_mode_ == LoopMode::Bounce) {
             if (!check_repeat_limit()) {
                 current_frame_ = ip;
+                anim_->seek_frame(current_frame_, ic);
+                if (audio_track_) anim_->stop_audio(*audio_track_);
                 return false;
             }
             float deficit = std::fmod(ip - current_frame_, total);
@@ -168,15 +202,35 @@ bool Player::advance(float dt) {
         } else {
             current_frame_ = ip;
             is_playing_ = false;
+            anim_->seek_frame(current_frame_, ic);
+            if (audio_track_) anim_->stop_audio(*audio_track_);
             if (on_complete) on_complete();
             return false;
         }
+    }
+
+    anim_->seek_frame(current_frame_, ic);
+    if (audio_track_) {
+        anim_->dispatch_audio(current_frame_, *audio_track_, is_playing_);
     }
 
     if (on_frame) {
         on_frame(current_frame_);
     }
     return true;
+}
+
+bool Player::advance(float dt, Rect* out_dirty_rect) {
+    InvalidationController ic;
+    bool active = advance(dt, out_dirty_rect ? &ic : nullptr);
+    if (out_dirty_rect) {
+        if (auto b = ic.bounds()) {
+            *out_dirty_rect = *b;
+        } else {
+            *out_dirty_rect = Rect();
+        }
+    }
+    return active;
 }
 
 std::optional<std::string> Player::hit_test(float x, float y) const {

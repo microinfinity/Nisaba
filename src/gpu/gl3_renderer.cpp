@@ -1805,10 +1805,16 @@ struct GL3Renderer::Impl {
 	void runFilterColorPass(GLuint dstFbo, GLuint srcTex,
 	                        const effects::ColorEffect& eff,
 	                        const float roiUv[4], const float cropUv[4],
-	                        int fbW, int fbH) {
+	                        int fbW, int fbH,
+	                        const int* scissorRect = nullptr) {
 		glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
 		glViewport(0, 0, fbW, fbH);
-		glDisable(GL_SCISSOR_TEST);
+		if (scissorRect && scissorRect[2] > 0 && scissorRect[3] > 0) {
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(scissorRect[0], scissorRect[1], scissorRect[2], scissorRect[3]);
+		} else {
+			glDisable(GL_SCISSOR_TEST);
+		}
 		if (stencilEnabled) glDisable(GL_STENCIL_TEST);
 		glDisable(GL_CULL_FACE);
 		glDisable(GL_BLEND);
@@ -1877,12 +1883,18 @@ struct GL3Renderer::Impl {
 	int evalColorEffectDag(const effects::ColorEffect& eff,
 	                       int srcIdx, int fbW, int fbH,
 	                       const float roiUv[4], const float cropUv[4],
-	                       bool hasRoi, int roiX0, int roiY0, int roiX1, int roiY1) {
+	                       bool hasRoi, int roiX0, int roiY0, int roiX1, int roiY1,
+	                       const int* scissorRect = nullptr) {
 		const float noCropUv[4] = {-1.0f, -1.0f, 2.0f, 2.0f};
 		auto acquireCleared = [&]() -> int {
 			const int idx = acquireLayerFbo(fbW, fbH);
 			glBindFramebuffer(GL_FRAMEBUFFER, layerPool[idx].fbo);
-			glDisable(GL_SCISSOR_TEST);
+			if (scissorRect && scissorRect[2] > 0 && scissorRect[3] > 0) {
+				glEnable(GL_SCISSOR_TEST);
+				glScissor(scissorRect[0], scissorRect[1], scissorRect[2], scissorRect[3]);
+			} else {
+				glDisable(GL_SCISSOR_TEST);
+			}
 			glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 			glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 			glClear(GL_COLOR_BUFFER_BIT);
@@ -1892,20 +1904,20 @@ struct GL3Renderer::Impl {
 			const auto& en = *eff.ext_node;
 			if (en.kind == effects::ColorEffectExtKind::Compose) {
 				const int innerIdx = (en.child1 && en.child1->is_active())
-					? evalColorEffectDag(*en.child1, srcIdx, fbW, fbH, roiUv, noCropUv, hasRoi, roiX0, roiY0, roiX1, roiY1)
+					? evalColorEffectDag(*en.child1, srcIdx, fbW, fbH, roiUv, noCropUv, hasRoi, roiX0, roiY0, roiX1, roiY1, scissorRect)
 					: srcIdx;
 				const int outIdx = (en.child0 && en.child0->is_active())
-					? evalColorEffectDag(*en.child0, innerIdx, fbW, fbH, roiUv, cropUv, hasRoi, roiX0, roiY0, roiX1, roiY1)
+					? evalColorEffectDag(*en.child0, innerIdx, fbW, fbH, roiUv, cropUv, hasRoi, roiX0, roiY0, roiX1, roiY1, scissorRect)
 					: innerIdx;
 				if (innerIdx != srcIdx && innerIdx != outIdx) layerPool[innerIdx].inUse = false;
 				return outIdx;
 			}
 			if (en.kind == effects::ColorEffectExtKind::Lerp) {
 				const int idx0 = (en.child0 && en.child0->is_active())
-					? evalColorEffectDag(*en.child0, srcIdx, fbW, fbH, roiUv, noCropUv, hasRoi, roiX0, roiY0, roiX1, roiY1)
+					? evalColorEffectDag(*en.child0, srcIdx, fbW, fbH, roiUv, noCropUv, hasRoi, roiX0, roiY0, roiX1, roiY1, scissorRect)
 					: srcIdx;
 				const int idx1 = (en.child1 && en.child1->is_active())
-					? evalColorEffectDag(*en.child1, srcIdx, fbW, fbH, roiUv, noCropUv, hasRoi, roiX0, roiY0, roiX1, roiY1)
+					? evalColorEffectDag(*en.child1, srcIdx, fbW, fbH, roiUv, noCropUv, hasRoi, roiX0, roiY0, roiX1, roiY1, scissorRect)
 					: srcIdx;
 				const int outIdx = acquireCleared();
 				FilterOpsParams p{};
@@ -1928,13 +1940,14 @@ struct GL3Renderer::Impl {
 				return outIdx;
 			}
 		}
-		const int outIdx = acquireCleared();
 		if (eff.is_active()) {
-			runFilterColorPass(layerPool[outIdx].fbo, layerPool[srcIdx].colorTex, eff, roiUv, cropUv, fbW, fbH);
-		} else {
-			runFilterBlendPass(layerPool[outIdx].fbo, layerPool[srcIdx].colorTex, 0,
-			                   0, 0.0f, 0.0f, Color(1, 1, 1, 1), roiUv, cropUv, fbW, fbH, false);
+			const int outIdx = acquireLayerFbo(fbW, fbH);
+			runFilterColorPass(layerPool[outIdx].fbo, layerPool[srcIdx].colorTex, eff, roiUv, cropUv, fbW, fbH, scissorRect);
+			return outIdx;
 		}
+		const int outIdx = acquireCleared();
+		runFilterBlendPass(layerPool[outIdx].fbo, layerPool[srcIdx].colorTex, 0,
+		                   0, 0.0f, 0.0f, Color(1, 1, 1, 1), roiUv, cropUv, fbW, fbH, false);
 		return outIdx;
 	}
 
@@ -2140,13 +2153,19 @@ struct GL3Renderer::Impl {
 	                          const effects::RuntimeFilterSpec& spec,
 	                          const Transform2D& layerXform,
 	                          const float roiUv[4], const float cropUv[4],
-	                          int fbW, int fbH) {
+	                          int fbW, int fbH,
+	                          const int* scissorRect = nullptr) {
 		RuntimeFilterProg* rfp = getOrCreateRuntimeFilterProg(spec);
 		if (!rfp) return;
 
 		glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
 		glViewport(0, 0, fbW, fbH);
-		glDisable(GL_SCISSOR_TEST);
+		if (scissorRect && scissorRect[2] > 0 && scissorRect[3] > 0) {
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(scissorRect[0], scissorRect[1], scissorRect[2], scissorRect[3]);
+		} else {
+			glDisable(GL_SCISSOR_TEST);
+		}
 		glDisable(GL_STENCIL_TEST);
 		stencilEnabled = false;
 		glDisable(GL_CULL_FACE);
@@ -2341,10 +2360,55 @@ struct GL3Renderer::Impl {
 		const float scaleX = std::hypot(m[0], m[1]) * sxDev;
 		const float scaleY = std::hypot(m[2], m[3]) * syDev;
 
+		auto dagSamplesOutsideRoi = [](const effects::ImageFilterNode* root) -> bool {
+			auto walk = [](auto&& self, const effects::ImageFilterNode* n) -> bool {
+				if (!n) return false;
+				switch (n->kind) {
+					case effects::ImageFilterKind::Offset:
+					case effects::ImageFilterKind::DropShadow:
+					case effects::ImageFilterKind::MatrixTransform:
+					case effects::ImageFilterKind::Tile:
+					case effects::ImageFilterKind::DisplacementMap:
+					case effects::ImageFilterKind::Magnifier:
+						return true;
+					default:
+						break;
+				}
+				for (const auto& ch : n->inputs) {
+					if (self(self, ch.get())) return true;
+				}
+				return false;
+			};
+			return walk(walk, root);
+		};
+
+		int dagScissor[4] = {0, 0, fbW, fbH};
+		const int* dagScissorPtr = nullptr;
+		if (hasRoi && (!desc.imageFilter.has_value() || !dagSamplesOutsideRoi(desc.imageFilter->node().get()))) {
+			const float maxBlur = desc.imageFilter.has_value() ? desc.imageFilter->max_sigma() : 0.0f;
+			const int cPad = (maxBlur > 0.001f) ? (static_cast<int>(std::ceil(maxBlur * 3.0f)) + 8) : 4;
+			const int sx0 = std::clamp(roiX0 - cPad, 0, fbW);
+			const int sy0 = std::clamp(roiY0 - cPad, 0, fbH);
+			const int sx1 = std::clamp(roiX1 + cPad, 0, fbW);
+			const int sy1 = std::clamp(roiY1 + cPad, 0, fbH);
+			if (sx1 > sx0 && sy1 > sy0) {
+				dagScissor[0] = sx0;
+				dagScissor[1] = sy0;
+				dagScissor[2] = sx1 - sx0;
+				dagScissor[3] = sy1 - sy0;
+				dagScissorPtr = dagScissor;
+			}
+		}
+
 		auto acquireClearedFbo = [&]() -> int {
 			const int idx = acquireLayerFbo(fbW, fbH);
 			glBindFramebuffer(GL_FRAMEBUFFER, layerPool[idx].fbo);
-			glDisable(GL_SCISSOR_TEST);
+			if (dagScissorPtr) {
+				glEnable(GL_SCISSOR_TEST);
+				glScissor(dagScissorPtr[0], dagScissorPtr[1], dagScissorPtr[2], dagScissorPtr[3]);
+			} else {
+				glDisable(GL_SCISSOR_TEST);
+			}
 			glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 			glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 			glClear(GL_COLOR_BUFFER_BIT);
@@ -2437,7 +2501,7 @@ struct GL3Renderer::Impl {
 			case effects::ImageFilterKind::ColorFilter: {
 				const int inIdx = evalChild(0);
 				const int outIdx = evalColorEffectDag(node->color_effect, inIdx, fbW, fbH,
-				                                      roiUv, cropUv, hasRoi, roiX0, roiY0, roiX1, roiY1);
+				                                      roiUv, cropUv, hasRoi, roiX0, roiY0, roiX1, roiY1, dagScissorPtr);
 				if (outIdx != inIdx) releaseTemp(inIdx);
 				return outIdx;
 			}
@@ -2497,10 +2561,10 @@ struct GL3Renderer::Impl {
 			case effects::ImageFilterKind::RuntimeShader: {
 				const int inIdx = evalChild(0);
 				if (!node->runtime_spec) return inIdx;
-				const int outIdx = acquireClearedFbo();
+				const int outIdx = dagScissorPtr ? acquireLayerFbo(fbW, fbH) : acquireClearedFbo();
 				runFilterRuntimePass(layerPool[outIdx].fbo, layerPool[inIdx].colorTex,
 				                     *node->runtime_spec, desc.layerTransform,
-				                     roiUv, cropUv, fbW, fbH);
+				                     roiUv, cropUv, fbW, fbH, dagScissorPtr);
 				releaseTemp(inIdx);
 				return outIdx;
 			}

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -78,6 +79,20 @@ private:
     std::unordered_map<std::string, std::vector<uint8_t>> values_{};
 };
 
+/// Optional compiled C++ CPU fast-path callback matching a RuntimeFilterSpec's shader semantics.
+using CpuRuntimeFilterFn = std::function<void(
+    const PixmapRef& src_rgba,
+    PixmapMut& dst_rgba,
+    int32_t roi_origin_x,
+    int32_t roi_origin_y,
+    const Transform& layer_transform,
+    const Transform& inv_layer_transform,
+    int32_t cx0,
+    int32_t cy0,
+    int32_t cx1,
+    int32_t cy1
+)>;
+
 /// Immutable, backend-independent representation of a custom post-processing shader
 /// used by `ImageFilter::runtime_shader(...)` across CPU, OpenGL, and Vulkan.
 struct RuntimeFilterSpec {
@@ -91,6 +106,7 @@ struct RuntimeFilterSpec {
     bool has_input_child{false};
     bool has_color_in{false};
     uint64_t shader_hash{0};
+    CpuRuntimeFilterFn cpu_fast_eval{};
 };
 
 /// Parses a Nisaba shader program into a backend-independent RuntimeFilterSpec.
@@ -99,6 +115,13 @@ struct RuntimeFilterSpec {
     std::string_view source,
     const RuntimeFilterUniforms* overrides = nullptr,
     std::string_view input_child_name = {}
+);
+
+/// Clones a pre-parsed RuntimeFilterSpec with updated uniform values and an optional compiled CPU kernel.
+[[nodiscard]] std::shared_ptr<RuntimeFilterSpec> clone_runtime_filter_with_uniforms(
+    const RuntimeFilterSpec& base_spec,
+    const RuntimeFilterUniforms& overrides,
+    CpuRuntimeFilterFn cpu_eval = {}
 );
 
 /// Evaluates a RuntimeFilterSpec on CPU over an RGBA8888 premultiplied source ROI pixmap.
