@@ -64,6 +64,7 @@ public:
         : pixmap_(pixmap.as_mut()),
           scissor_clip_(ScreenIntRect::from_xywh(0, 0, pixmap.width(), pixmap.height())) {}
 
+    [[nodiscard]] CanvasKind canvas_kind() const noexcept override { return CanvasKind::Software; }
     [[nodiscard]] uint32_t width() const noexcept { return pixmap_.width(); }
     [[nodiscard]] uint32_t height() const noexcept { return pixmap_.height(); }
     [[nodiscard]] uint32_t canvas_width() const noexcept override { return pixmap_.width(); }

@@ -582,27 +582,30 @@ void draw_math_string(
 
     float top_y = baseline_y - font_size * 0.82f;
 
-    if (auto* cpu_canvas = dynamic_cast<Canvas*>(&canvas)) {
+    if (canvas.canvas_kind() == CanvasKind::Software) {
+        auto& cpu_canvas = static_cast<Canvas&>(canvas);
         text::Buffer buf(text::Metrics(font_size, font_size * 1.2f));
         buf.set_wrap(text::Wrap::None);
         buf.set_text(text, attrs);
         buf.shape_until_scroll(font_system);
-        buf.draw(*cpu_canvas, glyph_cache, font_system, color, x, top_y);
+        buf.draw(cpu_canvas, glyph_cache, font_system, color, x, top_y);
         return;
     }
 
 #ifdef NISABA_GLEW
-    if (auto* gpu_canvas = dynamic_cast<gpu::GpuCanvas*>(&canvas)) {
+    if (canvas.canvas_kind() == CanvasKind::Gpu) {
+        auto& gpu_canvas = static_cast<gpu::GpuCanvas&>(canvas);
         text::Buffer buf(text::Metrics(font_size, font_size * 1.2f));
         buf.set_wrap(text::Wrap::None);
         buf.set_text(text, attrs);
         buf.shape_until_scroll(font_system);
-        gpu_canvas->draw_text_buffer(buf, font_system, Point::from_xy(x, top_y), color);
+        gpu_canvas.draw_text_buffer(buf, font_system, Point::from_xy(x, top_y), color);
         return;
     }
 #endif
 
-    if (auto* pdf_canvas = dynamic_cast<pdf::PdfCanvas*>(&canvas)) {
+    if (canvas.canvas_kind() == CanvasKind::Pdf) {
+        auto& pdf_canvas = static_cast<pdf::PdfCanvas&>(canvas);
         std::string_view pdf_font = "Helvetica";
         if (style == MathFontStyle::Bold) pdf_font = "Helvetica-Bold";
         else if (style == MathFontStyle::Normal && text.size() == 1 && std::isalpha(static_cast<unsigned char>(text[0]))) {
@@ -610,7 +613,7 @@ void draw_math_string(
         } else if (style == MathFontStyle::Monospace) {
             pdf_font = "Courier";
         }
-        pdf_canvas->draw_text(text, x, top_y, font_size, color, pdf_font);
+        pdf_canvas.draw_text(text, x, top_y, font_size, color, pdf_font);
     }
 }
 

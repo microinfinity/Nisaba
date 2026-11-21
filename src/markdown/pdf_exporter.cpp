@@ -45,7 +45,20 @@ std::vector<std::string> wrap_text(std::string_view text, float max_width, float
 std::string extract_plain_text(const std::vector<InlineSpan>& inlines) {
     std::string s;
     for (const auto& span : inlines) {
-        s += span.text;
+        if (span.type == InlineType::SoftBreak) {
+            s.push_back(' ');
+        } else if (span.type == InlineType::LineBreak) {
+            s.push_back('\n');
+        } else if (span.type == InlineType::HtmlInline) {
+            continue;
+        } else if (span.type == InlineType::Math) {
+            auto m = MathEngine::parse(span.text, false);
+            s += m ? MathEngine::to_plain_text(*m) : span.text;
+        } else if (!span.children.empty()) {
+            s += extract_plain_text(span.children);
+        } else {
+            s += span.text;
+        }
     }
     return s;
 }
@@ -300,7 +313,8 @@ std::vector<uint8_t> MarkdownPdfExporter::export_to_bytes(
 
             case BlockType::List: {
                 int item_num = block.list_start_number;
-                float item_gap = block.is_loose_list ? style.paragraph_spacing : style.list_item_spacing;
+                bool is_loose = block.is_loose_list || !block.is_tight_list;
+                float item_gap = is_loose ? style.paragraph_spacing : style.list_item_spacing;
 
                 for (const auto& item_ptr : block.children) {
                     if (!item_ptr) continue;

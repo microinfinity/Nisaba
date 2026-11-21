@@ -18,6 +18,13 @@ benchmark_render3d_pbr_exe = executable('benchmark_render3d_pbr',
   dependencies : [nisaba_dep, extra_deps]
 )
 
+if get_option('enable_markdown')
+  benchmark_markdown_exe = executable('benchmark_markdown',
+    'benchmark_markdown.cpp',
+    dependencies : [nisaba_dep, extra_deps]
+  )
+endif
+
 
 cairo_dep = dependency('cairo', required : false)
 if cairo_dep.found()

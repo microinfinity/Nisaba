@@ -268,4 +268,46 @@ bool HtmlParser::is_block_html_line(std::string_view line) {
            lower.starts_with("<!--");
 }
 
+bool HtmlParser::is_tagfilter_disallowed(std::string_view tag_name) {
+    static const std::unordered_set<std::string> disallowed = {
+        "title", "textarea", "style", "xmp", "iframe",
+        "noembed", "noframes", "script", "plaintext"
+    };
+    return disallowed.find(to_lower(tag_name)) != disallowed.end();
+}
+
+std::string HtmlParser::apply_tagfilter(std::string_view html) {
+    std::string out;
+    out.reserve(html.size() + 16);
+
+    size_t i = 0;
+    while (i < html.size()) {
+        if (html[i] == '<') {
+            size_t j = i + 1;
+            if (j < html.size() && html[j] == '/') {
+                j++;
+            }
+            size_t name_start = j;
+            while (j < html.size() && std::isalpha(static_cast<unsigned char>(html[j]))) {
+                j++;
+            }
+            if (j > name_start) {
+                std::string_view tag_name = html.substr(name_start, j - name_start);
+                bool valid_boundary = (j >= html.size() ||
+                                       html[j] == '>' ||
+                                       html[j] == '/' ||
+                                       std::isspace(static_cast<unsigned char>(html[j])));
+                if (valid_boundary && is_tagfilter_disallowed(tag_name)) {
+                    out += "&lt;";
+                    i++;
+                    continue;
+                }
+            }
+        }
+        out.push_back(html[i]);
+        i++;
+    }
+    return out;
+}
+
 } // namespace nisaba::markdown

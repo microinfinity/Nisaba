@@ -95,19 +95,22 @@ void draw_label(
     buf.set_text(text, attrs);
     buf.shape_until_scroll(font_system);
 
-    if (auto* cpu_canvas = dynamic_cast<Canvas*>(&canvas)) {
-        buf.draw(*cpu_canvas, glyph_cache, font_system, color, x, y);
+    if (canvas.canvas_kind() == CanvasKind::Software) {
+        auto& cpu_canvas = static_cast<Canvas&>(canvas);
+        buf.draw(cpu_canvas, glyph_cache, font_system, color, x, y);
         return;
     }
 
 #ifdef NISABA_GLEW
-    if (auto* gpu_canvas = dynamic_cast<gpu::GpuCanvas*>(&canvas)) {
-        gpu_canvas->draw_text_buffer(buf, font_system, Point::from_xy(x, y), color);
+    if (canvas.canvas_kind() == CanvasKind::Gpu) {
+        auto& gpu_canvas = static_cast<gpu::GpuCanvas&>(canvas);
+        gpu_canvas.draw_text_buffer(buf, font_system, Point::from_xy(x, y), color);
         return;
     }
 #endif
 
-    if (auto* pdf_canvas = dynamic_cast<pdf::PdfCanvas*>(&canvas)) {
+    if (canvas.canvas_kind() == CanvasKind::Pdf) {
+        auto& pdf_canvas = static_cast<pdf::PdfCanvas&>(canvas);
         float text_w = buf.max_line_width();
         float tx = x;
         if (align == text::Align::Center && width > text_w) {
@@ -115,7 +118,7 @@ void draw_label(
         } else if (align == text::Align::Right && width > text_w) {
             tx = x + (width - text_w);
         }
-        pdf_canvas->draw_text(text, tx, y, font_size, color, bold ? "Helvetica-Bold" : "Helvetica");
+        pdf_canvas.draw_text(text, tx, y, font_size, color, bold ? "Helvetica-Bold" : "Helvetica");
     }
 }
 

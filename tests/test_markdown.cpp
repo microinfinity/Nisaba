@@ -789,6 +789,732 @@ void test_markdown_math_diagram_document_and_pdf() {
     std::cout << "  Math & Diagram document layout, CPU render and PDF export verified." << std::endl;
 }
 
+// ============================================================================
+// Phase 1–4 Feature Parity & Spec Compliance Test Suites
+// ============================================================================
+
+void test_phase1_streaming_parser() {
+    std::cout << "[Test] Phase 1.1: Incremental Streaming Parser (feed + snapshot + finish)..." << std::endl;
+
+    std::string md =
+        "# Streaming Title\r\n"
+        "\r\n"
+        "Check [forward ref][f1] and **bold** text with UTF-8: — café 🚀.\r\n"
+        "\r\n"
+        "```cpp\r\n"
+        "int x = 1 + 2;\r\n"
+        "```\r\n"
+        "\r\n"
+        "| ColA | ColB |\r\n"
+        "| :--- | ---: |\r\n"
+        "| 10   | 20   |\r\n"
+        "\r\n"
+        "- Item A\r\n"
+        "- Item B\r\n"
+        "\r\n"
+        "[f1]: https://nisaba.dev/stream \"Stream Target\"\r\n";
+
+    MarkdownParseOptions opts;
+    opts.validate_utf8 = true;
+    auto expected = MarkdownParser::parse(md, opts);
+    std::string expected_html = MarkdownExporter::to_html(*expected);
+
+    // Feed in 1-byte, 7-byte, and 33-byte chunks (splitting CRLF and UTF-8 mid-sequence!)
+    for (size_t chunk_sz : {size_t{1}, size_t{7}, size_t{33}}) {
+        MarkdownParser streamer(opts);
+        size_t max_snap_blocks = 0;
+        for (size_t off = 0; off < md.size(); off += chunk_sz) {
+            size_t n = std::min(chunk_sz, md.size() - off);
+            streamer.feed(std::string_view(md.data() + off, n));
+            if (off >= md.size() / 2 && max_snap_blocks == 0) {
+                auto snap = streamer.snapshot();
+                assert(snap != nullptr);
+                max_snap_blocks = std::max(max_snap_blocks, snap->children.size());
+            }
+        }
+        assert(max_snap_blocks >= 2); // Mid-stream snapshot already has committed blocks!
+        auto streamed = streamer.finish();
+        assert(streamed != nullptr);
+        assert(streamed->children.size() == expected->children.size());
+        std::string streamed_html = MarkdownExporter::to_html(*streamed);
+        assert(streamed_html == expected_html);
+    }
+
+    // Verify reset() allows clean parser reuse
+    MarkdownParser reusable(opts);
+    reusable.feed("# First\n");
+    auto first = reusable.finish();
+    assert(first->children.size() == 1 && first->children[0]->type == BlockType::Heading);
+
+    reusable.reset();
+    reusable.feed("Second paragraph.\n");
+    auto second = reusable.finish();
+    assert(second->children.size() == 1 && second->children[0]->type == BlockType::Paragraph);
+
+    std::cout << "  Incremental streaming parser (1B/7B/33B chunks, snapshot, reset) verified." << std::endl;
+}
+
+void test_phase1_sourcepos() {
+    std::cout << "[Test] Phase 1.2: AST Source Positions (SourcePos)..." << std::endl;
+
+    std::string md =
+        "# Title\n"                   // line 1
+        "\n"                          // line 2
+        "Hello **world** here\n"      // line 3
+        "second line.\n"              // line 4
+        "\n"                          // line 5
+        "```cpp\n"                    // line 6
+        "auto a = 1;\n"               // line 7
+        "```\n"                       // line 8
+        "\n"                          // line 9
+        "---\n";                      // line 10
+
+    auto doc = MarkdownParser::parse(md);
+    assert(doc->sourcepos.is_valid());
+    assert(doc->sourcepos.start_line == 1);
+    assert(doc->sourcepos.end_line == 10);
+
+    // Heading on line 1
+    const auto& h = *doc->children[0];
+    assert(h.type == BlockType::Heading);
+    assert(h.sourcepos.start_line == 1 && h.sourcepos.start_col == 1);
+    assert(h.sourcepos.end_line == 1 && h.sourcepos.end_col == 7);
+
+    // Multi-line paragraph on lines 3..4
+    const auto& p = *doc->children[1];
+    assert(p.type == BlockType::Paragraph);
+    assert(p.sourcepos.start_line == 3 && p.sourcepos.start_col == 1);
+    assert(p.sourcepos.end_line == 4);
+
+    bool found_bold_pos = false;
+    for (const auto& sp : p.inlines) {
+        assert(sp.sourcepos.is_valid());
+        if (sp.type == InlineType::Bold && sp.text == "world") {
+            assert(sp.sourcepos.start_line == 3);
+            assert(sp.sourcepos.start_col == 7); // "Hello " = 6 bytes, "**world**" starts at col 7
+            assert(sp.sourcepos.end_line == 3);
+            assert(sp.sourcepos.end_col == 15);
+            found_bold_pos = true;
+        }
+    }
+    assert(found_bold_pos);
+
+    // Fenced code block on lines 6..8
+    const auto& cb = *doc->children[2];
+    assert(cb.type == BlockType::CodeBlock);
+    assert(cb.sourcepos.start_line == 6 && cb.sourcepos.end_line == 8);
+
+    // Thematic break on line 10
+    const auto& hr = *doc->children[3];
+    assert(hr.type == BlockType::ThematicBreak);
+    assert(hr.sourcepos.start_line == 10 && hr.sourcepos.end_line == 10);
+
+    std::cout << "  BlockNode & InlineSpan SourcePos verified." << std::endl;
+}
+
+void test_phase1_parse_options() {
+    std::cout << "[Test] Phase 1.3: Parser Configuration Flags (MarkdownParseOptions)..." << std::endl;
+
+    // 1. hard_breaks vs no_breaks vs default SoftBreak
+    std::string two_line = "Alpha\nBeta\n";
+    {
+        auto d_def = MarkdownParser::parse(two_line);
+        bool has_soft = false;
+        for (const auto& s : d_def->children[0]->inlines) {
+            if (s.type == InlineType::SoftBreak) has_soft = true;
+        }
+        assert(has_soft);
+
+        MarkdownParseOptions opt_hard;
+        opt_hard.hard_breaks = true;
+        auto d_hard = MarkdownParser::parse(two_line, opt_hard);
+        bool has_hard = false;
+        for (const auto& s : d_hard->children[0]->inlines) {
+            if (s.type == InlineType::LineBreak) has_hard = true;
+        }
+        assert(has_hard);
+
+        MarkdownParseOptions opt_no;
+        opt_no.no_breaks = true;
+        auto d_no = MarkdownParser::parse(two_line, opt_no);
+        for (const auto& s : d_no->children[0]->inlines) {
+            assert(s.type != InlineType::SoftBreak && s.type != InlineType::LineBreak);
+        }
+        assert(MarkdownExporter::to_html(*d_no) == "<p>Alpha Beta</p>\n");
+    }
+
+    // 2. unsafe_html false vs true
+    std::string raw_html_md = "<section>Raw HTML Block</section>\n";
+    {
+        MarkdownParseOptions opt_safe;
+        opt_safe.unsafe_html = false;
+        auto d_safe = MarkdownParser::parse(raw_html_md, opt_safe);
+        assert(d_safe->children.empty());
+
+        MarkdownParseOptions opt_unsafe;
+        opt_unsafe.unsafe_html = true;
+        auto d_unsafe = MarkdownParser::parse(raw_html_md, opt_unsafe);
+        assert(d_unsafe->children.size() == 1);
+        assert(d_unsafe->children[0]->type == BlockType::HtmlBlock);
+        assert(d_unsafe->children[0]->raw_html == "<section>Raw HTML Block</section>");
+    }
+
+    // 3. validate_utf8 (invalid bytes & embedded NUL -> U+FFFD)
+    {
+        std::string bad_utf8("Valid ");
+        bad_utf8.push_back('\xFF');
+        bad_utf8.push_back('\xFE');
+        bad_utf8.push_back(' ');
+        bad_utf8.push_back('\0');
+        bad_utf8 += " end";
+
+        MarkdownParseOptions opt_utf8;
+        opt_utf8.validate_utf8 = true;
+        auto d = MarkdownParser::parse(bad_utf8, opt_utf8);
+        std::string plain = MarkdownExporter::to_plaintext(*d);
+        assert(plain.find("\xEF\xBF\xBD") != std::string::npos);
+        assert(plain.find('\xFF') == std::string::npos);
+        assert(plain.find('\0') == std::string::npos);
+    }
+
+    // 4. smart_punctuation
+    {
+        MarkdownParseOptions opt_smart;
+        opt_smart.smart_punctuation = true;
+        std::string smart_md = "Wait---this is \"smart\" -- it's 'cool'... and `\"code\" --` and \\\"escaped\\\".\n";
+        auto d = MarkdownParser::parse(smart_md, opt_smart);
+        std::string html = MarkdownExporter::to_html(*d);
+        assert(html.find("\xe2\x80\x94") != std::string::npos); // — em-dash
+        assert(html.find("\xe2\x80\x93") != std::string::npos); // – en-dash
+        assert(html.find("\xe2\x80\xa6") != std::string::npos); // … ellipsis
+        assert(html.find("\xe2\x80\x9csmart\xe2\x80\x9d") != std::string::npos); // “smart”
+        assert(html.find("it\xe2\x80\x99s") != std::string::npos); // it’s
+        assert(html.find("\xe2\x80\x98" "cool\xe2\x80\x99") != std::string::npos); // ‘cool’
+        // Code span and escaped quotes must remain ASCII!
+        assert(html.find("<code>&quot;code&quot; --</code>") != std::string::npos);
+        assert(html.find("&quot;escaped&quot;") != std::string::npos);
+    }
+
+    std::cout << "  All MarkdownParseOptions flags verified." << std::endl;
+}
+
+void test_phase2_delimiter_stack() {
+    std::cout << "[Test] Phase 2.1: Full Delimiter Stack Algorithm (Emphasis & Links)..." << std::endl;
+
+    // 1. Intraword underscores MUST NOT create emphasis; intraword asterisks MUST
+    {
+        auto s_under = MarkdownParser::parse_inlines("foo_bar_baz and foo__bar__baz");
+        for (const auto& s : s_under) {
+            assert(s.type == InlineType::Text);
+        }
+        auto s_star = MarkdownParser::parse_inlines("foo*bar*baz");
+        assert(s_star.size() == 3);
+        assert(s_star[0].type == InlineType::Text && s_star[0].text == "foo");
+        assert(s_star[1].type == InlineType::Italic && s_star[1].text == "bar");
+        assert(s_star[2].type == InlineType::Text && s_star[2].text == "baz");
+    }
+
+    // 2. Underscores flanked by punctuation ARE valid emphasis
+    {
+        auto s_punct = MarkdownParser::parse_inlines("(_italic_)");
+        assert(s_punct.size() == 3);
+        assert(s_punct[1].type == InlineType::Italic && s_punct[1].text == "italic");
+    }
+
+    // 3. Nested emphasis: **bold *and italic* bold** and ***both***
+    {
+        auto d = MarkdownParser::parse("**bold *and italic* bold** and ***both***");
+        std::string html = MarkdownExporter::to_html(*d);
+        assert(html.find("<strong>bold <em>and italic</em> bold</strong>") != std::string::npos);
+        assert(html.find("<em><strong>both</strong></em>") != std::string::npos);
+    }
+
+    // 4. Emphasis across links and balanced nested brackets in links
+    {
+        auto d = MarkdownParser::parse("*[outer [inner] text](https://example.com/a_(b))*");
+        std::string html = MarkdownExporter::to_html(*d);
+        assert(html.find("<em><a href=\"https://example.com/a_(b)\">outer [inner] text</a></em>") != std::string::npos);
+    }
+
+    // 5. Multi-backtick code spans & single space stripping
+    {
+        auto s = MarkdownParser::parse_inlines("``code with ` backtick`` and `` ` ``");
+        int codes = 0;
+        for (const auto& sp : s) {
+            if (sp.type == InlineType::CodeSpan) {
+                if (codes == 0) assert(sp.text == "code with ` backtick");
+                if (codes == 1) assert(sp.text == "`");
+                codes++;
+            }
+        }
+        assert(codes == 2);
+    }
+
+    // 6. Backslash hard break & two-space hard break
+    {
+        auto d = MarkdownParser::parse("line1\\\nline2  \nline3");
+        int brs = 0;
+        for (const auto& sp : d->children[0]->inlines) {
+            if (sp.type == InlineType::LineBreak) brs++;
+        }
+        assert(brs == 2);
+    }
+
+    std::cout << "  Full Delimiter Stack algorithm verified." << std::endl;
+}
+
+void test_phase2_entities_and_escapes() {
+    std::cout << "[Test] Phase 2.2: Complete HTML5 Entities & Backslash Escapes..." << std::endl;
+
+    // 1. Named HTML5 entities + numeric decimal + numeric hex + invalid codepoint -> U+FFFD
+    auto spans = MarkdownParser::parse_inlines(
+        "&copy; &mdash; &nbsp; &euro; &AElig; &#123; &#x1F600; &#0; &#xD800;"
+    );
+    assert(spans.size() == 1);
+    const std::string& t = spans[0].text;
+    assert(t.find("\xc2\xa9") != std::string::npos);         // ©
+    assert(t.find("\xe2\x80\x94") != std::string::npos);     // —
+    assert(t.find("\xc2\xa0") != std::string::npos);         // NBSP
+    assert(t.find("\xe2\x82\xac") != std::string::npos);     // €
+    assert(t.find("\xc3\x86") != std::string::npos);         // Æ
+    assert(t.find('{') != std::string::npos);                // &#123;
+    assert(t.find("\xf0\x9f\x98\x80") != std::string::npos); // 😀
+    assert(t.find("\xef\xbf\xbd") != std::string::npos);     // U+FFFD for &#0; & &#xD800;
+
+    // 2. All 32 CommonMark ASCII punctuation backslash escapes
+    std::string punct = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+    assert(punct.size() == 32);
+    std::string escaped_input;
+    for (char c : punct) {
+        escaped_input.push_back('\\');
+        escaped_input.push_back(c);
+    }
+    auto esc_spans = MarkdownParser::parse_inlines(escaped_input);
+    assert(esc_spans.size() == 1);
+    assert(esc_spans[0].text == punct);
+
+    // 3. Non-punctuation backslash MUST remain literal
+    auto non_punct = MarkdownParser::parse_inlines("\\a \\1 \\Z");
+    assert(non_punct.size() == 1);
+    assert(non_punct[0].text == "\\a \\1 \\Z");
+
+    std::cout << "  HTML5 entities, numeric/hex refs, and 32 ASCII punctuation escapes verified." << std::endl;
+}
+
+void test_phase2_classic_blocks() {
+    std::cout << "[Test] Phase 2.3: Setext Headings, Indented Code, Lazy Continuation & Tight/Loose Lists..." << std::endl;
+
+    // 1. Setext Headings (H1 and H2)
+    {
+        auto doc = MarkdownParser::parse(
+            "Setext H1\n"
+            "=========\n"
+            "\n"
+            "Setext H2\n"
+            "---------\n"
+            "\n"
+            "---\n"
+        );
+        assert(doc->children.size() == 3);
+        assert(doc->children[0]->type == BlockType::Heading && doc->children[0]->heading_level == 1 && doc->children[0]->is_setext_heading);
+        assert(doc->children[1]->type == BlockType::Heading && doc->children[1]->heading_level == 2 && doc->children[1]->is_setext_heading);
+        assert(doc->children[2]->type == BlockType::ThematicBreak);
+    }
+
+    // 2. Indented Code Blocks (4 spaces and tab, preserving internal blank lines, stripping trailing blanks)
+    {
+        auto doc = MarkdownParser::parse(
+            "    int x = 1;\n"
+            "\n"
+            "\treturn x;\n"
+            "    \n"
+        );
+        assert(doc->children.size() == 1);
+        const auto& cb = *doc->children[0];
+        assert(cb.type == BlockType::CodeBlock);
+        assert(cb.is_indented_code);
+        assert(cb.code_lines.size() == 3);
+        assert(cb.code_lines[0] == "int x = 1;");
+        assert(cb.code_lines[1].empty());
+        assert(cb.code_lines[2] == "return x;");
+    }
+
+    // 3. Lazy continuation in BlockQuote and ListItem
+    {
+        auto doc = MarkdownParser::parse(
+            "> Quoted line 1\n"
+            "lazy quoted line 2\n"
+            "\n"
+            "- List item line 1\n"
+            "lazy list line 2\n"
+        );
+        assert(doc->children.size() == 2);
+        assert(doc->children[0]->type == BlockType::BlockQuote);
+        assert(doc->children[0]->children.size() == 1);
+        std::string bq_plain = MarkdownExporter::to_plaintext(*doc->children[0]);
+        assert(bq_plain.find("Quoted line 1 lazy quoted line 2") != std::string::npos);
+
+        assert(doc->children[1]->type == BlockType::List);
+        std::string li_plain = MarkdownExporter::to_plaintext(*doc->children[1]);
+        assert(li_plain.find("List item line 1 lazy list line 2") != std::string::npos);
+    }
+
+    // 4. Tight vs Loose lists
+    {
+        auto tight_doc = MarkdownParser::parse("- one\n- two\n");
+        assert(tight_doc->children[0]->type == BlockType::List);
+        assert(tight_doc->children[0]->is_tight_list);
+        assert(!tight_doc->children[0]->is_loose_list);
+        assert(MarkdownExporter::to_html(*tight_doc) == "<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n");
+
+        auto loose_doc = MarkdownParser::parse("- one\n\n- two\n");
+        assert(loose_doc->children[0]->type == BlockType::List);
+        assert(!loose_doc->children[0]->is_tight_list);
+        assert(loose_doc->children[0]->is_loose_list);
+        std::string loose_html = MarkdownExporter::to_html(*loose_doc);
+        assert(loose_html.find("<li>\n<p>one</p>\n</li>") != std::string::npos);
+    }
+
+    std::cout << "  Setext headings, indented code, lazy continuation & tight/loose lists verified." << std::endl;
+}
+
+void test_phase2_reference_links() {
+    std::cout << "[Test] Phase 2.4: Complete Reference Links (Full, Collapsed, Shortcut, Unicode, Multi-line)..." << std::endl;
+
+    std::string md =
+        "[Full][Foo   Bar], [Collapsed][], [Shortcut], [Unicode][STRASSE], and ![Pic][img1].\n"
+        "\n"
+        "[foo bar]: <https://example.com/a b>\n"
+        "  \"Multi-line\n"
+        "title\"\n"
+        "[collapsed]: https://example.com/collapsed 'Single Title'\n"
+        "[shortcut]: https://example.com/shortcut (Paren Title)\n"
+        "[shortcut]: https://example.com/ignored-second\n"
+        "[stra\xc3\x9f" "e]: https://example.com/strasse\n"
+        "[img1]: https://example.com/pic.png \"Logo\"\n"
+        "\n"
+        "```md\n"
+        "[in_code]: https://should.not/parse\n"
+        "```\n";
+
+    auto doc = MarkdownParser::parse(md);
+    assert(doc->children.size() == 2); // Paragraph + CodeBlock
+    const auto& inlines = doc->children[0]->inlines;
+
+    bool found_full = false, found_collapsed = false, found_shortcut = false, found_unicode = false, found_img = false;
+    for (const auto& s : inlines) {
+        if (s.type == InlineType::Link && s.text == "Full" && s.target == "https://example.com/a b" && s.title == "Multi-line\ntitle") {
+            found_full = true;
+        }
+        if (s.type == InlineType::Link && s.text == "Collapsed" && s.target == "https://example.com/collapsed" && s.title == "Single Title") {
+            found_collapsed = true;
+        }
+        if (s.type == InlineType::Link && s.text == "Shortcut" && s.target == "https://example.com/shortcut" && s.title == "Paren Title") {
+            found_shortcut = true;
+        }
+        if (s.type == InlineType::Link && s.text == "Unicode" && s.target == "https://example.com/strasse") {
+            found_unicode = true;
+        }
+        if (s.type == InlineType::Image && s.text == "Pic" && s.target == "https://example.com/pic.png" && s.title == "Logo") {
+            found_img = true;
+        }
+    }
+    assert(found_full && found_collapsed && found_shortcut && found_unicode && found_img);
+
+    std::cout << "  Full, collapsed, shortcut, angle-URL, multi-line title & Unicode reference links verified." << std::endl;
+}
+
+void test_phase3_tagfilter() {
+    std::cout << "[Test] Phase 3.1: GFM Tagfilter Extension (HTML Sanitization)..." << std::endl;
+
+    std::string raw =
+        "<title>t</title><textarea>a</textarea><style>s</style>"
+        "<xmp>x</xmp><iframe src=\"x\"></iframe><noembed>n</noembed>"
+        "<noframes>f</noframes><SCRIPT>alert(1)</SCRIPT><plaintext>p"
+        "<div>safe</div>";
+
+    std::string filtered = HtmlParser::apply_tagfilter(raw);
+    assert(filtered.find("&lt;title>") != std::string::npos);
+    assert(filtered.find("&lt;textarea>") != std::string::npos);
+    assert(filtered.find("&lt;style>") != std::string::npos);
+    assert(filtered.find("&lt;xmp>") != std::string::npos);
+    assert(filtered.find("&lt;iframe ") != std::string::npos);
+    assert(filtered.find("&lt;noembed>") != std::string::npos);
+    assert(filtered.find("&lt;noframes>") != std::string::npos);
+    assert(filtered.find("&lt;SCRIPT>") != std::string::npos);
+    assert(filtered.find("&lt;/SCRIPT>") != std::string::npos);
+    assert(filtered.find("&lt;plaintext>") != std::string::npos);
+    assert(filtered.find("<div>safe</div>") != std::string::npos);
+
+    // End-to-end parser + HTML exporter verification
+    MarkdownParseOptions parse_opts;
+    parse_opts.unsafe_html = true;
+    parse_opts.tagfilter = false; // Leave raw in AST to verify exporter-side tagfilter too
+    auto doc = MarkdownParser::parse("<script>alert(1)</script>\n\n<div>ok</div>\n", parse_opts);
+
+    MarkdownHtmlExportOptions safe_html_opts;
+    safe_html_opts.unsafe_html = false;
+    assert(MarkdownExporter::to_html(*doc, safe_html_opts).find("<!-- raw HTML omitted -->") != std::string::npos);
+
+    MarkdownHtmlExportOptions tf_html_opts;
+    tf_html_opts.unsafe_html = true;
+    tf_html_opts.tagfilter = true;
+    std::string tf_out = MarkdownExporter::to_html(*doc, tf_html_opts);
+    assert(tf_out.find("&lt;script>alert(1)&lt;/script>") != std::string::npos);
+    assert(tf_out.find("<div>ok</div>") != std::string::npos);
+
+    std::cout << "  GFM Tagfilter (all 9 disallowed tags + safe tag preservation) verified." << std::endl;
+}
+
+void test_phase3_strict_autolinks() {
+    std::cout << "[Test] Phase 3.2: Strict GFM Autolink Extension..." << std::endl;
+
+    std::string md =
+        "Visit www.example.com/docs! "
+        "See (https://en.wikipedia.org/wiki/C_(programming_language)). "
+        "Email user.name+tag@nisaba.dev, or bad www.bad_domain.com.";
+
+    auto spans = MarkdownParser::parse_inlines(md);
+    bool found_www = false, found_wiki = false, found_email = false, found_bad = false;
+
+    for (const auto& s : spans) {
+        if (s.type == InlineType::Link) {
+            if (s.target == "http://www.example.com/docs") found_www = true;
+            if (s.target == "https://en.wikipedia.org/wiki/C_(programming_language)") found_wiki = true;
+            if (s.target == "mailto:user.name+tag@nisaba.dev") found_email = true;
+            if (s.target.find("bad_domain") != std::string::npos) found_bad = true;
+        }
+    }
+    assert(found_www);
+    assert(found_wiki);
+    assert(found_email);
+    assert(!found_bad);
+
+    std::cout << "  Strict GFM Autolinks (www, balanced parens, email, trailing punct) verified." << std::endl;
+}
+
+void test_phase3_extensions() {
+    std::cout << "[Test] Phase 3.3: Extensible Syntax Extension Hook (MarkdownExtension)..." << std::endl;
+
+    class MentionAndCalloutExtension final : public MarkdownExtension {
+    public:
+        std::string_view name() const noexcept override { return "mention_and_callout"; }
+
+        bool try_parse_block(
+            const BlockExtensionContext& ctx,
+            std::shared_ptr<BlockNode>& out_block,
+            size_t& out_lines_consumed
+        ) const override {
+            auto line = ctx.current_line();
+            if (line.starts_with(":::banner ")) {
+                auto blk = std::make_shared<BlockNode>(BlockType::Custom);
+                blk->custom_kind = "banner";
+                blk->inlines.push_back(InlineSpan::make_text(std::string(line.substr(10))));
+                out_block = std::move(blk);
+                out_lines_consumed = 1;
+                return true;
+            }
+            return false;
+        }
+
+        bool try_parse_inline(
+            const InlineExtensionContext& ctx,
+            InlineSpan& out_span,
+            size_t& out_bytes_consumed
+        ) const override {
+            auto rem = ctx.remaining();
+            if (rem.size() >= 2 && (rem[0] == '@' || rem[0] == '#')) {
+                size_t end = 1;
+                while (end < rem.size() && (std::isalnum(static_cast<unsigned char>(rem[end])) || rem[end] == '_' || rem[end] == '-')) {
+                    end++;
+                }
+                if (end > 1) {
+                    std::string token(rem.substr(0, end));
+                    std::string kind = (rem[0] == '@') ? "mention" : "issue";
+                    out_span = InlineSpan::make_custom(kind, token, "/" + kind + "/" + token.substr(1));
+                    out_bytes_consumed = end;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool render_html_block(const BlockNode& block, std::string& out_html) const override {
+            if (block.custom_kind == "banner") {
+                out_html += "<aside class=\"banner\">";
+                if (!block.inlines.empty()) out_html += block.inlines[0].text;
+                out_html += "</aside>\n";
+                return true;
+            }
+            return false;
+        }
+
+        bool render_html_inline(const InlineSpan& span, std::string& out_html) const override {
+            if (span.custom_kind == "mention" || span.custom_kind == "issue") {
+                out_html += "<a class=\"" + span.custom_kind + "\" href=\"" + span.target + "\">" + span.text + "</a>";
+                return true;
+            }
+            return false;
+        }
+    };
+
+    MarkdownExtensionRegistry reg;
+    reg.register_extension(std::make_shared<MentionAndCalloutExtension>());
+
+    std::string md =
+        ":::banner Sovereign Release\n"
+        "\n"
+        "Thanks @alice for fixing #42!\n";
+
+    MarkdownParseOptions opts;
+    auto doc = MarkdownParser::parse(md, opts, &reg);
+    assert(doc->children.size() == 2);
+    assert(doc->children[0]->type == BlockType::Custom && doc->children[0]->custom_kind == "banner");
+
+    bool found_mention = false, found_issue = false;
+    for (const auto& sp : doc->children[1]->inlines) {
+        if (sp.type == InlineType::Custom && sp.custom_kind == "mention" && sp.text == "@alice") found_mention = true;
+        if (sp.type == InlineType::Custom && sp.custom_kind == "issue" && sp.text == "#42") found_issue = true;
+    }
+    assert(found_mention && found_issue);
+
+    MarkdownHtmlExportOptions hopts;
+    hopts.extensions = &reg;
+    std::string html = MarkdownExporter::to_html(*doc, hopts);
+    assert(html.find("<aside class=\"banner\">Sovereign Release</aside>") != std::string::npos);
+    assert(html.find("<a class=\"mention\" href=\"/mention/alice\">@alice</a>") != std::string::npos);
+    assert(html.find("<a class=\"issue\" href=\"/issue/42\">#42</a>") != std::string::npos);
+
+    std::cout << "  Pluggable MarkdownExtension (block + inline + HTML hooks) verified." << std::endl;
+}
+
+void test_phase4_exporters() {
+    std::cout << "[Test] Phase 4: Multi-Format Exporters (to_html, to_plaintext, to_markdown)..." << std::endl;
+
+    std::string md =
+        "# Heading One\n"
+        "\n"
+        "A paragraph with **bold**, *italic*, `code`, ~~del~~, and [link](https://nisaba.dev \"Home\").\n"
+        "\n"
+        "- [x] Done task\n"
+        "- [ ] Pending task\n"
+        "\n"
+        "| Key | Value |\n"
+        "| :--- | ---: |\n"
+        "| Engine | Nisaba |\n"
+        "\n"
+        "```cpp\n"
+        "int v = 7;\n"
+        "```\n"
+        "\n"
+        "> Quoted block.\n"
+        "\n"
+        "---\n";
+
+    auto doc = MarkdownDocument::from_string(md);
+
+    // 4.1 to_html (with sourcepos)
+    MarkdownHtmlExportOptions hopts;
+    hopts.sourcepos = true;
+    std::string html = doc.to_html(hopts);
+    assert(html.find("<h1 data-sourcepos=\"1:1-1:13\">Heading One</h1>") != std::string::npos);
+    assert(html.find("<strong>bold</strong>") != std::string::npos);
+    assert(html.find("<em>italic</em>") != std::string::npos);
+    assert(html.find("<code>code</code>") != std::string::npos);
+    assert(html.find("<del>del</del>") != std::string::npos);
+    assert(html.find("<a href=\"https://nisaba.dev\" title=\"Home\">link</a>") != std::string::npos);
+    assert(html.find("checked=\"\" disabled=\"\"") != std::string::npos);
+    assert(html.find("<th align=\"right\">Value</th>") != std::string::npos);
+    assert(html.find("<pre data-sourcepos=") != std::string::npos);
+    assert(html.find("<code class=\"language-cpp\">int v = 7;\n</code>") != std::string::npos);
+    assert(html.find("<hr data-sourcepos=") != std::string::npos);
+
+    // 4.2 to_plaintext
+    std::string plain = doc.to_plaintext();
+    assert(plain.find("Heading One") != std::string::npos);
+    assert(plain.find("A paragraph with bold, italic, code, del, and link.") != std::string::npos);
+    assert(plain.find("[x] Done task") != std::string::npos);
+    assert(plain.find("Engine\tNisaba") != std::string::npos);
+    assert(plain.find("**") == std::string::npos);
+    assert(plain.find("<h1>") == std::string::npos);
+
+    // 4.3 to_markdown round-trip parity
+    std::string formatted = doc.to_markdown();
+    auto reparsed = MarkdownDocument::from_string(formatted);
+    assert(doc.to_html() == reparsed.to_html());
+
+    std::cout << "  to_html, to_plaintext, and to_markdown round-trip verified." << std::endl;
+}
+
+void test_canvas_icanvas_pdf_parity() {
+    std::cout << "[Test] Verification: CPU Canvas, RTTI-free ICanvas & PDF Export Parity..." << std::endl;
+
+    class RecordingCanvas final : public ICanvas {
+    public:
+        uint32_t canvas_width() const noexcept override { return 800; }
+        uint32_t canvas_height() const noexcept override { return 1200; }
+        void save() override {}
+        void restore() override {}
+        void translate(float, float) override {}
+        void scale(float, float) override {}
+        void concat(const Transform&) override {}
+        void fill_rect(const Rect&, const Paint&) override { draw_ops++; }
+        void fill_path(const Path&, const Paint&, FillRule) override { draw_ops++; }
+        void stroke_path(const Path&, const Paint&, const Stroke&) override { draw_ops++; }
+        size_t draw_ops{0};
+    };
+
+    std::string md =
+        "Setext Title\n"
+        "============\n"
+        "\n"
+        "Smart &copy; text with **bold**, `code`, and https://nisaba.dev.\n"
+        "\n"
+        "    indented_code();\n"
+        "\n"
+        "> [!TIP]\n"
+        "> Parity check across render backends.\n"
+        "\n"
+        "- Tight 1\n"
+        "- Tight 2\n"
+        "\n"
+        "| A | B |\n"
+        "| :- | -: |\n"
+        "| 1 | 2 |\n";
+
+    MarkdownParseOptions opts;
+    opts.smart_punctuation = true;
+    auto doc = MarkdownDocument::from_string(md, opts);
+    auto style = MarkdownStyle::dark_theme();
+    text::FontSystem fonts;
+    text::GlyphCache cache;
+
+    float h = doc.layout(640.0f, style, fonts, cache);
+    assert(h > 150.0f);
+
+    // 1. CPU Canvas
+    auto pixmap = Pixmap::create(700, static_cast<uint32_t>(h + 40.0f));
+    assert(pixmap.has_value());
+    Canvas cpu_canvas(*pixmap);
+    cpu_canvas.clear(Color::from_rgba8(10, 14, 24, 255));
+    MarkdownRenderer::render(cpu_canvas, doc, 20.0f, 10.0f, 640.0f, style, fonts, cache);
+
+    // 2. Polymorphic RTTI-free ICanvas (exercises the exact GPU/ICanvas vector path)
+    RecordingCanvas rec_canvas;
+    MarkdownRenderer::render(static_cast<ICanvas&>(rec_canvas), doc, 20.0f, 10.0f, 640.0f, style, fonts, cache);
+    assert(rec_canvas.draw_ops >= 8);
+
+    // 3. PdfCanvas directly via ICanvas + MarkdownPdfExporter
+    pdf::PdfCanvas pdf_canvas(595.28f, 841.89f);
+    MarkdownRenderer::render(static_cast<ICanvas&>(pdf_canvas), doc, 20.0f, 10.0f, 550.0f, style, fonts, cache);
+    assert(!pdf_canvas.content_stream().empty());
+
+    auto pdf_bytes = MarkdownPdfExporter::export_to_bytes(doc, MarkdownStyle::light_theme(), fonts, cache);
+    assert(!pdf_bytes.empty());
+
+    std::cout << "  CPU Canvas, polymorphic ICanvas (" << rec_canvas.draw_ops << " vector ops) & PDF parity verified." << std::endl;
+}
+
 int main() {
     std::cout << "=== NISABA SOVEREIGN MARKDOWN ENGINE TESTS ===" << std::endl;
 
@@ -800,7 +1526,7 @@ int main() {
     test_markdown_blockquotes();
     test_markdown_document_and_render();
 
-    // New GitHub-Grade Markdown test suites
+    // GitHub-Grade Markdown test suites
     test_markdown_html_tags();
     test_markdown_github_alerts();
     test_markdown_syntax_highlighter();
@@ -814,6 +1540,20 @@ int main() {
     test_markdown_diagram_engine();
     test_markdown_math_diagram_document_and_pdf();
 
-    std::cout << "\n>>> ALL 19 MARKDOWN TEST SUITES PASSED! <<<\n" << std::endl;
+    // Full CommonMark 0.30 + GFM Parity test suites (Phases 1-4 + Verification)
+    test_phase1_streaming_parser();
+    test_phase1_sourcepos();
+    test_phase1_parse_options();
+    test_phase2_delimiter_stack();
+    test_phase2_entities_and_escapes();
+    test_phase2_classic_blocks();
+    test_phase2_reference_links();
+    test_phase3_tagfilter();
+    test_phase3_strict_autolinks();
+    test_phase3_extensions();
+    test_phase4_exporters();
+    test_canvas_icanvas_pdf_parity();
+
+    std::cout << "\n>>> ALL 31 MARKDOWN TEST SUITES PASSED! <<<\n" << std::endl;
     return 0;
 }

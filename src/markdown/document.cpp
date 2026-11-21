@@ -12,6 +12,157 @@ namespace nisaba::markdown {
 
 namespace {
 
+void flatten_inlines_rec(
+    const std::vector<InlineSpan>& inlines,
+    std::string& out_text,
+    text::AttrsList& out_attrs,
+    const text::Attrs& inherited,
+    const MarkdownStyle& style,
+    float font_size
+) {
+    auto to_tc = [](const Color& c) noexcept {
+        return text::TextColor::rgba(
+            static_cast<uint8_t>(std::clamp(c.red() * 255.0f, 0.0f, 255.0f)),
+            static_cast<uint8_t>(std::clamp(c.green() * 255.0f, 0.0f, 255.0f)),
+            static_cast<uint8_t>(std::clamp(c.blue() * 255.0f, 0.0f, 255.0f)),
+            static_cast<uint8_t>(std::clamp(c.alpha() * 255.0f, 0.0f, 255.0f))
+        );
+    };
+
+    for (const auto& span : inlines) {
+        size_t start = out_text.size();
+        text::Attrs cur = inherited;
+
+        if (span.text_color) cur.set_color(to_tc(*span.text_color));
+        if (span.bg_color) cur.set_background_color(to_tc(*span.bg_color));
+
+        auto emit_leaf = [&](std::string_view leaf) {
+            if (leaf.empty()) return;
+            size_t s0 = out_text.size();
+            out_text.append(leaf);
+            out_attrs.add_span(s0, out_text.size(), cur);
+        };
+
+        switch (span.type) {
+            case InlineType::Text:
+            case InlineType::Emoji:
+            case InlineType::Custom:
+                emit_leaf(span.text);
+                break;
+
+            case InlineType::Bold:
+                cur.set_weight(text::Weight::Bold);
+                if (!span.children.empty()) flatten_inlines_rec(span.children, out_text, out_attrs, cur, style, font_size);
+                else emit_leaf(span.text);
+                break;
+
+            case InlineType::Italic:
+                cur.set_style(text::Style::Italic);
+                if (!span.children.empty()) flatten_inlines_rec(span.children, out_text, out_attrs, cur, style, font_size);
+                else emit_leaf(span.text);
+                break;
+
+            case InlineType::BoldItalic:
+                cur.set_weight(text::Weight::Bold);
+                cur.set_style(text::Style::Italic);
+                if (!span.children.empty()) flatten_inlines_rec(span.children, out_text, out_attrs, cur, style, font_size);
+                else emit_leaf(span.text);
+                break;
+
+            case InlineType::CodeSpan:
+                cur.set_family(text::Family::monospace());
+                cur.set_font_size(font_size * 0.92f);
+                if (!span.text_color) cur.set_color(to_tc(style.code_span_text));
+                out_text.push_back(' ');
+                out_text += span.text;
+                out_text.push_back(' ');
+                out_attrs.add_span(start, out_text.size(), cur);
+                break;
+
+            case InlineType::Kbd:
+                cur.set_family(text::Family::monospace());
+                cur.set_font_size(font_size * 0.88f);
+                cur.set_weight(text::Weight::Bold);
+                cur.set_color(to_tc(style.kbd_text_color));
+                out_text.push_back(' ');
+                out_text += span.text;
+                out_text.push_back(' ');
+                out_attrs.add_span(start, out_text.size(), cur);
+                break;
+
+            case InlineType::Link:
+                if (!span.text_color) cur.set_color(to_tc(style.link_color));
+                cur.set_underline(true);
+                if (!span.children.empty()) flatten_inlines_rec(span.children, out_text, out_attrs, cur, style, font_size);
+                else emit_leaf(span.text);
+                break;
+
+            case InlineType::Strikethrough:
+                cur.set_strikethrough(true);
+                if (!span.children.empty()) flatten_inlines_rec(span.children, out_text, out_attrs, cur, style, font_size);
+                else emit_leaf(span.text);
+                break;
+
+            case InlineType::Underline:
+                cur.set_underline(true);
+                if (!span.children.empty()) flatten_inlines_rec(span.children, out_text, out_attrs, cur, style, font_size);
+                else emit_leaf(span.text);
+                break;
+
+            case InlineType::Highlight:
+                cur.set_color(to_tc(style.mark_text_color));
+                emit_leaf(span.text);
+                break;
+
+            case InlineType::Subscript:
+                cur.set_font_size(font_size * 0.78f);
+                cur.set_baseline_shift(font_size * 0.22f);
+                emit_leaf(span.text);
+                break;
+
+            case InlineType::Superscript:
+                cur.set_font_size(font_size * 0.78f);
+                cur.set_baseline_shift(-font_size * 0.28f);
+                emit_leaf(span.text);
+                break;
+
+            case InlineType::FootnoteRef:
+                cur.set_color(to_tc(style.footnote_link_color));
+                cur.set_font_size(font_size * 0.78f);
+                out_text.push_back('[');
+                out_text += span.text.empty() ? std::to_string(span.footnote_index) : span.text;
+                out_text.push_back(']');
+                out_attrs.add_span(start, out_text.size(), cur);
+                break;
+
+            case InlineType::LineBreak:
+                out_text.push_back('\n');
+                break;
+
+            case InlineType::SoftBreak:
+                out_text.push_back(' ');
+                break;
+
+            case InlineType::Math: {
+                cur.set_style(text::Style::Italic);
+                auto m = MathEngine::parse(span.text, false);
+                emit_leaf(m ? MathEngine::to_plain_text(*m) : span.text);
+                break;
+            }
+
+            case InlineType::Image:
+                out_text += "[Image: ";
+                out_text += span.text;
+                out_text.push_back(']');
+                out_attrs.add_span(start, out_text.size(), cur);
+                break;
+
+            case InlineType::HtmlInline:
+                break;
+        }
+    }
+}
+
 void flatten_inlines(
     const std::vector<InlineSpan>& inlines,
     std::string& out_text,
@@ -19,168 +170,9 @@ void flatten_inlines(
     const MarkdownStyle& style,
     float font_size
 ) {
-    for (const auto& span : inlines) {
-        size_t start = out_text.size();
-        text::Attrs attr;
-        attr.set_family(text::Family::sans_serif());
-
-        if (span.text_color) {
-            attr.set_color(text::TextColor::rgba(
-                static_cast<uint8_t>(span.text_color->red() * 255.0f),
-                static_cast<uint8_t>(span.text_color->green() * 255.0f),
-                static_cast<uint8_t>(span.text_color->blue() * 255.0f),
-                static_cast<uint8_t>(span.text_color->alpha() * 255.0f)
-            ));
-        }
-
-        switch (span.type) {
-            case InlineType::Text:
-            case InlineType::Emoji:
-                out_text += span.text;
-                break;
-
-            case InlineType::Bold:
-                attr.set_weight(text::Weight::Bold);
-                if (!span.children.empty()) {
-                    flatten_inlines(span.children, out_text, out_attrs, style, font_size);
-                } else {
-                    out_text += span.text;
-                }
-                out_attrs.add_span(start, out_text.size(), attr);
-                break;
-
-            case InlineType::Italic:
-                attr.set_style(text::Style::Italic);
-                if (!span.children.empty()) {
-                    flatten_inlines(span.children, out_text, out_attrs, style, font_size);
-                } else {
-                    out_text += span.text;
-                }
-                out_attrs.add_span(start, out_text.size(), attr);
-                break;
-
-            case InlineType::BoldItalic:
-                attr.set_weight(text::Weight::Bold);
-                attr.set_style(text::Style::Italic);
-                if (!span.children.empty()) {
-                    flatten_inlines(span.children, out_text, out_attrs, style, font_size);
-                } else {
-                    out_text += span.text;
-                }
-                out_attrs.add_span(start, out_text.size(), attr);
-                break;
-
-            case InlineType::CodeSpan:
-                attr.set_family(text::Family::monospace());
-                if (!span.text_color) {
-                    attr.set_color(text::TextColor::rgba(
-                        static_cast<uint8_t>(style.code_span_text.red() * 255.0f),
-                        static_cast<uint8_t>(style.code_span_text.green() * 255.0f),
-                        static_cast<uint8_t>(style.code_span_text.blue() * 255.0f),
-                        255
-                    ));
-                }
-                out_text += ' ';
-                out_text += span.text;
-                out_text += ' ';
-                out_attrs.add_span(start, out_text.size(), attr);
-                break;
-
-            case InlineType::Kbd:
-                attr.set_family(text::Family::monospace());
-                attr.set_color(text::TextColor::rgba(
-                    static_cast<uint8_t>(style.kbd_text_color.red() * 255.0f),
-                    static_cast<uint8_t>(style.kbd_text_color.green() * 255.0f),
-                    static_cast<uint8_t>(style.kbd_text_color.blue() * 255.0f),
-                    255
-                ));
-                out_text += " ";
-                out_text += span.text;
-                out_text += " ";
-                out_attrs.add_span(start, out_text.size(), attr);
-                break;
-
-            case InlineType::Link:
-                if (!span.text_color) {
-                    attr.set_color(text::TextColor::rgba(
-                        static_cast<uint8_t>(style.link_color.red() * 255.0f),
-                        static_cast<uint8_t>(style.link_color.green() * 255.0f),
-                        static_cast<uint8_t>(style.link_color.blue() * 255.0f),
-                        255
-                    ));
-                }
-                if (!span.children.empty()) {
-                    flatten_inlines(span.children, out_text, out_attrs, style, font_size);
-                } else {
-                    out_text += span.text;
-                }
-                out_attrs.add_span(start, out_text.size(), attr);
-                break;
-
-            case InlineType::Strikethrough:
-                if (!span.children.empty()) {
-                    flatten_inlines(span.children, out_text, out_attrs, style, font_size);
-                } else {
-                    out_text += span.text;
-                }
-                break;
-
-            case InlineType::Underline:
-                if (!span.children.empty()) {
-                    flatten_inlines(span.children, out_text, out_attrs, style, font_size);
-                } else {
-                    out_text += span.text;
-                }
-                break;
-
-            case InlineType::Highlight:
-                attr.set_color(text::TextColor::rgba(
-                    static_cast<uint8_t>(style.mark_text_color.red() * 255.0f),
-                    static_cast<uint8_t>(style.mark_text_color.green() * 255.0f),
-                    static_cast<uint8_t>(style.mark_text_color.blue() * 255.0f),
-                    255
-                ));
-                out_text += span.text;
-                out_attrs.add_span(start, out_text.size(), attr);
-                break;
-
-            case InlineType::Subscript:
-            case InlineType::Superscript:
-                out_text += span.text;
-                break;
-
-            case InlineType::FootnoteRef:
-                attr.set_color(text::TextColor::rgba(
-                    static_cast<uint8_t>(style.footnote_link_color.red() * 255.0f),
-                    static_cast<uint8_t>(style.footnote_link_color.green() * 255.0f),
-                    static_cast<uint8_t>(style.footnote_link_color.blue() * 255.0f),
-                    255
-                ));
-                out_text += "[";
-                out_text += span.text.empty() ? std::to_string(span.footnote_index) : span.text;
-                out_text += "]";
-                out_attrs.add_span(start, out_text.size(), attr);
-                break;
-
-            case InlineType::LineBreak:
-                out_text += '\n';
-                break;
-
-            case InlineType::Math: {
-                attr.set_style(text::Style::Italic);
-                auto m = MathEngine::parse(span.text, false);
-                out_text += m ? MathEngine::to_plain_text(*m) : span.text;
-                out_attrs.add_span(start, out_text.size(), attr);
-                break;
-            }
-
-            case InlineType::Image:
-                out_text += "[Image: ";
-                out_text += span.text;
-                out_text += "]";
-                break;
-        }
-    }
+    text::Attrs base;
+    base.set_family(text::Family::sans_serif());
+    flatten_inlines_rec(inlines, out_text, out_attrs, base, style, font_size);
 }
 
 float measure_inline_block(
@@ -226,14 +218,42 @@ MarkdownDocument MarkdownDocument::from_string(std::string_view markdown_text) {
     return MarkdownDocument(MarkdownParser::parse(markdown_text));
 }
 
+MarkdownDocument MarkdownDocument::from_string(
+    std::string_view markdown_text,
+    const MarkdownParseOptions& options,
+    const MarkdownExtensionRegistry* extensions
+) {
+    return MarkdownDocument(MarkdownParser::parse(markdown_text, options, extensions));
+}
+
 MarkdownDocument MarkdownDocument::from_file(std::string_view file_path) {
+    return from_file(file_path, MarkdownParseOptions{}, nullptr);
+}
+
+MarkdownDocument MarkdownDocument::from_file(
+    std::string_view file_path,
+    const MarkdownParseOptions& options,
+    const MarkdownExtensionRegistry* extensions
+) {
     std::ifstream file(std::string(file_path), std::ios::binary);
     if (!file.is_open()) {
         return MarkdownDocument();
     }
     std::ostringstream ss;
     ss << file.rdbuf();
-    return from_string(ss.str());
+    return from_string(ss.str(), options, extensions);
+}
+
+std::string MarkdownDocument::to_html(const MarkdownHtmlExportOptions& options) const {
+    return MarkdownExporter::to_html(*this, options);
+}
+
+std::string MarkdownDocument::to_plaintext() const {
+    return MarkdownExporter::to_plaintext(*this);
+}
+
+std::string MarkdownDocument::to_markdown(const MarkdownFormatOptions& options) const {
+    return MarkdownExporter::to_markdown(*this, options);
 }
 
 float MarkdownDocument::layout(
@@ -374,7 +394,8 @@ float MarkdownDocument::layout(
             case BlockType::List: {
                 block.layout_y = current_y;
                 float list_h = 0.0f;
-                float item_gap = block.is_loose_list ? style.paragraph_spacing : style.list_item_spacing;
+                bool is_loose = block.is_loose_list || !block.is_tight_list;
+                float item_gap = is_loose ? style.paragraph_spacing : style.list_item_spacing;
 
                 for (size_t idx = 0; idx < block.children.size(); ++idx) {
                     auto& item = block.children[idx];
@@ -386,10 +407,33 @@ float MarkdownDocument::layout(
                     item->layout_y = list_h;
                     item->layout_width = item_w;
 
-                    float ih = measure_inline_block(
-                        item->inlines, item_w, style.base_font_size,
-                        style.line_height_multiplier, style, font_system
-                    );
+                    float ih = 0.0f;
+                    if (!item->children.empty()) {
+                        for (size_t c = 0; c < item->children.size(); ++c) {
+                            auto& ch = item->children[c];
+                            if (!ch) continue;
+                            float ch_h = 0.0f;
+                            if (ch->type == BlockType::CodeBlock) {
+                                float lh = style.code_font_size * style.code_line_height_multiplier;
+                                ch_h = static_cast<float>(std::max<size_t>(1, ch->code_lines.size())) * lh + 2.0f * style.code_block_padding;
+                            } else {
+                                ch_h = measure_inline_block(
+                                    ch->inlines, item_w, style.base_font_size,
+                                    style.line_height_multiplier, style, font_system
+                                );
+                            }
+                            ch->layout_x = 0.0f;
+                            ch->layout_y = ih;
+                            ch->layout_width = item_w;
+                            ch->layout_height = ch_h;
+                            ih += ch_h + (c + 1 < item->children.size() ? style.paragraph_spacing * 0.5f : 0.0f);
+                        }
+                    } else {
+                        ih = measure_inline_block(
+                            item->inlines, item_w, style.base_font_size,
+                            style.line_height_multiplier, style, font_system
+                        );
+                    }
                     item->layout_height = std::max(ih, style.base_font_size * style.line_height_multiplier);
                     list_h += item->layout_height + (idx + 1 < block.children.size() ? item_gap : 0.0f);
                 }
@@ -498,6 +542,17 @@ float MarkdownDocument::layout(
                 }
                 block.layout_height = h;
                 current_y += h + style.paragraph_spacing;
+                break;
+            }
+
+            case BlockType::Custom: {
+                block.layout_y = current_y;
+                float h = measure_inline_block(
+                    block.inlines, max_width, style.base_font_size,
+                    style.line_height_multiplier, style, font_system
+                );
+                block.layout_height = h;
+                current_y += h + (h > 0.0f ? style.paragraph_spacing : 0.0f);
                 break;
             }
 

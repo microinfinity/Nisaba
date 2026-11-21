@@ -5,6 +5,8 @@
 #include <string>
 #include <functional>
 #include "nisaba/markdown/types.hpp"
+#include "nisaba/markdown/extension.hpp"
+#include "nisaba/markdown/exporter.hpp"
 #include "nisaba/markdown/style.hpp"
 #include "nisaba/text/font_system.hpp"
 #include "nisaba/text/glyph_cache.hpp"
@@ -20,8 +22,31 @@ public:
     /// Parses markdown from a UTF-8 string.
     static MarkdownDocument from_string(std::string_view markdown_text);
 
+    /// Parses markdown from a UTF-8 string with explicit parse options and optional extensions.
+    static MarkdownDocument from_string(
+        std::string_view markdown_text,
+        const MarkdownParseOptions& options,
+        const MarkdownExtensionRegistry* extensions = nullptr
+    );
+
     /// Parses markdown from a file on disk.
     static MarkdownDocument from_file(std::string_view file_path);
+
+    /// Parses markdown from a file on disk with explicit parse options and optional extensions.
+    static MarkdownDocument from_file(
+        std::string_view file_path,
+        const MarkdownParseOptions& options,
+        const MarkdownExtensionRegistry* extensions = nullptr
+    );
+
+    /// Exports this document AST to clean GFM-compatible HTML5.
+    [[nodiscard]] std::string to_html(const MarkdownHtmlExportOptions& options = {}) const;
+
+    /// Extracts clean unformatted UTF-8 plaintext from this document AST.
+    [[nodiscard]] std::string to_plaintext() const;
+
+    /// Serializes this document AST back to normalized CommonMark/GFM Markdown source.
+    [[nodiscard]] std::string to_markdown(const MarkdownFormatOptions& options = {}) const;
 
     [[nodiscard]] bool is_valid() const noexcept { return root_ != nullptr; }
     [[nodiscard]] const std::shared_ptr<BlockNode>& root() const noexcept { return root_; }

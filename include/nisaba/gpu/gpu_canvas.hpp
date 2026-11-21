@@ -35,6 +35,7 @@ public:
     explicit GpuCanvas(std::shared_ptr<GpuSurface> surface);
     ~GpuCanvas();
 
+    [[nodiscard]] CanvasKind canvas_kind() const noexcept override { return CanvasKind::Gpu; }
     [[nodiscard]] uint32_t width() const noexcept { return surface_ ? surface_->width() : 0; }
     [[nodiscard]] uint32_t height() const noexcept { return surface_ ? surface_->height() : 0; }
     [[nodiscard]] uint32_t canvas_width() const noexcept override { return surface_ ? surface_->width() : 0; }

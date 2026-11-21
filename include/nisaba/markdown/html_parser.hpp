@@ -44,6 +44,13 @@ public:
 
     /// Checks if a line begins a block-level HTML element (e.g. <details>, <div, <p, <!--).
     static bool is_block_html_line(std::string_view line);
+
+    /// Returns true if `tag_name` is disallowed by the GFM Tagfilter extension
+    /// (title, textarea, style, xmp, iframe, noembed, noframes, script, plaintext).
+    static bool is_tagfilter_disallowed(std::string_view tag_name);
+
+    /// Neutralizes GFM Tagfilter disallowed raw HTML tags by replacing their leading '<' with "&lt;".
+    [[nodiscard]] static std::string apply_tagfilter(std::string_view html);
 };
 
 } // namespace nisaba::markdown

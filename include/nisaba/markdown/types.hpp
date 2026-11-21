@@ -14,6 +14,34 @@ namespace nisaba::markdown {
 struct MathNode;      // Defined in math_engine.hpp
 struct DiagramModel;  // Defined in diagram_engine.hpp
 
+/// 1-based source range within the original Markdown input (0 means unspecified).
+struct SourcePos {
+    uint32_t start_line{0};
+    uint32_t start_col{0};
+    uint32_t end_line{0};
+    uint32_t end_col{0};
+
+    [[nodiscard]] bool is_valid() const noexcept { return start_line > 0; }
+    bool operator==(const SourcePos&) const noexcept = default;
+};
+
+/// Configuration flags controlling CommonMark 0.30 and GFM parsing behavior.
+struct MarkdownParseOptions {
+    bool hard_breaks{false};        // Treat soft line breaks as hard LineBreak
+    bool no_breaks{false};          // Render soft line breaks as spaces instead of SoftBreak
+    bool unsafe_html{false};        // Allow raw HTML blocks & raw inline HTML tags
+    bool validate_utf8{false};      // Replace invalid UTF-8 sequences & NUL bytes with U+FFFD
+    bool smart_punctuation{false};  // Convert --, ---, ..., and straight quotes to typographic forms
+    bool tagfilter{true};           // Neutralize GFM disallowed raw HTML tags (<script>, <iframe>, etc.)
+    bool autolink{true};            // GFM autolink extension (www., http(s)://, email)
+    bool strikethrough{true};       // GFM ~~strikethrough~~
+    bool tables{true};              // GFM pipe tables
+    bool task_lists{true};          // GFM task list checkboxes
+    bool math{true};                // LaTeX math ($...$ and $$...$$)
+    bool diagrams{true};            // Diagram code blocks
+    bool emojis{true};              // GitHub :shortcode: emoji expansion
+};
+
 /// Alignment of table columns in GitHub Flavored Markdown (GFM).
 enum class TableAlign : uint8_t {
     None,
@@ -39,17 +67,24 @@ enum class InlineType : uint8_t {
     Highlight,    // <mark> tag
     Emoji,        // GitHub Emoji (:smile:, :rocket:, etc.)
     FootnoteRef,  // Footnote reference [^1]
-    LineBreak,    // Hard line break (<br> or two trailing spaces)
-    Math          // Inline LaTeX math: $E = mc^2$ (source in `text`)
+    LineBreak,    // Hard line break (<br>, trailing backslash, or two trailing spaces)
+    SoftBreak,    // Soft line break (single newline inside paragraph)
+    Math,         // Inline LaTeX math: $E = mc^2$ (source in `text`)
+    HtmlInline,   // Raw inline HTML (when unsafe_html is enabled)
+    Custom        // Custom syntax extension inline node (`custom_kind` identifies type)
 };
 
 /// Inline formatting span within a paragraph, heading, or table cell.
 struct InlineSpan {
     InlineType type{InlineType::Text};
     std::string text{};
-    std::string target{}; // URL or image source path
-    std::string title{};  // Optional hover title
+    std::string target{};      // URL or image source path
+    std::string title{};       // Optional hover title
+    std::string custom_kind{}; // Custom extension discriminator for InlineType::Custom
     std::vector<InlineSpan> children{};
+
+    // Source position in original Markdown input
+    SourcePos sourcepos{};
 
     // Extended styling overrides (e.g. from <span style="color: ..."> or <mark>)
     std::optional<Color> text_color{std::nullopt};
@@ -117,8 +152,19 @@ struct InlineSpan {
     static InlineSpan make_linebreak() {
         return InlineSpan(InlineType::LineBreak, "\n");
     }
+    static InlineSpan make_softbreak() {
+        return InlineSpan(InlineType::SoftBreak, "\n");
+    }
     static InlineSpan make_math(std::string latex) {
         return InlineSpan(InlineType::Math, std::move(latex));
+    }
+    static InlineSpan make_html_inline(std::string raw_html) {
+        return InlineSpan(InlineType::HtmlInline, std::move(raw_html));
+    }
+    static InlineSpan make_custom(std::string kind, std::string text, std::string target = {}) {
+        InlineSpan s(InlineType::Custom, std::move(text), std::move(target));
+        s.custom_kind = std::move(kind);
+        return s;
     }
 };
 
@@ -148,7 +194,8 @@ enum class BlockType : uint8_t {
     HtmlBlock,   // Block-level HTML container (e.g. <div align="...">)
     FootnoteDef, // Footnote definition block: [^1]: Content
     MathBlock,   // Display LaTeX math: $$ ... $$ or ```math
-    Diagram      // Mermaid diagram / chart: ```mermaid
+    Diagram,     // Diagram / chart: ```mermaid
+    Custom       // Custom syntax extension block (`custom_kind` identifies type)
 };
 
 /// Single cell in a markdown table.
@@ -177,6 +224,17 @@ struct BlockNode {
     bool is_task_item{false};             // For ListItem [ ] or [x]
     bool is_task_checked{false};          // For ListItem
     bool is_loose_list{false};            // For List (loose vs tight spacing)
+    bool is_tight_list{true};             // For List (inverse of is_loose_list)
+    bool is_indented_code{false};         // True if CodeBlock came from 4-space indentation
+    bool is_setext_heading{false};        // True if Heading came from Setext underline
+    char list_marker{'-'};                // Original bullet/delimiter char ('-', '*', '+', '.', ')')
+
+    // Source position in original Markdown input
+    SourcePos sourcepos{};
+
+    // Raw HTML or custom block payload
+    std::string raw_html{};
+    std::string custom_kind{};
 
     // GitHub Alert Callout fields
     AlertType alert_type{AlertType::None};

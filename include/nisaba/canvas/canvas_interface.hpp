@@ -58,12 +58,21 @@ namespace detail {
 
 } // namespace detail
 
+/// Runtime-free canvas backend discriminator for RTTI-free dispatch.
+enum class CanvasKind : uint8_t {
+    Unknown = 0,
+    Software,
+    Gpu,
+    Pdf
+};
+
 /// @class ICanvas
 /// @brief Abstract 2D vector drawing interface shared by software (Canvas) and hardware (GpuCanvas).
 class ICanvas {
 public:
     virtual ~ICanvas() = default;
 
+    [[nodiscard]] virtual CanvasKind canvas_kind() const noexcept { return CanvasKind::Unknown; }
     [[nodiscard]] virtual uint32_t canvas_width() const noexcept { return 0; }
     [[nodiscard]] virtual uint32_t canvas_height() const noexcept { return 0; }
 

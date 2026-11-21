@@ -33,6 +33,9 @@ public:
     ~PdfCanvas() override = default;
 
     // --- ICanvas Interface ---
+    [[nodiscard]] CanvasKind canvas_kind() const noexcept override { return CanvasKind::Pdf; }
+    [[nodiscard]] uint32_t canvas_width() const noexcept override { return static_cast<uint32_t>(width_); }
+    [[nodiscard]] uint32_t canvas_height() const noexcept override { return static_cast<uint32_t>(height_); }
     void save() override;
     void restore() override;
     void translate(float dx, float dy) override;

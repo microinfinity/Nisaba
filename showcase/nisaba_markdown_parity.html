@@ -1,0 +1,79 @@
+<h1 data-sourcepos="1:1-2:45">Nisaba Markdown Engine — Complete Spec Parity</h1>
+<div class="release-banner">[RELEASE] Phase 1-4 CommonMark 0.30 + GFM Verified</div>
+<p data-sourcepos="6:1-6:146">Smart punctuation &amp; HTML5 entities: “Nisaba” — it’s fast – really… © 2026 € ♥ 😀 and literal *escaped* punctuation.</p>
+<h2 data-sourcepos="8:1-9:35">Delimiter Stack &amp; Inline Edge Cases</h2>
+<ul data-sourcepos="11:1-17:62">
+<li data-sourcepos="11:1-11:61">Intraword underscore preserved: foo_bar_baz and my_var_name</li>
+<li data-sourcepos="12:1-12:42">Intraword asterisk emphasis: foo<em>bar</em>baz</li>
+<li data-sourcepos="13:1-13:90">Nested emphasis: <strong>bold <em>and italic</em> bold</strong> plus <em><strong>bold italic</strong></em> and <del>strikethrough</del></li>
+<li data-sourcepos="14:1-14:93">Multi-backtick code span: <code>code with ` inner backtick</code> and <kbd>Ctrl</kbd> + <kbd>S</kbd></li>
+<li data-sourcepos="15:1-15:98">Nested brackets &amp; reference links: <a href="https://nisaba.dev/markdown%20spec" title="Multi-line
+reference title">Outer [Inner] <strong>Link</strong></a>, <a href="https://nisaba.dev/collapsed">Collapsed</a>, <a href="https://nisaba.dev/shortcut">Shortcut</a></li>
+<li data-sourcepos="16:1-16:112">Strict GFM autolinks: (<a href="https://en.wikipedia.org/wiki/C_(programming_language)">https://en.wikipedia.org/wiki/C_(programming_language)</a>), <a href="http://www.nisaba.dev">www.nisaba.dev</a>, <a href="mailto:dev@nisaba.dev">dev@nisaba.dev</a></li>
+<li data-sourcepos="17:1-17:62">Custom extension hook: reviewed by <a class="mention" href="/mention/architect">@architect</a> for issue <a class="issue" href="/issue/108">#108</a></li>
+</ul>
+<div class="markdown-alert markdown-alert-note" data-sourcepos="19:1-21:65">
+<p class="markdown-alert-title">Note</p>
+<p data-sourcepos="20:3-21:67">Lazy continuation &amp; alerts:
+this second line lazily continues the alert paragraph seamlessly.</p>
+</div>
+<blockquote data-sourcepos="23:1-24:51">
+<p data-sourcepos="23:3-24:53">Classic BlockQuote line 1
+lazy continuation line 2 inside the same paragraph.</p>
+</blockquote>
+<h3 data-sourcepos="26:1-26:46">Loose List vs Tight List &amp; Task Checkboxes</h3>
+<ul data-sourcepos="28:1-32:59">
+<li data-sourcepos="28:1-28:52">
+<p><input type="checkbox" checked="" disabled="" /> Streaming <code>feed()</code> + <code>snapshot()</code> + <code>finish()</code></p>
+</li>
+<li data-sourcepos="30:1-30:61">
+<p><input type="checkbox" checked="" disabled="" /> Exact <code>SourcePos</code> on every <code>BlockNode</code> and <code>InlineSpan</code></p>
+</li>
+<li data-sourcepos="32:1-32:59">
+<p><input type="checkbox" checked="" disabled="" /> GFM <code>Tagfilter</code> sanitization &amp; multi-format exporters</p>
+</li>
+</ul>
+<h3 data-sourcepos="34:1-34:56">Indented Code Block &amp; Syntax-Highlighted Fenced Code</h3>
+<pre data-sourcepos="36:1-38:23"><code>// 4-space Indented Code Block (CommonMark 4.4)
+auto parser = MarkdownParser(opts);
+parser.feed(chunk);
+</code></pre>
+<pre data-sourcepos="40:1-44:3"><code class="language-cpp">// Fenced C++20 Code Block
+MarkdownParseOptions opts{.smart_punctuation = true, .validate_utf8 = true};
+auto doc = MarkdownDocument::from_string(source, opts);
+</code></pre>
+<h3 data-sourcepos="46:1-46:21">Aligned GFM Table</h3>
+<table data-sourcepos="48:1-52:61">
+<thead>
+<tr>
+<th align="left">Capability</th>
+<th align="center">Alignment</th>
+<th align="right">Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td align="left">Streaming <code>feed()</code></td>
+<td align="center">Centered</td>
+<td align="right"><strong>Verified</strong></td>
+</tr>
+<tr>
+<td align="left">HTML5 Entities (2125)</td>
+<td align="center">— ©</td>
+<td align="right"><strong>Verified</strong></td>
+</tr>
+<tr>
+<td align="left">Exporters (<code>HTML</code>/<code>MD</code>/<code>TXT</code>)</td>
+<td align="center">Round-Trip</td>
+<td align="right"><strong>Verified</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 data-sourcepos="54:1-54:33">Display Math &amp; Diagram Blocks</h3>
+<div class="math math-display">E = \frac{1}{2}mv^2 + \sum_{i=1}^{n} \alpha_i</div>
+<pre class="diagram"><code class="language-mermaid">flowchart LR
+  Stream[feed chunk] --&gt; AST[BlockNode + SourcePos]
+  AST --&gt; Canvas[CPU / GPU / PDF]
+  AST --&gt; Export[HTML / Plain / MD]
+</code></pre>
+&lt;script>alert('must-be-filtered')&lt;/script>

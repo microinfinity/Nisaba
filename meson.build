@@ -218,10 +218,12 @@ endif
 
 if get_option('enable_markdown')
   nisaba_sources += files(
+    'src/markdown/entities.cpp',
     'src/markdown/html_parser.cpp',
     'src/markdown/syntax_highlighter.cpp',
     'src/markdown/parser.cpp',
     'src/markdown/document.cpp',
+    'src/markdown/exporter.cpp',
     'src/markdown/style.cpp',
     'src/markdown/renderer.cpp',
     'src/markdown/math_engine.cpp',

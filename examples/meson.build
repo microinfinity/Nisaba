@@ -245,6 +245,11 @@ if get_option('enable_markdown')
     cpp_args : showcase_md_args,
     dependencies : showcase_md_deps
   )
+
+  showcase_markdown_parity_exe = executable('showcase_markdown_parity',
+    'showcase_markdown_parity.cpp',
+    dependencies : [nisaba_dep, extra_deps]
+  )
 endif
 
 if get_option('enable_pdf')
