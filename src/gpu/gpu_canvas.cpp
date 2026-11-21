@@ -425,7 +425,9 @@ void GpuCanvas::push_layer_internal(
     std::optional<nisaba::Rect> bounds,
     const nisaba::Paint& paint,
     bool with_backdrop,
-    float blur_sigma
+    float blur_sigma,
+    std::optional<effects::MaskFilter> mask_filter,
+    nisaba::Color mask_tint
 ) {
     if (!context_ || !surface_) return;
     ensure_frame();
@@ -464,17 +466,39 @@ void GpuCanvas::push_layer_internal(
         ? std::clamp(paint.shader.solid_color().alpha(), 0.0f, 1.0f)
         : 1.0f;
     desc.compOp = CompositeOperationState::fromBlendMode(paint.blend_mode);
-    apply_color_effect_to(paint, desc);
+    desc.layerTransform = Transform2D(current_transform_);
+    if (mask_filter.has_value() && mask_filter->is_blur()) {
+        desc.maskFilter = mask_filter;
+        desc.maskTintColor = Color(mask_tint);
+    }
+    if (paint.has_custom_blender()) {
+        desc.blender = paint.blender;
+    }
+    if (auto eff_cf = paint.effective_color_effect()) {
+        if (eff_cf->is_extended()) {
+            desc.extColorEffect = *eff_cf;
+        } else {
+            apply_color_effect_to(paint, desc);
+        }
+    }
     if (paint.has_image_filter()) {
         const auto& imgf = *paint.image_filter;
-        desc.postBlurSigmaX = imgf.sigma_x;
-        desc.postBlurSigmaY = imgf.sigma_y;
-        if (imgf.kind == effects::ImageFilterKind::DropShadow) {
-            desc.isDropShadow = true;
-            desc.shadowDx = imgf.dx;
-            desc.shadowDy = imgf.dy;
-            desc.shadowColor = Color(imgf.color);
-            desc.shadowOnly = imgf.shadow_only;
+        desc.imageFilter = imgf;
+        const bool simple_identity_xform =
+            std::abs(current_transform_.sx - 1.0f) < 1e-4f &&
+            std::abs(current_transform_.sy - 1.0f) < 1e-4f &&
+            std::abs(current_transform_.kx) < 1e-4f &&
+            std::abs(current_transform_.ky) < 1e-4f;
+        if (imgf.is_simple_leaf() && simple_identity_xform) {
+            desc.postBlurSigmaX = imgf.sigma_x();
+            desc.postBlurSigmaY = imgf.sigma_y();
+            if (imgf.kind() == effects::ImageFilterKind::DropShadow) {
+                desc.isDropShadow = true;
+                desc.shadowDx = imgf.dx();
+                desc.shadowDy = imgf.dy();
+                desc.shadowColor = Color(imgf.color());
+                desc.shadowOnly = imgf.shadow_only();
+            }
         }
     }
 
@@ -782,6 +806,26 @@ Paint GpuCanvas::build_gpu_paint(const nisaba::Paint& paint) {
         const auto& cg = paint.shader.conical_gradient();
         populate_conical_params(cg.start_center(), cg.start_radius(), cg.end_center(), cg.end_radius(), gp);
         populate_gradient_stops_and_xform(cg, gp);
+    } else if (stype == nisaba::Shader::Type::PerlinNoise) {
+        const auto& pn = paint.shader.perlin_noise();
+        gp.gradientKind = (pn.noise_type() == nisaba::PerlinNoiseType::Turbulence)
+            ? GradientKind::PerlinTurbulence
+            : GradientKind::PerlinFractal;
+        gp.xform = Transform2D(pn.transform());
+        gp.gradUnitXform = Transform2D::identity();
+        gp.gradStopCount = pn.num_octaves();
+        gp.gradParams0 = {pn.base_freq_x(), pn.base_freq_y(), pn.seed(), std::clamp(pn.opacity(), 0.0f, 1.0f)};
+        const bool has_tile = pn.tile_size().has_value() && pn.tile_size()->width() > 0 && pn.tile_size()->height() > 0;
+        const float tw = has_tile ? static_cast<float>(pn.tile_size()->width()) : 0.0f;
+        const float th = has_tile ? static_cast<float>(pn.tile_size()->height()) : 0.0f;
+        gp.gradParams1 = {
+            has_tile ? std::max(1.0f, std::round(tw * pn.base_freq_x())) : 0.0f,
+            has_tile ? std::max(1.0f, std::round(th * pn.base_freq_y())) : 0.0f,
+            has_tile ? 1.0f : 0.0f,
+            0.0f
+        };
+        gp.innerColor = Color::rgbaf(1.0f, 1.0f, 1.0f, 1.0f);
+        gp.outerColor = gp.innerColor;
     } else if (stype == nisaba::Shader::Type::Pattern) {
         const auto& pat = paint.shader.pattern();
         const auto& px = pat.pixmap();
@@ -878,35 +922,170 @@ void GpuCanvas::draw_with_image_filter(
     float extra_margin,
     DrawFn&& draw_fn
 ) {
-    if (!paint.image_filter.has_value()) return;
-    const auto& imgf = *paint.image_filter;
-    std::optional<nisaba::Rect> padded_bounds = std::nullopt;
-    if (local_bounds.has_value()) {
-        const float pad_x = std::ceil(imgf.sigma_x * 3.0f) + 2.0f + std::abs(imgf.dx) + extra_margin;
-        const float pad_y = std::ceil(imgf.sigma_y * 3.0f) + 2.0f + std::abs(imgf.dy) + extra_margin;
-        padded_bounds = nisaba::Rect::from_xywh(
-            local_bounds->x() - pad_x,
-            local_bounds->y() - pad_y,
-            local_bounds->width() + 2.0f * pad_x,
-            local_bounds->height() + 2.0f * pad_y
-        );
+    if (paint.has_custom_blender()) {
+        const float mask_pad = (paint.has_mask_filter() && paint.mask_filter->is_blur())
+            ? (std::ceil(paint.mask_filter->sigma * 3.0f) + 2.0f) : 0.0f;
+        std::optional<nisaba::Rect> padded_bounds = std::nullopt;
+        if (local_bounds.has_value()) {
+            nisaba::Rect base = paint.has_image_filter() ? paint.image_filter->map_layer_bounds(*local_bounds) : *local_bounds;
+            const float tot = extra_margin + mask_pad + 1.0f;
+            padded_bounds = nisaba::Rect::from_xywh(
+                base.x() - tot, base.y() - tot, base.width() + 2.0f * tot, base.height() + 2.0f * tot);
+        }
+        nisaba::Paint layer_paint(nisaba::Color::WHITE);
+        layer_paint.blender = paint.blender;
+        nisaba::Paint inner_paint = paint;
+        inner_paint.blender = std::nullopt;
+        inner_paint.blend_mode = BlendMode::SourceOver;
+        push_layer_internal(padded_bounds, layer_paint, false, 0.0f);
+        draw_fn(inner_paint);
+        restore();
+        return;
     }
-    nisaba::Paint layer_paint(nisaba::Color::WHITE);
-    layer_paint.blend_mode = paint.blend_mode;
-    layer_paint.image_filter = imgf;
 
-    nisaba::Paint inner_paint = paint;
-    inner_paint.blend_mode = BlendMode::SourceOver;
-    inner_paint.image_filter = std::nullopt;
+    if (paint.has_image_filter()) {
+        const auto& imgf = *paint.image_filter;
+        const float mask_pad = (paint.has_mask_filter() && paint.mask_filter->is_blur())
+            ? (std::ceil(paint.mask_filter->sigma * 3.0f) + 2.0f) : 0.0f;
+        std::optional<nisaba::Rect> padded_bounds = std::nullopt;
+        if (local_bounds.has_value()) {
+            const nisaba::Rect mapped = imgf.map_layer_bounds(*local_bounds);
+            const float tot = extra_margin + mask_pad;
+            padded_bounds = nisaba::Rect::from_xywh(
+                mapped.x() - tot,
+                mapped.y() - tot,
+                mapped.width() + 2.0f * tot,
+                mapped.height() + 2.0f * tot
+            );
+        }
+        nisaba::Paint layer_paint(nisaba::Color::WHITE);
+        layer_paint.blend_mode = paint.blend_mode;
+        layer_paint.image_filter = imgf;
 
-    push_layer_internal(padded_bounds, layer_paint, false, 0.0f);
-    draw_fn(inner_paint);
-    restore();
+        nisaba::Paint inner_paint = paint;
+        inner_paint.blend_mode = BlendMode::SourceOver;
+        inner_paint.image_filter = std::nullopt;
+
+        push_layer_internal(padded_bounds, layer_paint, false, 0.0f);
+        draw_fn(inner_paint);
+        restore();
+        return;
+    }
+
+    if (paint.has_extended_color_filter() && !paint.is_solid_color()) {
+        std::optional<nisaba::Rect> padded_bounds = std::nullopt;
+        if (local_bounds.has_value()) {
+            const float tot = extra_margin + 1.0f;
+            padded_bounds = nisaba::Rect::from_xywh(
+                local_bounds->x() - tot, local_bounds->y() - tot,
+                local_bounds->width() + 2.0f * tot, local_bounds->height() + 2.0f * tot);
+        }
+        nisaba::Paint layer_paint(nisaba::Color::WHITE);
+        layer_paint.blend_mode = paint.blend_mode;
+        layer_paint.color_effect = paint.color_effect;
+
+        nisaba::Paint inner_paint = paint;
+        inner_paint.blend_mode = BlendMode::SourceOver;
+        inner_paint.clear_color_filter();
+
+        push_layer_internal(padded_bounds, layer_paint, false, 0.0f);
+        draw_fn(inner_paint);
+        restore();
+        return;
+    }
+
+    if (paint.has_mask_filter()) {
+        const auto& mf = *paint.mask_filter;
+        if (mf.is_shader()) {
+            std::optional<nisaba::Rect> padded_bounds = std::nullopt;
+            if (local_bounds.has_value()) {
+                const float tot = extra_margin + 1.0f;
+                padded_bounds = nisaba::Rect::from_xywh(
+                    local_bounds->x() - tot, local_bounds->y() - tot,
+                    local_bounds->width() + 2.0f * tot, local_bounds->height() + 2.0f * tot);
+            }
+            nisaba::Paint outer_paint(nisaba::Color::WHITE);
+            outer_paint.blend_mode = paint.blend_mode;
+            push_layer_internal(padded_bounds, outer_paint, false, 0.0f);
+
+            nisaba::Paint inner_paint = paint;
+            inner_paint.blend_mode = BlendMode::SourceOver;
+            inner_paint.clear_mask_filter();
+            draw_fn(inner_paint);
+
+            nisaba::Paint mask_p(*mf.mask_shader);
+            mask_p.blend_mode = BlendMode::DestinationIn;
+            nisaba::Rect cover = padded_bounds.value_or(
+                nisaba::Rect::from_xywh(0.0f, 0.0f, static_cast<float>(width()), static_cast<float>(height())).value());
+            fill_rect(cover, mask_p);
+            restore();
+            return;
+        }
+        float pad = std::ceil(mf.sigma * 3.0f) + 2.0f + extra_margin;
+        if (!mf.respect_ctm) {
+            const float min_scale = std::min(
+                std::hypot(current_transform_.sx, current_transform_.ky),
+                std::hypot(current_transform_.kx, current_transform_.sy)
+            );
+            if (min_scale > 1e-4f) {
+                pad = std::ceil((mf.sigma / min_scale) * 3.0f) + 2.0f + extra_margin;
+            }
+        }
+        std::optional<nisaba::Rect> padded_bounds = std::nullopt;
+        if (local_bounds.has_value()) {
+            padded_bounds = nisaba::Rect::from_xywh(
+                local_bounds->x() - pad,
+                local_bounds->y() - pad,
+                local_bounds->width() + 2.0f * pad,
+                local_bounds->height() + 2.0f * pad
+            );
+        }
+
+        nisaba::Paint mask_draw_paint = paint;
+        mask_draw_paint.set_color(nisaba::Color::WHITE);
+        mask_draw_paint.clear_color_filter();
+        mask_draw_paint.clear_image_filter();
+        mask_draw_paint.clear_mask_filter();
+        mask_draw_paint.blend_mode = BlendMode::SourceOver;
+
+        if (paint.is_solid_color()) {
+            nisaba::Color tint = paint.shader.solid_color();
+            if (auto cf = paint.effective_color_effect()) {
+                tint = cf->transform(tint);
+            }
+            nisaba::Paint layer_paint(nisaba::Color::WHITE);
+            layer_paint.blend_mode = paint.blend_mode;
+            push_layer_internal(padded_bounds, layer_paint, false, 0.0f, mf, tint);
+            draw_fn(mask_draw_paint);
+            restore();
+        } else {
+            nisaba::Paint outer_paint(nisaba::Color::WHITE);
+            outer_paint.blend_mode = paint.blend_mode;
+            push_layer_internal(padded_bounds, outer_paint, false, 0.0f);
+
+            push_layer_internal(padded_bounds, nisaba::Paint(nisaba::Color::WHITE), false, 0.0f, mf, nisaba::Color::WHITE);
+            draw_fn(mask_draw_paint);
+            restore();
+
+            nisaba::Paint shade_paint = paint;
+            shade_paint.clear_image_filter();
+            shade_paint.clear_mask_filter();
+            shade_paint.blend_mode = BlendMode::SourceIn;
+            nisaba::Rect cover = padded_bounds.value_or(
+                nisaba::Rect::from_xywh(0.0f, 0.0f, static_cast<float>(width()), static_cast<float>(height())).value());
+            fill_rect(cover, shade_paint);
+            restore();
+        }
+    }
 }
 
 void GpuCanvas::fill_rect(const nisaba::Rect& rect, const nisaba::Paint& paint) {
     if (!context_) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_path_effect()) {
+        fill_path(PathBuilder::from_rect(rect), paint, nisaba::FillRule::Winding);
+        return;
+    }
+    if (paint.has_layer_filter()) {
         draw_with_image_filter(rect, paint, 0.0f, [&](const nisaba::Paint& inner) {
             fill_rect(rect, inner);
         });
@@ -922,7 +1101,11 @@ void GpuCanvas::fill_rect(const nisaba::Rect& rect, const nisaba::Paint& paint) 
 
 void GpuCanvas::stroke_rect(const nisaba::Rect& rect, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_path_effect()) {
+        stroke_path(PathBuilder::from_rect(rect), paint, stroke);
+        return;
+    }
+    if (paint.has_layer_filter()) {
         draw_with_image_filter(rect, paint, stroke_filter_margin(stroke), [&](const nisaba::Paint& inner) {
             stroke_rect(rect, inner, stroke);
         });
@@ -942,7 +1125,7 @@ void GpuCanvas::stroke_rect(const nisaba::Rect& rect, const nisaba::Paint& paint
 
 void GpuCanvas::fill_round_rect(const nisaba::Rect& rect, float rx, float ry, const nisaba::Paint& paint) {
     if (!context_) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_layer_filter()) {
         draw_with_image_filter(rect, paint, 0.0f, [&](const nisaba::Paint& inner) {
             fill_round_rect(rect, rx, ry, inner);
         });
@@ -964,7 +1147,7 @@ void GpuCanvas::fill_round_rect(const nisaba::Rect& rect, float rx, float ry, co
 
 void GpuCanvas::stroke_round_rect(const nisaba::Rect& rect, float rx, float ry, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_layer_filter()) {
         draw_with_image_filter(rect, paint, stroke_filter_margin(stroke), [&](const nisaba::Paint& inner) {
             stroke_round_rect(rect, rx, ry, inner, stroke);
         });
@@ -986,7 +1169,7 @@ void GpuCanvas::stroke_round_rect(const nisaba::Rect& rect, float rx, float ry, 
 
 void GpuCanvas::fill_rrect(const nisaba::Rect& rect, const nisaba::BorderRadius& radii, const nisaba::Paint& paint) {
     if (!context_) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_layer_filter()) {
         draw_with_image_filter(rect, paint, 0.0f, [&](const nisaba::Paint& inner) {
             fill_rrect(rect, radii, inner);
         });
@@ -1005,7 +1188,7 @@ void GpuCanvas::fill_rrect(const nisaba::Rect& rect, const nisaba::BorderRadius&
 void GpuCanvas::stroke_rrect(const nisaba::Rect& rect, const nisaba::BorderRadius& radii, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_) return;
     BorderRadius cr = radii.constrained_for_size(rect.width(), rect.height());
-    if (cr.is_uniform() && !paint.has_image_filter() && !stroke.dash.has_value()) {
+    if (cr.is_uniform() && !paint.has_layer_filter() && !stroke.dash.has_value()) {
         stroke_round_rect(rect, cr.top_left, cr.top_left, paint, stroke);
         return;
     }
@@ -1037,7 +1220,7 @@ void GpuCanvas::clip_rrect(const nisaba::Rect& rect, const nisaba::BorderRadius&
 
 void GpuCanvas::fill_circle(float cx, float cy, float radius, const nisaba::Paint& paint) {
     if (!context_) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_layer_filter()) {
         auto lb = nisaba::Rect::from_xywh(cx - radius, cy - radius, radius * 2.0f, radius * 2.0f);
         draw_with_image_filter(lb, paint, 0.0f, [&](const nisaba::Paint& inner) {
             fill_circle(cx, cy, radius, inner);
@@ -1054,7 +1237,7 @@ void GpuCanvas::fill_circle(float cx, float cy, float radius, const nisaba::Pain
 
 void GpuCanvas::stroke_circle(float cx, float cy, float radius, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_layer_filter()) {
         auto lb = nisaba::Rect::from_xywh(cx - radius, cy - radius, radius * 2.0f, radius * 2.0f);
         draw_with_image_filter(lb, paint, stroke_filter_margin(stroke), [&](const nisaba::Paint& inner) {
             stroke_circle(cx, cy, radius, inner, stroke);
@@ -1081,7 +1264,7 @@ void GpuCanvas::stroke_line(nisaba::Point p0, nisaba::Point p1, const nisaba::Pa
 
 void GpuCanvas::stroke_line(float x0, float y0, float x1, float y1, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_layer_filter()) {
         const float min_x = std::min(x0, x1);
         const float min_y = std::min(y0, y1);
         const float max_x = std::max(x0, x1);
@@ -1112,7 +1295,7 @@ void GpuCanvas::stroke_line(float x0, float y0, float x1, float y1, const nisaba
 
 void GpuCanvas::fill_oval(const nisaba::Rect& oval, const nisaba::Paint& paint) {
     if (!context_ || oval.is_empty()) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_layer_filter()) {
         draw_with_image_filter(oval, paint, 0.0f, [&](const nisaba::Paint& inner) {
             fill_oval(oval, inner);
         });
@@ -1132,7 +1315,7 @@ void GpuCanvas::fill_oval(const nisaba::Rect& oval, const nisaba::Paint& paint) 
 
 void GpuCanvas::stroke_oval(const nisaba::Rect& oval, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_ || oval.is_empty()) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_layer_filter()) {
         draw_with_image_filter(oval, paint, stroke_filter_margin(stroke), [&](const nisaba::Paint& inner) {
             stroke_oval(oval, inner, stroke);
         });
@@ -1179,7 +1362,7 @@ void GpuCanvas::fill_drrect(const nisaba::RRect& outer, const nisaba::RRect& inn
 
     if (inner_box_inside) {
         if (context_->renderer() && context_->renderer()->supportsDRRectShader() &&
-            paint.is_solid_color() && !paint.has_image_filter() && !paint.has_custom_shader()) {
+            paint.is_solid_color() && !paint.has_layer_filter() && !paint.has_custom_shader()) {
             const auto comp = CompositeOperationState::fromBlendMode(paint.blend_mode);
             nisaba::Color col = paint.shader.solid_color();
             bool color_ok = !paint.has_color_filter();
@@ -1280,7 +1463,22 @@ void GpuCanvas::draw_points(
 
 void GpuCanvas::fill_path(const nisaba::Path& path, const nisaba::Paint& paint, nisaba::FillRule fill_rule) {
     if (!context_) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_path_effect()) {
+        const auto& pe = *paint.path_effect;
+        nisaba::Path mod = pe.apply(path);
+        nisaba::Paint p2 = paint;
+        p2.clear_path_effect();
+        if (pe.needs_source_clip()) {
+            save();
+            clip_path(path, fill_rule);
+            fill_path(mod, p2, fill_rule);
+            restore();
+        } else {
+            fill_path(mod, p2, fill_rule);
+        }
+        return;
+    }
+    if (paint.has_layer_filter()) {
         draw_with_image_filter(path.bounds(), paint, 0.0f, [&](const nisaba::Paint& inner) {
             fill_path(path, inner, fill_rule);
         });
@@ -1296,7 +1494,26 @@ void GpuCanvas::fill_path(const nisaba::Path& path, const nisaba::Paint& paint, 
 
 void GpuCanvas::stroke_path(const nisaba::Path& path, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_) return;
-    if (paint.has_image_filter()) {
+    if (paint.has_path_effect()) {
+        const auto& pe = *paint.path_effect;
+        nisaba::Path mod = pe.apply(path);
+        nisaba::Paint p2 = paint;
+        p2.clear_path_effect();
+        if (pe.produces_fill_geometry()) {
+            if (pe.needs_source_clip()) {
+                save();
+                clip_path(path, nisaba::FillRule::Winding);
+                fill_path(mod, p2, nisaba::FillRule::Winding);
+                restore();
+            } else {
+                fill_path(mod, p2, nisaba::FillRule::Winding);
+            }
+        } else {
+            stroke_path(mod, p2, stroke);
+        }
+        return;
+    }
+    if (paint.has_layer_filter()) {
         draw_with_image_filter(path.bounds(), paint, stroke_filter_margin(stroke), [&](const nisaba::Paint& inner) {
             stroke_path(path, inner, stroke);
         });

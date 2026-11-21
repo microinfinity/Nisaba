@@ -237,7 +237,14 @@ private:
     [[nodiscard]] Paint build_gpu_paint(const nisaba::Paint& paint);
     void apply_fill_paint(const nisaba::Paint& paint);
     void apply_stroke(const nisaba::Stroke& stroke, const nisaba::Paint& paint);
-    void push_layer_internal(std::optional<nisaba::Rect> bounds, const nisaba::Paint& paint, bool with_backdrop, float blur_sigma);
+    void push_layer_internal(
+        std::optional<nisaba::Rect> bounds,
+        const nisaba::Paint& paint,
+        bool with_backdrop,
+        float blur_sigma,
+        std::optional<effects::MaskFilter> mask_filter = std::nullopt,
+        nisaba::Color mask_tint = nisaba::Color::WHITE
+    );
     template <typename DrawFn>
     void draw_with_image_filter(
         const std::optional<nisaba::Rect>& local_bounds,

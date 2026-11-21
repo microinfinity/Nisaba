@@ -58,6 +58,8 @@ public:
                     const Scissor& scissor, const float* bounds) override;
     void restoreClip(int targetDepth) override;
     void resetClip() override;
+    void pushLayer(const LayerDesc& desc, const Scissor& parentScissor, int parentClipDepth) override;
+    void popLayer(const LayerDesc& desc, const Scissor& parentScissor, int parentClipDepth) override;
 
     void setTargetSurface(VulkanSurface* surface);
     void setCommandBuffer(VkCommandBuffer cmd);

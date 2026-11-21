@@ -9,6 +9,9 @@
 #include "nisaba/effects/color_matrix.hpp"
 #include "nisaba/effects/color_filter.hpp"
 #include "nisaba/effects/image_filter.hpp"
+#include "nisaba/effects/mask_filter.hpp"
+#include "nisaba/effects/path_effect.hpp"
+#include "nisaba/effects/blender.hpp"
 
 namespace nisaba {
 
@@ -47,6 +50,9 @@ public:
     std::optional<effects::ColorMatrix> color_filter{std::nullopt};
     std::optional<effects::ColorEffect> color_effect{std::nullopt};
     std::optional<effects::ImageFilter> image_filter{std::nullopt};
+    std::optional<effects::MaskFilter> mask_filter{std::nullopt};
+    std::optional<effects::PathEffect> path_effect{std::nullopt};
+    std::optional<effects::Blender> blender{std::nullopt};
     PaintStyle style{PaintStyle::Fill};
     float stroke_width{1.0f};
 
@@ -124,6 +130,51 @@ public:
 
     [[nodiscard]] bool has_image_filter() const noexcept {
         return image_filter.has_value() && image_filter->is_active();
+    }
+
+    void set_mask_filter(const effects::MaskFilter& filter) noexcept {
+        mask_filter = filter;
+    }
+
+    void clear_mask_filter() noexcept {
+        mask_filter = std::nullopt;
+    }
+
+    [[nodiscard]] bool has_mask_filter() const noexcept {
+        return mask_filter.has_value() && mask_filter->is_active();
+    }
+
+    void set_path_effect(const effects::PathEffect& effect) noexcept {
+        path_effect = effect;
+    }
+
+    void clear_path_effect() noexcept {
+        path_effect = std::nullopt;
+    }
+
+    [[nodiscard]] bool has_path_effect() const noexcept {
+        return path_effect.has_value() && path_effect->is_active();
+    }
+
+    void set_blender(const effects::Blender& b) noexcept {
+        blender = b;
+    }
+
+    void clear_blender() noexcept {
+        blender = std::nullopt;
+    }
+
+    [[nodiscard]] bool has_custom_blender() const noexcept {
+        return blender.has_value() && blender->is_custom();
+    }
+
+    [[nodiscard]] bool has_extended_color_filter() const noexcept {
+        return color_effect.has_value() && color_effect->is_extended();
+    }
+
+    [[nodiscard]] bool has_layer_filter() const noexcept {
+        return has_image_filter() || has_mask_filter() || has_custom_blender() ||
+               (has_extended_color_filter() && !is_solid_color());
     }
 
     void set_linear_blending(bool enable) noexcept {

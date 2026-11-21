@@ -1,8 +1,10 @@
 #pragma once
 
+#include "nisaba/effects/image_filter.hpp"
 #include "nisaba/gpu/shader.hpp"
 #include "nisaba/gpu/types.hpp"
 #include "nisaba/math/transform.hpp"
+#include <optional>
 #include <string>
 #include <string_view>
 #include <span>
@@ -59,6 +61,7 @@ public:
     [[nodiscard]] uint32_t programId() const noexcept { return program_; }
     [[nodiscard]] int localMatrixLoc() const noexcept { return loc_local_mat_; }
     [[nodiscard]] int viewSizeLoc() const noexcept { return loc_view_size_; }
+    [[nodiscard]] const std::string& source_code() const noexcept { return source_code_; }
     [[nodiscard]] const std::string& transformed_code() const noexcept { return transformed_code_; }
     [[nodiscard]] const std::vector<std::string>& declared_functions() const noexcept { return declared_functions_; }
     [[nodiscard]] bool has_color_in() const noexcept { return has_color_in_; }
@@ -78,6 +81,7 @@ private:
     std::vector<Child> children_{};
     std::vector<uint8_t> default_uniforms_{};
     std::vector<std::string> declared_functions_{};
+    std::string source_code_{};
     std::string transformed_code_{};
     bool has_color_in_{false};
     size_t uniform_size_{0};
@@ -175,6 +179,13 @@ public:
     std::shared_ptr<Shader> make_shader(const Transform2D* local_matrix = nullptr) {
         return makeShader(local_matrix);
     }
+
+    /// Creates a composable post-processing ImageFilter from this builder's shader and uniform values.
+    [[nodiscard]] effects::ImageFilter make_image_filter(
+        std::string_view input_child_name = {},
+        std::optional<effects::ImageFilter> input = std::nullopt,
+        std::optional<Rect> crop_rect = std::nullopt
+    ) const;
 
     void writeUniformData(size_t offset, const void* data, size_t size);
 

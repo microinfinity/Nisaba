@@ -2972,6 +2972,587 @@ static void test_gpu_phase4_incremental_updates_cache_and_visitor_parity() {
     std::cout << "  -> Phase 4 Incremental Updates, ParagraphCache & Visitor Parity OK" << std::endl;
 }
 
+static void test_gpu_image_filter_dag_parity() {
+    std::cout << "[Test 31/31] Phase 1.1 Composable ImageFilter DAG CPU-vs-OpenGL Parity..." << std::endl;
+
+    auto dev = GpuDevice::create_headless();
+    assert(dev && dev->is_valid());
+
+    constexpr uint32_t W = 260;
+    constexpr uint32_t H = 200;
+    const Color bg = Color::from_rgba8(22, 26, 36, 255);
+
+    auto run_dag_parity = [&](const char* label, auto&& draw_fn,
+                              const std::vector<std::pair<uint32_t, uint32_t>>& pts,
+                              int pt_tol = 8, float max_avg_diff = 3.5f) {
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(bg);
+        {
+            Canvas cpu(cpu_pm->as_mut());
+            draw_fn(cpu);
+        }
+
+        auto surface = GpuSurface::create(dev, W, H, 1);
+        assert(surface != nullptr);
+        {
+            GpuCanvas gpu(surface);
+            gpu.clear(bg);
+            draw_fn(gpu);
+            gpu.flush();
+        }
+        auto gpu_pm = surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        const auto cpu_r = cpu_pm->as_ref();
+        const auto gpu_r = gpu_pm->as_ref();
+
+        for (auto [px, py] : pts) {
+            auto cp = cpu_r.pixel(px, py);
+            auto gp = gpu_r.pixel(px, py);
+            assert(cp.has_value() && gp.has_value());
+            int dr = std::abs(int(cp->red()) - int(gp->red()));
+            int dg = std::abs(int(cp->green()) - int(gp->green()));
+            int db = std::abs(int(cp->blue()) - int(gp->blue()));
+            int da = std::abs(int(cp->alpha()) - int(gp->alpha()));
+            if (dr > pt_tol || dg > pt_tol || db > pt_tol || da > pt_tol) {
+                std::cerr << "  [DAG GL MISMATCH] " << label << " @(" << px << "," << py << ") "
+                          << "CPU=(" << int(cp->red()) << "," << int(cp->green()) << "," << int(cp->blue()) << "," << int(cp->alpha()) << ") "
+                          << "GL=(" << int(gp->red()) << "," << int(gp->green()) << "," << int(gp->blue()) << "," << int(gp->alpha()) << ")\n";
+                assert(false);
+            }
+        }
+
+        double sum_diff = 0.0;
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cpu_r.pixel(x, y);
+                auto gp = gpu_r.pixel(x, y);
+                int dr = std::abs(int(cp->red()) - int(gp->red()));
+                int dg = std::abs(int(cp->green()) - int(gp->green()));
+                int db = std::abs(int(cp->blue()) - int(gp->blue()));
+                int da = std::abs(int(cp->alpha()) - int(gp->alpha()));
+                sum_diff += (dr + dg + db + da) * 0.25;
+            }
+        }
+        double avg_diff = sum_diff / double(W * H);
+        if (avg_diff > max_avg_diff) {
+            std::cerr << "  [DAG GL AVG MISMATCH] " << label << " avg_diff=" << avg_diff << " > " << max_avg_diff << "\n";
+            assert(false);
+        }
+    };
+
+    // 1. Offset + ColorFilter + Compose + CropRect
+    run_dag_parity("Compose + Offset + ColorFilter + CropRect", [&](ICanvas& c) {
+        Paint p1(Color::from_rgba8(230, 60, 50, 255));
+        auto crop = Rect::from_xywh(35.0f, 25.0f, 55.0f, 55.0f);
+        p1.set_image_filter(effects::ImageFilter::compose(
+            effects::ImageFilter::color_filter(effects::ColorEffect::invert(), std::nullopt, crop),
+            effects::ImageFilter::offset(15.0f, 10.0f)
+        ));
+        c.fill_rect(*Rect::from_xywh(15.0f, 15.0f, 65.0f, 65.0f), p1);
+
+        // Compose(Blur, ColorFilter(grayscale))
+        Paint p2(Color::from_rgba8(60, 200, 110, 255));
+        p2.set_image_filter(effects::ImageFilter::compose(
+            effects::ImageFilter::blur(3.0f),
+            effects::ImageFilter::color_filter(effects::ColorEffect::grayscale())
+        ));
+        c.fill_round_rect(*Rect::from_xywh(135.0f, 25.0f, 80.0f, 60.0f), 10.0f, 10.0f, p2);
+    }, {{55, 50}, {22, 22}, {92, 50}, {175, 55}, {132, 55}}, 10, 3.0f);
+
+    // 2. Merge + Blend (Multiply & Screen)
+    run_dag_parity("Merge & Blend DAG", [&](ICanvas& c) {
+        Paint pm(Color::from_rgba8(240, 80, 50, 255));
+        auto sh = effects::ImageFilter::blur(3.0f,
+            effects::ImageFilter::offset(14.0f, 12.0f,
+                effects::ImageFilter::color_filter(
+                    effects::ColorEffect::mode(Color::from_rgba8(40, 120, 250, 210), BlendMode::SourceIn))));
+        pm.set_image_filter(effects::ImageFilter::merge(sh, std::optional<effects::ImageFilter>{std::nullopt}));
+        c.fill_rect(*Rect::from_xywh(20.0f, 25.0f, 65.0f, 55.0f), pm);
+
+        Paint pb(Color::from_rgba8(200, 120, 60, 255));
+        auto bg_branch = effects::ImageFilter::offset(-10.0f, 0.0f,
+            effects::ImageFilter::color_filter(
+                effects::ColorEffect::mode(Color::from_rgba8(80, 180, 240, 255), BlendMode::SourceIn)));
+        auto fg_branch = effects::ImageFilter::offset(10.0f, 0.0f);
+        pb.set_image_filter(effects::ImageFilter::blend(BlendMode::Screen, bg_branch, fg_branch));
+        c.fill_rect(*Rect::from_xywh(155.0f, 35.0f, 60.0f, 60.0f), pb);
+
+        // SaveLayer with nested Blend(Multiply)
+        Paint lp(Color::from_rgba8(255, 255, 255, 230));
+        auto fg_tint = effects::ImageFilter::color_filter(
+            effects::ColorEffect::mode(Color::from_rgba8(255, 160, 80, 255), BlendMode::SourceIn));
+        lp.set_image_filter(effects::ImageFilter::blend(BlendMode::Multiply, std::nullopt, fg_tint));
+        c.save_layer_bounds(*Rect::from_xywh(20.0f, 115.0f, 180.0f, 65.0f), lp);
+        c.fill_rect(*Rect::from_xywh(30.0f, 125.0f, 140.0f, 45.0f), Paint(Color::from_rgba8(140, 200, 240, 255)));
+        c.restore();
+    }, {{50, 50}, {92, 65}, {152, 65}, {185, 65}, {218, 65}, {100, 145}}, 10, 3.5f);
+
+    std::cout << "  -> Phase 1.1 Composable ImageFilter DAG CPU-vs-OpenGL Parity OK" << std::endl;
+}
+
+static void test_gpu_mask_filter_and_perlin_noise_parity() {
+    std::cout << "[Test 32/32] Phase 1.3 BlurMaskFilter & Phase 1.4 PerlinNoiseShader CPU-vs-OpenGL Parity..." << std::endl;
+
+    auto dev = GpuDevice::create_headless();
+    assert(dev && dev->is_valid());
+
+    constexpr uint32_t W = 260;
+    constexpr uint32_t H = 200;
+    const Color bg = Color::from_rgba8(20, 24, 34, 255);
+
+    auto run_case = [&](const char* label, auto&& draw_fn,
+                        const std::vector<std::pair<uint32_t, uint32_t>>& pts,
+                        int pt_tol = 10, float max_avg_diff = 3.5f) {
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        assert(cpu_pm.has_value());
+        cpu_pm->fill(bg);
+        {
+            Canvas cpu(cpu_pm->as_mut());
+            draw_fn(cpu);
+        }
+
+        auto surface = GpuSurface::create(dev, W, H, 1);
+        assert(surface != nullptr);
+        {
+            GpuCanvas gpu(surface);
+            gpu.clear(bg);
+            draw_fn(gpu);
+            gpu.flush();
+        }
+        auto gpu_pm = surface->to_pixmap();
+        assert(gpu_pm.has_value());
+
+        const auto cpu_r = cpu_pm->as_ref();
+        const auto gpu_r = gpu_pm->as_ref();
+        for (auto [px, py] : pts) {
+            auto cp = cpu_r.pixel(px, py);
+            auto gp = gpu_r.pixel(px, py);
+            assert(cp.has_value() && gp.has_value());
+            int dr = std::abs(int(cp->red()) - int(gp->red()));
+            int dg = std::abs(int(cp->green()) - int(gp->green()));
+            int db = std::abs(int(cp->blue()) - int(gp->blue()));
+            int da = std::abs(int(cp->alpha()) - int(gp->alpha()));
+            if (dr > pt_tol || dg > pt_tol || db > pt_tol || da > pt_tol) {
+                std::cerr << "  [GL MISMATCH] " << label << " @(" << px << "," << py << ") "
+                          << "CPU=(" << int(cp->red()) << "," << int(cp->green()) << "," << int(cp->blue()) << "," << int(cp->alpha()) << ") "
+                          << "GL=(" << int(gp->red()) << "," << int(gp->green()) << "," << int(gp->blue()) << "," << int(gp->alpha()) << ")\n";
+                assert(false);
+            }
+        }
+        double sum_diff = 0.0;
+        for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cpu_r.pixel(x, y);
+                auto gp = gpu_r.pixel(x, y);
+                sum_diff += (std::abs(int(cp->red()) - int(gp->red())) +
+                             std::abs(int(cp->green()) - int(gp->green())) +
+                             std::abs(int(cp->blue()) - int(gp->blue())) +
+                             std::abs(int(cp->alpha()) - int(gp->alpha()))) * 0.25;
+            }
+        }
+        double avg_diff = sum_diff / double(W * H);
+        if (avg_diff > max_avg_diff) {
+            std::cerr << "  [GL AVG MISMATCH] " << label << " avg_diff=" << avg_diff << " > " << max_avg_diff << "\n";
+            assert(false);
+        }
+    };
+
+    // 1. All 4 BlurMaskFilter styles (Normal, Solid, Outer, Inner)
+    run_case("BlurMaskFilter 4 Modes", [&](ICanvas& c) {
+        const effects::BlurStyle styles[4] = {
+            effects::BlurStyle::Normal,
+            effects::BlurStyle::Solid,
+            effects::BlurStyle::Outer,
+            effects::BlurStyle::Inner
+        };
+        const Color colors[4] = {
+            Color::from_rgba8(240, 80, 60, 255),
+            Color::from_rgba8(60, 200, 120, 255),
+            Color::from_rgba8(70, 150, 250, 255),
+            Color::from_rgba8(240, 190, 50, 255)
+        };
+        for (int i = 0; i < 4; ++i) {
+            Paint p(colors[i]);
+            p.set_mask_filter(effects::MaskFilter::blur(styles[i], 4.0f));
+            float x = 15.0f + static_cast<float>(i % 2) * 125.0f;
+            float y = 18.0f + static_cast<float>(i / 2) * 95.0f;
+            c.fill_round_rect(*Rect::from_xywh(x, y, 90.0f, 65.0f), 10.0f, 10.0f, p);
+        }
+    }, {{60, 50}, {185, 50}, {60, 145}, {15, 145}, {185, 145}, {137, 145}}, 12, 3.5f);
+
+    // 2. PerlinNoiseShader (FractalNoise + Turbulence + Tiled)
+    run_case("PerlinNoiseShader Fractal & Turbulence", [&](ICanvas& c) {
+        Paint pf(Shader::create_fractal_noise(0.05f, 0.05f, 4, 3.0f));
+        c.fill_rect(*Rect::from_xywh(15.0f, 20.0f, 105.0f, 160.0f), pf);
+
+        Paint pt(Shader::create_turbulence(0.0625f, 0.0625f, 4, 11.0f, IntSize::from_wh(32, 32)));
+        c.fill_rect(*Rect::from_xywh(135.0f, 20.0f, 105.0f, 160.0f), pt);
+    }, {{40, 50}, {85, 110}, {165, 65}, {210, 140}}, 4, 1.5f);
+
+    std::cout << "  -> Phase 1.3 BlurMaskFilter & Phase 1.4 PerlinNoiseShader CPU-vs-OpenGL Parity OK" << std::endl;
+}
+
+static void test_gpu_runtime_shader_image_filter_parity() {
+    std::cout << "[Test 33/33] Phase 1.2 RuntimeShader ImageFilter CPU-vs-OpenGL Parity..." << std::endl;
+
+    auto dev = GpuDevice::create_headless();
+    assert(dev && dev->is_valid());
+
+    constexpr uint32_t W = 220;
+    constexpr uint32_t H = 160;
+    const Color bg = Color::from_rgba8(18, 22, 32, 255);
+
+    const char* kPostFxSrc = R"(
+        uniform shader content;
+        uniform float shift;
+        uniform vec3 gain;
+        vec4 main(vec2 pos) {
+            vec4 cr = content.eval(pos + vec2(shift, 0.0));
+            vec4 cg = content.eval(pos);
+            vec4 cb = content.eval(pos - vec2(shift, 0.0));
+            float a = max(max(cr.a, cg.a), cb.a);
+            return vec4(cr.r * gain.r, cg.g * gain.g, cb.b * gain.b, a);
+        }
+    )";
+
+    auto draw_scene = [&](ICanvas& c) {
+        effects::RuntimeFilterUniforms u;
+        u.set_float("shift", 7.0f).set_vec3("gain", 1.0f, 0.85f, 0.95f);
+        auto crop = Rect::from_xywh(16.0f, 16.0f, 188.0f, 128.0f);
+        Paint lp;
+        lp.set_image_filter(effects::ImageFilter::runtime_shader(kPostFxSrc, u, "content", std::nullopt, crop));
+        c.save_layer_bounds(*Rect::from_xywh(10.0f, 10.0f, 200.0f, 140.0f), lp);
+        c.fill_rect(*Rect::from_xywh(45.0f, 35.0f, 130.0f, 90.0f), Paint(Color::from_rgba8(240, 210, 230, 255)));
+        c.restore();
+    };
+
+    auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+    assert(cpu_pm.has_value());
+    cpu_pm->fill(bg);
+    {
+        Canvas cpu(cpu_pm->as_mut());
+        draw_scene(cpu);
+    }
+
+    auto surface = GpuSurface::create(dev, W, H, 1);
+    assert(surface != nullptr);
+    GpuCanvas gpu(surface);
+    gpu.clear(bg);
+    draw_scene(gpu);
+    gpu.flush();
+    auto gpu_pm = surface->to_pixmap();
+    assert(gpu_pm.has_value());
+
+    const auto cpu_r = cpu_pm->as_ref();
+    const auto gpu_r = gpu_pm->as_ref();
+    const std::vector<std::pair<uint32_t, uint32_t>> pts = {
+        {41, 80}, {110, 80}, {178, 80}, {10, 10}
+    };
+    for (auto [px, py] : pts) {
+        auto cp = cpu_r.pixel(px, py);
+        auto gp = gpu_r.pixel(px, py);
+        assert(cp.has_value() && gp.has_value());
+        assert(std::abs(int(cp->red()) - int(gp->red())) <= 4);
+        assert(std::abs(int(cp->green()) - int(gp->green())) <= 4);
+        assert(std::abs(int(cp->blue()) - int(gp->blue())) <= 4);
+        assert(std::abs(int(cp->alpha()) - int(gp->alpha())) <= 4);
+    }
+    double sum_diff = 0.0;
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            auto cp = cpu_r.pixel(x, y);
+            auto gp = gpu_r.pixel(x, y);
+            sum_diff += (std::abs(int(cp->red()) - int(gp->red())) +
+                         std::abs(int(cp->green()) - int(gp->green())) +
+                         std::abs(int(cp->blue()) - int(gp->blue())) +
+                         std::abs(int(cp->alpha()) - int(gp->alpha()))) * 0.25;
+        }
+    }
+    assert(sum_diff / double(W * H) < 1.5);
+
+    std::cout << "  -> Phase 1.2 RuntimeShader ImageFilter CPU-vs-OpenGL Parity OK" << std::endl;
+}
+
+static void test_gpu_phase2_and_lighting_filters_parity() {
+    std::cout << "[Test 34/34] Phase 2 (Morphology/Conv/Distort/Arith/Xform/Tile/Alpha) & Phase 4.1 (3D Lighting) CPU-vs-OpenGL Parity..." << std::endl;
+
+    auto dev = GpuDevice::create_headless();
+    assert(dev && dev->is_valid());
+    constexpr uint32_t W = 260;
+    constexpr uint32_t H = 220;
+    const Color bg = Color::from_rgba8(16, 20, 28, 255);
+
+    auto run_case = [&](const char* label, auto&& draw_fn,
+                        const std::vector<std::pair<uint32_t, uint32_t>>& pts,
+                        int pt_tol = 10, double max_avg = 3.5) {
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        cpu_pm->fill(bg);
+        {
+            Canvas cpu(cpu_pm->as_mut());
+            draw_fn(cpu);
+        }
+        auto surface = GpuSurface::create(dev, W, H, 1);
+        GpuCanvas gpu(surface);
+        gpu.clear(bg);
+        draw_fn(gpu);
+        gpu.flush();
+        auto gpu_pm = surface->to_pixmap();
+        const auto cr = cpu_pm->as_ref();
+        const auto gr = gpu_pm->as_ref();
+        for (auto [px, py] : pts) {
+            auto cp = cr.pixel(px, py);
+            auto gp = gr.pixel(px, py);
+            int d = std::max({std::abs(int(cp->red()) - int(gp->red())),
+                              std::abs(int(cp->green()) - int(gp->green())),
+                              std::abs(int(cp->blue()) - int(gp->blue())),
+                              std::abs(int(cp->alpha()) - int(gp->alpha()))});
+            if (d > pt_tol) {
+                std::cerr << "  [GL P2 MISMATCH] " << label << " @(" << px << "," << py << ") CPU=("
+                          << int(cp->red()) << "," << int(cp->green()) << "," << int(cp->blue()) << "," << int(cp->alpha())
+                          << ") GL=(" << int(gp->red()) << "," << int(gp->green()) << "," << int(gp->blue()) << "," << int(gp->alpha()) << ")\n";
+                assert(false);
+            }
+        }
+        double sum = 0.0;
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cr.pixel(x, y);
+                auto gp = gr.pixel(x, y);
+                sum += (std::abs(int(cp->red()) - int(gp->red())) +
+                        std::abs(int(cp->green()) - int(gp->green())) +
+                        std::abs(int(cp->blue()) - int(gp->blue())) +
+                        std::abs(int(cp->alpha()) - int(gp->alpha()))) * 0.25;
+            }
+        assert(sum / double(W * H) <= max_avg);
+    };
+
+    // Case A: Dilate, Erode, MatrixConvolution, Arithmetic
+    run_case("Dilate/Erode/Conv/Arith", [&](ICanvas& c) {
+        Paint pd(Color::from_rgba8(240, 80, 50, 255));
+        pd.set_image_filter(effects::ImageFilter::dilate(4.0f, 4.0f));
+        c.fill_rect(*Rect::from_xywh(20.0f, 20.0f, 45.0f, 45.0f), pd);
+
+        Paint pe(Color::from_rgba8(60, 210, 120, 255));
+        pe.set_image_filter(effects::ImageFilter::erode(4.0f, 4.0f));
+        c.fill_rect(*Rect::from_xywh(95.0f, 20.0f, 45.0f, 45.0f), pe);
+
+        Paint pc(Color::from_rgba8(80, 150, 240, 255));
+        pc.set_image_filter(effects::ImageFilter::matrix_convolution(
+            3, 3, {-1, -1, -1, -1, 9, -1, -1, -1, -1}, 1.0f, 0.0f, 1, 1, effects::FilterTileMode::Clamp, false));
+        c.fill_rect(*Rect::from_xywh(175.0f, 20.0f, 55.0f, 45.0f), pc);
+
+        Paint pa(Color::from_rgba8(220, 40, 60, 255));
+        auto bgf = effects::ImageFilter::color_filter(
+            effects::ColorEffect::mode(Color::from_rgba8(40, 200, 220, 255), BlendMode::SourceIn));
+        pa.set_image_filter(effects::ImageFilter::arithmetic(0.0f, 0.5f, 0.5f, 0.0f, true, bgf, std::nullopt));
+        c.fill_rect(*Rect::from_xywh(20.0f, 110.0f, 80.0f, 65.0f), pa);
+    }, {{18, 42}, {117, 42}, {97, 42}, {200, 42}, {60, 140}}, 8, 2.5);
+
+    // Case B: DisplacementMap, Magnifier, MatrixTransform, Tile, AlphaThreshold
+    run_case("Disp/Mag/Xform/Tile/Alpha", [&](ICanvas& c) {
+        // DisplacementMap
+        Paint pdm(Color::from_rgba8(230, 180, 50, 255));
+        auto disp_src = effects::ImageFilter::color_filter(
+            effects::ColorEffect::mode(Color::from_rgba8(255, 128, 0, 255), BlendMode::SourceIn));
+        pdm.set_image_filter(effects::ImageFilter::displacement_map(
+            effects::ColorChannel::R, effects::ColorChannel::G, 16.0f, disp_src, std::nullopt));
+        c.fill_rect(*Rect::from_xywh(25.0f, 20.0f, 40.0f, 40.0f), pdm);
+
+        // Magnifier
+        Paint pmag;
+        pmag.set_image_filter(effects::ImageFilter::magnifier(*Rect::from_xywh(90.0f, 15.0f, 70.0f, 70.0f), 12.0f));
+        c.save_layer_bounds(*Rect::from_xywh(85.0f, 10.0f, 80.0f, 80.0f), pmag);
+        c.fill_rect(*Rect::from_xywh(105.0f, 30.0f, 40.0f, 40.0f), Paint(Color::from_rgba8(240, 90, 160, 255)));
+        c.restore();
+
+        // MatrixTransform
+        Paint pmx(Color::from_rgba8(90, 220, 210, 255));
+        pmx.set_image_filter(effects::ImageFilter::matrix_transform(Transform::from_translate(12.0f, 8.0f), FilterQuality::Bilinear));
+        c.fill_rect(*Rect::from_xywh(180.0f, 20.0f, 45.0f, 45.0f), pmx);
+
+        // Tile
+        Paint ptl;
+        ptl.set_image_filter(effects::ImageFilter::tile(*Rect::from_xywh(20.0f, 115.0f, 20.0f, 20.0f), *Rect::from_xywh(20.0f, 115.0f, 80.0f, 60.0f)));
+        c.save_layer_bounds(*Rect::from_xywh(15.0f, 110.0f, 90.0f, 70.0f), ptl);
+        c.fill_rect(*Rect::from_xywh(20.0f, 115.0f, 10.0f, 10.0f), Paint(Color::from_rgba8(240, 210, 60, 255)));
+        c.restore();
+
+        // AlphaThreshold
+        Paint pat(Color::from_rgba8(180, 100, 240, 128));
+        pat.set_image_filter(effects::ImageFilter::alpha_threshold(*Rect::from_xywh(140.0f, 125.0f, 60.0f, 50.0f), 0.9f, 0.2f));
+        c.fill_rect(*Rect::from_xywh(120.0f, 115.0f, 100.0f, 70.0f), pat);
+    }, {{40, 40}, {125, 50}, {210, 48}, {45, 140}, {170, 150}, {126, 150}}, 10, 3.0);
+
+    // Case C: SVG 3D Surface Lighting (Distant/Point/Spot Diffuse & Specular)
+    run_case("3D Surface Lighting", [&](ICanvas& c) {
+        auto bump = effects::ImageFilter::blur(3.0f);
+        Paint p1(Color::WHITE);
+        p1.set_image_filter(effects::ImageFilter::distant_lit_diffuse(
+            effects::Point3{0.5f, -0.5f, 1.0f}, Color::from_rgba8(255, 220, 180, 255), 6.0f, 1.0f, bump));
+        c.fill_oval(*Rect::from_xywh(23.0f, 28.0f, 64.0f, 64.0f), p1);
+
+        Paint p2(Color::WHITE);
+        p2.set_image_filter(effects::ImageFilter::point_lit_specular(
+            effects::Point3{135.0f, 45.0f, 60.0f}, Color::from_rgba8(140, 210, 255, 255), 8.0f, 1.0f, 12.0f, bump));
+        c.fill_oval(*Rect::from_xywh(113.0f, 28.0f, 64.0f, 64.0f), p2);
+
+        Paint p3(Color::WHITE);
+        p3.set_image_filter(effects::ImageFilter::spot_lit_diffuse(
+            effects::Point3{120.0f, 130.0f, 90.0f}, effects::Point3{130.0f, 155.0f, 0.0f},
+            4.0f, 45.0f, Color::from_rgba8(255, 180, 220, 255), 6.0f, 1.0f, bump));
+        c.fill_oval(*Rect::from_xywh(95.0f, 120.0f, 70.0f, 70.0f), p3);
+    }, {{55, 60}, {32, 42}, {145, 60}, {130, 155}}, 14, 4.5);
+
+    std::cout << "  -> Phase 2 & Phase 4.1 3D Lighting CPU-vs-OpenGL Parity OK" << std::endl;
+}
+
+static void test_gpu_phase3_and_phase4_2_parity() {
+    std::cout << "[Test 35/35] Phase 3.1 (Ext ColorEffect), Phase 3.2 (PathEffect) & Phase 4.2 (Blender/ShaderMask) CPU-vs-OpenGL Parity..." << std::endl;
+
+    auto dev = GpuDevice::create_headless();
+    assert(dev && dev->is_valid());
+    constexpr uint32_t W = 260;
+    constexpr uint32_t H = 220;
+    const Color bg = Color::from_rgba8(24, 34, 52, 255);
+
+    auto run_case = [&](const char* label, auto&& draw_fn,
+                        const std::vector<std::pair<uint32_t, uint32_t>>& pts,
+                        int pt_tol = 10, double max_avg = 3.5) {
+        auto cpu_pm = Pixmap::allocate(W, H, PixelFormat::RGBA8888);
+        cpu_pm->fill(bg);
+        {
+            Canvas cpu(cpu_pm->as_mut());
+            draw_fn(cpu);
+        }
+        auto surface = GpuSurface::create(dev, W, H, 1);
+        GpuCanvas gpu(surface);
+        gpu.clear(bg);
+        draw_fn(gpu);
+        gpu.flush();
+        auto gpu_pm = surface->to_pixmap();
+        const auto cr = cpu_pm->as_ref();
+        const auto gr = gpu_pm->as_ref();
+        for (auto [px, py] : pts) {
+            auto cp = cr.pixel(px, py);
+            auto gp = gr.pixel(px, py);
+            int d = std::max({std::abs(int(cp->red()) - int(gp->red())),
+                              std::abs(int(cp->green()) - int(gp->green())),
+                              std::abs(int(cp->blue()) - int(gp->blue())),
+                              std::abs(int(cp->alpha()) - int(gp->alpha()))});
+            if (d > pt_tol) {
+                std::cerr << "  [GL P3/4 MISMATCH] " << label << " @(" << px << "," << py << ") CPU=("
+                          << int(cp->red()) << "," << int(cp->green()) << "," << int(cp->blue()) << "," << int(cp->alpha())
+                          << ") GL=(" << int(gp->red()) << "," << int(gp->green()) << "," << int(gp->blue()) << "," << int(gp->alpha()) << ")\n";
+                assert(false);
+            }
+        }
+        double sum = 0.0;
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x) {
+                auto cp = cr.pixel(x, y);
+                auto gp = gr.pixel(x, y);
+                sum += (std::abs(int(cp->red()) - int(gp->red())) +
+                        std::abs(int(cp->green()) - int(gp->green())) +
+                        std::abs(int(cp->blue()) - int(gp->blue())) +
+                        std::abs(int(cp->alpha()) - int(gp->alpha()))) * 0.25;
+            }
+        assert(sum / double(W * H) <= max_avg);
+    };
+
+    // Case A: Extended ColorEffect (Table, HSLAMatrix, Luma, HighContrast, Lerp) on gradients
+    run_case("Extended ColorEffects", [&](ICanvas& c) {
+        auto grad = Shader(*LinearGradient::create(
+            Point::from_xy(0.0f, 0.0f), Point::from_xy(260.0f, 0.0f),
+            {GradientStop::create(0.0f, Color::from_rgba8(240, 60, 40, 255)),
+             GradientStop::create(0.5f, Color::from_rgba8(60, 220, 100, 255)),
+             GradientStop::create(1.0f, Color::from_rgba8(50, 100, 240, 255))}
+        ));
+
+        std::array<uint8_t, 256> post{};
+        for (int i = 0; i < 256; ++i) post[i] = static_cast<uint8_t>((i / 64) * 64);
+        Paint p_tbl(grad);
+        p_tbl.set_color_filter(effects::ColorEffect::table(post));
+        c.fill_rect(*Rect::from_xywh(10.0f, 10.0f, 240.0f, 32.0f), p_tbl);
+
+        effects::ColorMatrix hmat = effects::ColorMatrix::identity();
+        hmat.m[4] = 0.33f;
+        Paint p_hsla(grad);
+        p_hsla.set_color_filter(effects::ColorEffect::hsla_matrix(hmat));
+        c.fill_rect(*Rect::from_xywh(10.0f, 52.0f, 240.0f, 32.0f), p_hsla);
+
+        Paint p_luma(grad);
+        p_luma.set_color_filter(effects::ColorEffect::luma());
+        c.fill_rect(*Rect::from_xywh(10.0f, 94.0f, 240.0f, 32.0f), p_luma);
+
+        Paint p_hc(grad);
+        p_hc.set_color_filter(effects::ColorEffect::high_contrast(
+            effects::HighContrastConfig{false, effects::HighContrastInvertStyle::InvertLightness, 0.25f}));
+        c.fill_rect(*Rect::from_xywh(10.0f, 136.0f, 240.0f, 32.0f), p_hc);
+
+        Paint p_lerp(grad);
+        p_lerp.set_color_filter(effects::ColorEffect::lerp(0.5f, effects::ColorEffect::invert(), effects::ColorEffect::grayscale()));
+        c.fill_rect(*Rect::from_xywh(10.0f, 178.0f, 240.0f, 32.0f), p_lerp);
+    }, {{60, 25}, {180, 25}, {60, 68}, {130, 110}, {130, 152}, {130, 194}}, 8, 2.5);
+
+    // Case B: Composable PathEffects (Corner, Trim, Discrete, Path1D, Path2D)
+    run_case("Composable PathEffects", [&](ICanvas& c) {
+        Stroke st; st.width = 4.0f;
+
+        Paint p1(Color::from_rgba8(240, 100, 60, 255));
+        p1.set_path_effect(effects::PathEffect::corner(14.0f));
+        c.fill_rect(*Rect::from_xywh(15.0f, 15.0f, 65.0f, 55.0f), p1);
+
+        Paint p2(Color::from_rgba8(80, 220, 140, 255));
+        p2.set_path_effect(effects::PathEffect::trim(0.15f, 0.75f));
+        c.stroke_rect(*Rect::from_xywh(100.0f, 15.0f, 65.0f, 55.0f), p2, st);
+
+        Paint p3(Color::from_rgba8(100, 170, 250, 255));
+        p3.set_path_effect(effects::PathEffect::discrete(10.0f, 3.0f, 99u));
+        c.stroke_rect(*Rect::from_xywh(185.0f, 15.0f, 60.0f, 55.0f), p3, st);
+
+        Path dot = PathBuilder::from_circle(0.0f, 0.0f, 3.5f).value();
+        Paint p4(Color::from_rgba8(240, 200, 60, 255));
+        p4.set_path_effect(effects::PathEffect::path_1d(dot, 12.0f, 0.0f, effects::Path1DStyle::Rotate));
+        c.stroke_rect(*Rect::from_xywh(20.0f, 105.0f, 80.0f, 80.0f), p4, st);
+
+        Paint p5(Color::from_rgba8(220, 100, 240, 255));
+        p5.set_path_effect(effects::PathEffect::path_2d(Transform::from_scale(14.0f, 14.0f), dot));
+        c.fill_rect(*Rect::from_xywh(135.0f, 105.0f, 100.0f, 80.0f), p5);
+    }, {{45, 42}, {16, 16}, {130, 15}, {185, 145}}, 12, 3.5);
+
+    // Case C: Custom Blenders (Arithmetic + Runtime) & ShaderMaskFilter
+    run_case("Blenders & ShaderMaskFilter", [&](ICanvas& c) {
+        Paint pa(Color::from_rgba8(230, 60, 50, 255));
+        pa.set_blender(effects::Blender::arithmetic(0.0f, 0.6f, 0.4f, 0.0f, true));
+        c.fill_rect(*Rect::from_xywh(15.0f, 20.0f, 70.0f, 75.0f), pa);
+
+        const char* kMaxBlend = R"(
+            uniform float gain;
+            vec4 main(vec4 src, vec4 dst) {
+                return vec4(clamp(max(src.rgb * gain, dst.rgb), 0.0, 1.0), 1.0);
+            }
+        )";
+        effects::RuntimeFilterUniforms bu;
+        bu.set_float("gain", 0.9f);
+        Paint pr(Color::from_rgba8(240, 180, 40, 255));
+        pr.set_blender(effects::Blender::runtime(kMaxBlend, bu));
+        c.fill_rect(*Rect::from_xywh(100.0f, 20.0f, 70.0f, 75.0f), pr);
+
+        auto mask_grad = Shader(*LinearGradient::create(
+            Point::from_xy(20.0f, 0.0f), Point::from_xy(220.0f, 0.0f),
+            {GradientStop::create(0.0f, Color::from_rgba8(255, 255, 255, 0)),
+             GradientStop::create(1.0f, Color::from_rgba8(255, 255, 255, 255))}
+        ));
+        Paint psm(Color::from_rgba8(80, 230, 160, 255));
+        psm.set_mask_filter(effects::MaskFilter::shader(mask_grad));
+        c.fill_rect(*Rect::from_xywh(20.0f, 120.0f, 200.0f, 75.0f), psm);
+    }, {{50, 55}, {135, 55}, {40, 155}, {120, 155}, {200, 155}}, 6, 2.0);
+
+    std::cout << "  -> Phase 3.1, Phase 3.2 & Phase 4.2 CPU-vs-OpenGL Parity OK" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "Running Nisaba GPU Rendering Pipeline Test Suite" << std::endl;
@@ -3007,9 +3588,14 @@ int main() {
     test_gpu_phase2_placeholders_rich_paint_and_gaps_parity();
     test_gpu_phase3_features_variable_fonts_and_strut_parity();
     test_gpu_phase4_incremental_updates_cache_and_visitor_parity();
+    test_gpu_image_filter_dag_parity();
+    test_gpu_mask_filter_and_perlin_noise_parity();
+    test_gpu_runtime_shader_image_filter_parity();
+    test_gpu_phase2_and_lighting_filters_parity();
+    test_gpu_phase3_and_phase4_2_parity();
 
     std::cout << "========================================" << std::endl;
-    std::cout << "All Nisaba GPU pipeline tests PASSED (30/30)!" << std::endl;
+    std::cout << "All Nisaba GPU pipeline tests PASSED (35/35)!" << std::endl;
     std::cout << "========================================" << std::endl;
 
     return 0;

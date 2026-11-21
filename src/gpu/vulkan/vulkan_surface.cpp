@@ -119,8 +119,7 @@ bool VulkanSurface::init_surface() {
 
     // 2. Create MSAA Color Image if samples > 1
     if (sample_count != VK_SAMPLE_COUNT_1_BIT) {
-        VkImageUsageFlags msaa_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                                       VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+        VkImageUsageFlags msaa_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (!vk_device_->create_image(
                 width_, height_, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL,
                 msaa_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sample_count,
@@ -180,7 +179,7 @@ bool VulkanSurface::init_surface() {
         msaa_desc.format = VK_FORMAT_R8G8B8A8_UNORM;
         msaa_desc.samples = sample_count;
         msaa_desc.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        msaa_desc.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        msaa_desc.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         msaa_desc.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         msaa_desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         msaa_desc.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -195,8 +194,8 @@ bool VulkanSurface::init_surface() {
         ds_desc.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         ds_desc.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         ds_desc.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        ds_desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        ds_desc.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ds_desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        ds_desc.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         ds_desc.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         attachments.push_back(ds_desc);
         fb_attachments.push_back(depth_stencil_view_);
@@ -243,8 +242,8 @@ bool VulkanSurface::init_surface() {
         ds_desc.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         ds_desc.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         ds_desc.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        ds_desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        ds_desc.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ds_desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        ds_desc.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         ds_desc.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         attachments.push_back(ds_desc);
         fb_attachments.push_back(depth_stencil_view_);
@@ -286,16 +285,20 @@ bool VulkanSurface::init_surface() {
         return false;
     }
 
-    // Create Load/Preserve Render Pass (for incremental Damage Tracking)
+    // Create Load/Preserve Render Pass (for incremental Damage Tracking & Layer Resumption)
     std::vector<VkAttachmentDescription> attachments_load = attachments;
     if (sample_count != VK_SAMPLE_COUNT_1_BIT) {
         attachments_load[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         attachments_load[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        attachments_load[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachments_load[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         attachments_load[2].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         attachments_load[2].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     } else {
         attachments_load[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         attachments_load[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        attachments_load[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachments_load[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     }
 
     VkRenderPassCreateInfo rp_info_load = rp_info;
@@ -345,6 +348,23 @@ bool VulkanSurface::init_surface() {
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
         }
+
+        VkImageMemoryBarrier ds_barrier{};
+        ds_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        ds_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ds_barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        ds_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ds_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ds_barrier.image = depth_stencil_image_;
+        ds_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        ds_barrier.subresourceRange.baseMipLevel = 0;
+        ds_barrier.subresourceRange.levelCount = 1;
+        ds_barrier.subresourceRange.baseArrayLayer = 0;
+        ds_barrier.subresourceRange.layerCount = 1;
+        ds_barrier.srcAccessMask = 0;
+        ds_barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, nullptr, 0, nullptr, 1, &ds_barrier);
 
         vk_device_->end_single_time_commands(cmd);
     }

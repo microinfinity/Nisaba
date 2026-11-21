@@ -292,6 +292,75 @@ private:
 
 class ComposeShader;
 
+enum class PerlinNoiseType : uint8_t {
+    FractalNoise = 0,
+    Turbulence = 1,
+};
+
+class PerlinNoiseShader {
+public:
+    PerlinNoiseShader() noexcept = default;
+
+    static std::optional<PerlinNoiseShader> create_fractal_noise(
+        float base_freq_x,
+        float base_freq_y,
+        int num_octaves,
+        float seed,
+        std::optional<IntSize> tile_size = std::nullopt,
+        Transform transform = Transform()
+    );
+
+    static std::optional<PerlinNoiseShader> create_turbulence(
+        float base_freq_x,
+        float base_freq_y,
+        int num_octaves,
+        float seed,
+        std::optional<IntSize> tile_size = std::nullopt,
+        Transform transform = Transform()
+    );
+
+    [[nodiscard]] PerlinNoiseType noise_type() const noexcept { return noise_type_; }
+    [[nodiscard]] float base_freq_x() const noexcept { return base_freq_x_; }
+    [[nodiscard]] float base_freq_y() const noexcept { return base_freq_y_; }
+    [[nodiscard]] int num_octaves() const noexcept { return num_octaves_; }
+    [[nodiscard]] float seed() const noexcept { return seed_; }
+    [[nodiscard]] float opacity() const noexcept { return opacity_; }
+    [[nodiscard]] const std::optional<IntSize>& tile_size() const noexcept { return tile_size_; }
+    [[nodiscard]] const Transform& transform() const noexcept { return transform_; }
+    [[nodiscard]] const std::optional<Transform>& inv_transform() const noexcept { return inv_ts_; }
+
+    void set_transform(const Transform& ts) noexcept;
+    void post_concat(const Transform& ts) noexcept;
+    void apply_opacity(float opacity) noexcept;
+
+    [[nodiscard]] Color sample(float x, float y) const noexcept;
+    [[nodiscard]] PremultipliedColor sample_premul(float x, float y) const noexcept;
+    void shade_span(float x, float y, uint32_t count, PremultipliedColorU8* dst) const noexcept;
+    [[nodiscard]] bool is_opaque() const noexcept { return false; }
+
+private:
+    PerlinNoiseType noise_type_{PerlinNoiseType::FractalNoise};
+    float base_freq_x_{0.0f};
+    float base_freq_y_{0.0f};
+    int num_octaves_{1};
+    float seed_{0.0f};
+    float opacity_{1.0f};
+    std::optional<IntSize> tile_size_{std::nullopt};
+    Transform transform_{};
+    std::optional<Transform> inv_ts_{};
+
+    static std::optional<PerlinNoiseShader> create_impl(
+        PerlinNoiseType type,
+        float base_freq_x,
+        float base_freq_y,
+        int num_octaves,
+        float seed,
+        std::optional<IntSize> tile_size,
+        Transform transform
+    );
+    void update_inv() noexcept;
+};
+
 class Shader {
 public:
     enum class Type {
@@ -302,6 +371,7 @@ public:
         Pattern,
         TwoPointConicalGradient,
         ComposeShader,
+        PerlinNoise,
     };
 
     using ComplexShader = std::variant<
@@ -311,7 +381,8 @@ public:
         std::shared_ptr<SweepGradient>,
         std::shared_ptr<Pattern>,
         std::shared_ptr<TwoPointConicalGradient>,
-        std::shared_ptr<ComposeShader>
+        std::shared_ptr<ComposeShader>,
+        std::shared_ptr<PerlinNoiseShader>
     >;
 
     Shader() noexcept;
@@ -328,6 +399,7 @@ public:
     explicit Shader(Pattern patt);
     explicit Shader(TwoPointConicalGradient grad);
     explicit Shader(ComposeShader comp);
+    explicit Shader(PerlinNoiseShader noise);
 
     static Shader from_color(Color color) noexcept { return Shader(color); }
     static Shader from_color_rgba8(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) noexcept {
@@ -346,6 +418,22 @@ public:
         SpreadMode mode = SpreadMode::Pad,
         Transform transform = Transform()
     );
+    static Shader create_fractal_noise(
+        float base_freq_x,
+        float base_freq_y,
+        int num_octaves,
+        float seed,
+        std::optional<IntSize> tile_size = std::nullopt,
+        Transform transform = Transform()
+    );
+    static Shader create_turbulence(
+        float base_freq_x,
+        float base_freq_y,
+        int num_octaves,
+        float seed,
+        std::optional<IntSize> tile_size = std::nullopt,
+        Transform transform = Transform()
+    );
 
     [[nodiscard]] Type type() const noexcept { return type_; }
     [[nodiscard]] bool is_solid_color() const noexcept { return type_ == Type::SolidColor; }
@@ -361,6 +449,7 @@ public:
     [[nodiscard]] const TwoPointConicalGradient& conical_gradient() const noexcept;
     [[nodiscard]] const Pattern& pattern() const noexcept;
     [[nodiscard]] const ComposeShader& compose_shader() const noexcept;
+    [[nodiscard]] const PerlinNoiseShader& perlin_noise() const noexcept;
 
     [[nodiscard]] Color sample(float x, float y) const noexcept;
     [[nodiscard]] PremultipliedColor sample_premul(float x, float y) const noexcept;

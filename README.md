@@ -1,8 +1,8 @@
 <div align="center">
 
-![Nisaba — Full-Stack 2D Graphics Engine](assets/Nisaba-background-banner.jpeg)
+![Nisaba — Full-Stack Graphics Engine](assets/Nisaba-background-banner.jpeg)
 
-# Nisaba — Full-Stack 2D Graphics Engine
+# Nisaba — Full-Stack Graphics Engine
 ### Sovereign C++20 2D Vector Graphics, Typography, UI Layout & Hardware GPU Engine
 
 [![C++20](https://img.shields.io/badge/Language-C%2B%2B20-blue.svg)](https://en.cppreference.com/w/cpp/20)

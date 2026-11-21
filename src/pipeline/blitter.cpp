@@ -404,7 +404,8 @@ void PipelineBlitter::blend_span(uint32_t x, uint32_t y, uint32_t len, float cov
             (paint_.shader.type() == Shader::Type::LinearGradient ||
              paint_.shader.type() == Shader::Type::RadialGradient ||
              paint_.shader.type() == Shader::Type::TwoPointConicalGradient ||
-             paint_.shader.type() == Shader::Type::Pattern)) {
+             paint_.shader.type() == Shader::Type::Pattern ||
+             paint_.shader.type() == Shader::Type::PerlinNoise)) {
             if (!mask_.has_value()) {
                 if ((blend_mode_ == BlendMode::Source || paint_.shader.is_opaque()) && coverage >= 1.0f) {
                     paint_.shader.shade_span(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, count, pixmap_.row(y) + x);

@@ -19,7 +19,60 @@ inline ColorTransfer combine_transfers(ColorTransfer inner, ColorTransfer outer)
     return outer;
 }
 
+inline void rgb_to_hsl(float r, float g, float b, float& h, float& s, float& l) noexcept {
+    const float max_c = std::max({r, g, b});
+    const float min_c = std::min({r, g, b});
+    l = 0.5f * (max_c + min_c);
+    const float d = max_c - min_c;
+    if (d <= 1e-6f) {
+        h = 0.0f;
+        s = 0.0f;
+        return;
+    }
+    s = (l > 0.5f) ? (d / std::max(2.0f - max_c - min_c, 1e-6f)) : (d / std::max(max_c + min_c, 1e-6f));
+    if (max_c == r) {
+        h = (g - b) / d + (g < b ? 6.0f : 0.0f);
+    } else if (max_c == g) {
+        h = (b - r) / d + 2.0f;
+    } else {
+        h = (r - g) / d + 4.0f;
+    }
+    h /= 6.0f;
+}
+
+inline float hue_to_rgb(float p, float q, float t) noexcept {
+    if (t < 0.0f) t += 1.0f;
+    if (t > 1.0f) t -= 1.0f;
+    if (t < 1.0f / 6.0f) return p + (q - p) * 6.0f * t;
+    if (t < 0.5f) return q;
+    if (t < 2.0f / 3.0f) return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
+    return p;
+}
+
+inline void hsl_to_rgb(float h, float s, float l, float& r, float& g, float& b) noexcept {
+    h = h - std::floor(h);
+    s = std::clamp(s, 0.0f, 1.0f);
+    l = std::clamp(l, 0.0f, 1.0f);
+    if (s <= 1e-6f) {
+        r = g = b = l;
+        return;
+    }
+    const float q = (l < 0.5f) ? (l * (1.0f + s)) : (l + s - l * s);
+    const float p = 2.0f * l - q;
+    r = hue_to_rgb(p, q, h + 1.0f / 3.0f);
+    g = hue_to_rgb(p, q, h);
+    b = hue_to_rgb(p, q, h - 1.0f / 3.0f);
+}
+
 } // namespace
+
+bool ColorEffect::is_extended() const noexcept {
+    return ext_node != nullptr && ext_node->kind != ColorEffectExtKind::None;
+}
+
+bool ColorEffect::is_active() const noexcept {
+    return has_matrix || transfer != ColorTransfer::None || has_blend || is_extended();
+}
 
 ColorEffect ColorEffect::tint(Color color, float intensity) noexcept {
     float t = std::clamp(intensity, 0.0f, 1.0f);
@@ -32,37 +85,188 @@ ColorEffect ColorEffect::tint(Color color, float intensity) noexcept {
     return mode(adjusted, BlendMode::SourceAtop);
 }
 
-std::optional<ColorEffect> ColorEffect::compose(const ColorEffect& outer, const ColorEffect& inner) noexcept {
+ColorEffect ColorEffect::table(const std::array<uint8_t, 256>& rgb_lut) {
+    return table_argb(nullptr, rgb_lut.data(), rgb_lut.data(), rgb_lut.data());
+}
+
+ColorEffect ColorEffect::table_argb(
+    const uint8_t* a_lut,
+    const uint8_t* r_lut,
+    const uint8_t* g_lut,
+    const uint8_t* b_lut
+) {
+    auto node = std::make_shared<ColorEffectExtNode>();
+    node->kind = ColorEffectExtKind::Table;
+    for (int i = 0; i < 256; ++i) {
+        const uint8_t id = static_cast<uint8_t>(i);
+        node->lut_a[i] = a_lut ? a_lut[i] : id;
+        node->lut_r[i] = r_lut ? r_lut[i] : id;
+        node->lut_g[i] = g_lut ? g_lut[i] : id;
+        node->lut_b[i] = b_lut ? b_lut[i] : id;
+    }
+    ColorEffect e;
+    e.ext_node = std::move(node);
+    return e;
+}
+
+ColorEffect ColorEffect::hsla_matrix(const ColorMatrix& mat) {
+    auto node = std::make_shared<ColorEffectExtNode>();
+    node->kind = ColorEffectExtKind::HslaMatrix;
+    node->hsla_matrix = mat;
+    ColorEffect e;
+    e.ext_node = std::move(node);
+    return e;
+}
+
+ColorEffect ColorEffect::luma() {
+    auto node = std::make_shared<ColorEffectExtNode>();
+    node->kind = ColorEffectExtKind::Luma;
+    ColorEffect e;
+    e.ext_node = std::move(node);
+    return e;
+}
+
+ColorEffect ColorEffect::high_contrast(const HighContrastConfig& cfg) {
+    auto node = std::make_shared<ColorEffectExtNode>();
+    node->kind = ColorEffectExtKind::HighContrast;
+    node->high_contrast = cfg;
+    ColorEffect e;
+    e.ext_node = std::move(node);
+    return e;
+}
+
+ColorEffect ColorEffect::lerp(float t, const ColorEffect& cf0, const ColorEffect& cf1) {
+    const float ct = std::clamp(t, 0.0f, 1.0f);
+    if (ct <= 0.0f) return cf0;
+    if (ct >= 1.0f) return cf1;
+    auto node = std::make_shared<ColorEffectExtNode>();
+    node->kind = ColorEffectExtKind::Lerp;
+    node->lerp_t = ct;
+    node->child0 = std::make_shared<ColorEffect>(cf0);
+    node->child1 = std::make_shared<ColorEffect>(cf1);
+    ColorEffect e;
+    e.ext_node = std::move(node);
+    return e;
+}
+
+std::optional<ColorEffect> ColorEffect::compose(const ColorEffect& outer, const ColorEffect& inner) {
     if (!inner.is_active()) return outer;
     if (!outer.is_active()) return inner;
 
-    // Matrix -> Transfer -> Blend cannot losslessly represent Matrix/Transfer applied *after* Blend
-    // unless outer is pure Blend and inner has no Blend (or pure Transfer after Matrix).
-    if (inner.has_blend && (outer.has_matrix || outer.transfer != ColorTransfer::None || outer.has_blend)) {
-        return std::nullopt;
-    }
-    if (inner.transfer != ColorTransfer::None && outer.has_matrix) {
-        return std::nullopt;
+    const bool can_fold = !inner.is_extended() && !outer.is_extended() &&
+                          !(inner.has_blend && (outer.has_matrix || outer.transfer != ColorTransfer::None || outer.has_blend)) &&
+                          !(inner.transfer != ColorTransfer::None && outer.has_matrix);
+    if (can_fold) {
+        ColorEffect out;
+        out.has_matrix = inner.has_matrix || outer.has_matrix;
+        if (inner.has_matrix && outer.has_matrix) {
+            out.matrix = outer.matrix.multiply(inner.matrix);
+        } else if (inner.has_matrix) {
+            out.matrix = inner.matrix;
+        } else if (outer.has_matrix) {
+            out.matrix = outer.matrix;
+        }
+        out.transfer = combine_transfers(inner.transfer, outer.transfer);
+        out.has_blend = outer.has_blend;
+        out.blend_color = outer.blend_color;
+        out.blend_mode = outer.blend_mode;
+        return out;
     }
 
+    auto node = std::make_shared<ColorEffectExtNode>();
+    node->kind = ColorEffectExtKind::Compose;
+    node->child0 = std::make_shared<ColorEffect>(outer);
+    node->child1 = std::make_shared<ColorEffect>(inner);
     ColorEffect out;
-    out.has_matrix = inner.has_matrix || outer.has_matrix;
-    if (inner.has_matrix && outer.has_matrix) {
-        out.matrix = outer.matrix.multiply(inner.matrix);
-    } else if (inner.has_matrix) {
-        out.matrix = inner.matrix;
-    } else if (outer.has_matrix) {
-        out.matrix = outer.matrix;
-    }
-
-    out.transfer = combine_transfers(inner.transfer, outer.transfer);
-    out.has_blend = outer.has_blend;
-    out.blend_color = outer.blend_color;
-    out.blend_mode = outer.blend_mode;
+    out.ext_node = std::move(node);
     return out;
 }
 
 PremultipliedColor ColorEffect::transform_premul(PremultipliedColor c) const noexcept {
+    if (is_extended()) {
+        const auto& en = *ext_node;
+        switch (en.kind) {
+            case ColorEffectExtKind::Table: {
+                const Color s = c.demultiply();
+                const uint8_t r8 = static_cast<uint8_t>(std::clamp(s.red() * 255.0f + 0.5f, 0.0f, 255.0f));
+                const uint8_t g8 = static_cast<uint8_t>(std::clamp(s.green() * 255.0f + 0.5f, 0.0f, 255.0f));
+                const uint8_t b8 = static_cast<uint8_t>(std::clamp(s.blue() * 255.0f + 0.5f, 0.0f, 255.0f));
+                const uint8_t a8 = static_cast<uint8_t>(std::clamp(s.alpha() * 255.0f + 0.5f, 0.0f, 255.0f));
+                constexpr float inv = 1.0f / 255.0f;
+                return Color::from_rgba_unchecked(
+                    en.lut_r[r8] * inv, en.lut_g[g8] * inv, en.lut_b[b8] * inv, en.lut_a[a8] * inv
+                ).premultiply();
+            }
+            case ColorEffectExtKind::HslaMatrix: {
+                const Color s = c.demultiply();
+                float h = 0.0f, sat = 0.0f, l = 0.0f;
+                rgb_to_hsl(s.red(), s.green(), s.blue(), h, sat, l);
+                const auto& m = en.hsla_matrix.m;
+                const float a = s.alpha();
+                const float nh = m[0] * h + m[1] * sat + m[2] * l + m[3] * a + m[4];
+                const float ns = std::clamp(m[5] * h + m[6] * sat + m[7] * l + m[8] * a + m[9], 0.0f, 1.0f);
+                const float nl = std::clamp(m[10] * h + m[11] * sat + m[12] * l + m[13] * a + m[14], 0.0f, 1.0f);
+                const float na = std::clamp(m[15] * h + m[16] * sat + m[17] * l + m[18] * a + m[19], 0.0f, 1.0f);
+                float nr = 0.0f, ng = 0.0f, nb = 0.0f;
+                hsl_to_rgb(nh, ns, nl, nr, ng, nb);
+                return Color::from_rgba_unchecked(nr, ng, nb, na).premultiply();
+            }
+            case ColorEffectExtKind::Luma: {
+                const float lum = std::clamp(
+                    0.2126f * c.red() + 0.7152f * c.green() + 0.0722f * c.blue(),
+                    0.0f, 1.0f
+                );
+                return PremultipliedColor(
+                    NormalizedF32::ZERO, NormalizedF32::ZERO, NormalizedF32::ZERO,
+                    NormalizedF32::create_clamped(lum)
+                );
+            }
+            case ColorEffectExtKind::HighContrast: {
+                const Color s = c.demultiply();
+                float r = s.red(), g = s.green(), b = s.blue(), a = s.alpha();
+                if (en.high_contrast.grayscale) {
+                    const float l = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+                    r = g = b = l;
+                }
+                if (en.high_contrast.invert_style == HighContrastInvertStyle::InvertBrightness) {
+                    r = 1.0f - r; g = 1.0f - g; b = 1.0f - b;
+                } else if (en.high_contrast.invert_style == HighContrastInvertStyle::InvertLightness) {
+                    float h = 0.0f, sat = 0.0f, l = 0.0f;
+                    rgb_to_hsl(r, g, b, h, sat, l);
+                    hsl_to_rgb(h, sat, 1.0f - l, r, g, b);
+                }
+                if (std::abs(en.high_contrast.contrast) > 1e-5f) {
+                    const float cf = std::clamp(en.high_contrast.contrast, -0.99f, 0.99f);
+                    const float m = (1.0f + cf) / (1.0f - cf);
+                    r = std::clamp(m * (r - 0.5f) + 0.5f, 0.0f, 1.0f);
+                    g = std::clamp(m * (g - 0.5f) + 0.5f, 0.0f, 1.0f);
+                    b = std::clamp(m * (b - 0.5f) + 0.5f, 0.0f, 1.0f);
+                }
+                return Color::from_rgba_unchecked(r, g, b, a).premultiply();
+            }
+            case ColorEffectExtKind::Compose: {
+                PremultipliedColor tmp = en.child1 ? en.child1->transform_premul(c) : c;
+                return en.child0 ? en.child0->transform_premul(tmp) : tmp;
+            }
+            case ColorEffectExtKind::Lerp: {
+                const PremultipliedColor c0 = en.child0 ? en.child0->transform_premul(c) : c;
+                const PremultipliedColor c1 = en.child1 ? en.child1->transform_premul(c) : c;
+                const float t = en.lerp_t;
+                const float it = 1.0f - t;
+                const float a = std::clamp(c0.alpha() * it + c1.alpha() * t, 0.0f, 1.0f);
+                const float r = std::clamp(c0.red() * it + c1.red() * t, 0.0f, a);
+                const float g = std::clamp(c0.green() * it + c1.green() * t, 0.0f, a);
+                const float b = std::clamp(c0.blue() * it + c1.blue() * t, 0.0f, a);
+                return PremultipliedColor(
+                    NormalizedF32::create_clamped(r), NormalizedF32::create_clamped(g),
+                    NormalizedF32::create_clamped(b), NormalizedF32::create_clamped(a)
+                );
+            }
+            default:
+                break;
+        }
+    }
+
     PremultipliedColor pm = c;
     if (has_matrix) {
         pm = matrix.transform_premul(pm);
@@ -87,7 +291,7 @@ Color ColorEffect::transform(Color c) const noexcept {
 
 PremultipliedColorU8 ColorEffect::transform_pixel(PremultipliedColorU8 p) const noexcept {
     if (!is_active()) return p;
-    if (transfer == ColorTransfer::None && !has_blend && has_matrix) {
+    if (!is_extended() && transfer == ColorTransfer::None && !has_blend && has_matrix) {
         return matrix.transform_pixel(p);
     }
     PremultipliedColor pm(
@@ -101,7 +305,7 @@ PremultipliedColorU8 ColorEffect::transform_pixel(PremultipliedColorU8 p) const 
 
 void ColorEffect::apply(PixmapMut& pixmap) const noexcept {
     if (!is_active()) return;
-    if (has_matrix && transfer == ColorTransfer::None && !has_blend) {
+    if (!is_extended() && has_matrix && transfer == ColorTransfer::None && !has_blend) {
         matrix.apply(pixmap);
         return;
     }

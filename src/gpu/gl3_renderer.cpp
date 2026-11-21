@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <unordered_map>
 #include <vector>
 #include <cstddef>
 
@@ -361,6 +362,65 @@ struct GL3Renderer::Impl {
 	GLint locBlurRadius{-1};
 	GLint locBlurSigma{-1};
 	GLint locBlurUvBounds{-1};
+	GLShader filterBlendShader;
+	GLint locFilterBlendSrc{-1};
+	GLint locFilterBlendDst{-1};
+	GLint locFilterBlendMode{-1};
+	GLint locFilterBlendOffset{-1};
+	GLint locFilterBlendColor{-1};
+	GLint locFilterBlendRoiUv{-1};
+	GLint locFilterBlendCropUv{-1};
+	GLShader filterColorShader;
+	GLint locFilterColorSrc{-1};
+	GLint locFilterColorHasMat{-1};
+	GLint locFilterColorMat0{-1};
+	GLint locFilterColorMat1{-1};
+	GLint locFilterColorMat2{-1};
+	GLint locFilterColorMat3{-1};
+	GLint locFilterColorMatBias{-1};
+	GLint locFilterColorTransfer{-1};
+	GLint locFilterColorHasBlend{-1};
+	GLint locFilterColorBlendMode{-1};
+	GLint locFilterColorBlendCol{-1};
+	GLint locFilterColorRoiUv{-1};
+	GLint locFilterColorCropUv{-1};
+	GLint locFilterColorExtKind{-1};
+	GLint locFilterColorHcParams{-1};
+	GLint locFilterColorLut{-1};
+	GLShader filterOpsShader;
+	GLint locFilterOpsSrc{-1};
+	GLint locFilterOpsSrc2{-1};
+	GLint locFilterOpsRoiDev{-1};
+	GLint locFilterOpsCropDev{-1};
+	GLint locFilterOpsFbSize{-1};
+	GLint locFilterOpsP0{-1};
+	GLint locFilterOpsP1{-1};
+	GLint locFilterOpsP2{-1};
+	GLint locFilterOpsP3{-1};
+	GLint locFilterOpsP4{-1};
+	GLint locFilterOpsI0{-1};
+	GLint locFilterOpsKernel{-1};
+	struct RuntimeFilterProg {
+		GLShader shader{};
+		GLint locInputTex{-1};
+		GLint locFbSize{-1};
+		GLint locLayerMat0{-1};
+		GLint locLayerMat1{-1};
+		GLint locInvLayerMat0{-1};
+		GLint locInvLayerMat1{-1};
+		GLint locRoiUv{-1};
+		GLint locCropUv{-1};
+		std::vector<GLint> userUniformLocs{};
+	};
+	std::unordered_map<uint64_t, RuntimeFilterProg> runtimeFilterCache;
+	struct RuntimeBlenderProg {
+		GLShader shader{};
+		GLint locSrcTex{-1};
+		GLint locDstTex{-1};
+		GLint locOpacity{-1};
+		std::vector<GLint> userUniformLocs{};
+	};
+	std::unordered_map<uint64_t, RuntimeBlenderProg> runtimeBlenderCache;
 	GLuint blurTierFbo[3][2]{{0, 0}, {0, 0}, {0, 0}};
 	GLuint blurTierTex[3][2]{{0, 0}, {0, 0}, {0, 0}};
 	int blurTierW[3]{0, 0, 0};
@@ -1615,7 +1675,13 @@ struct GL3Renderer::Impl {
 		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 		glClearStencil(0);
 		if (layer.hasBounds) {
-			const float maxBlur = std::max(layer.postBlurSigmaX, layer.postBlurSigmaY);
+			float maxBlur = std::max(layer.postBlurSigmaX, layer.postBlurSigmaY);
+			if (layer.imageFilter.has_value()) {
+				maxBlur = std::max(maxBlur, layer.imageFilter->max_sigma());
+			}
+			if (layer.maskFilter.has_value() && layer.maskFilter->is_active()) {
+				maxBlur = std::max(maxBlur, layer.maskFilter->sigma);
+			}
 			const int cPad = (maxBlur > 0.001f) ? (static_cast<int>(std::ceil(maxBlur * 3.0f)) + 8) : 4;
 			const int cx0 = std::clamp(roiX0 - cPad, 0, fbW);
 			const int cy0 = std::clamp(roiY0 - cPad, 0, fbH);
@@ -1662,11 +1728,1024 @@ struct GL3Renderer::Impl {
 		enableStencil(false);
 	}
 
+	void computeFilterCropUv(const std::optional<nisaba::Rect>& cropRect,
+	                         const Transform2D& layerXform,
+	                         int fbW, int fbH,
+	                         float outUv[4]) const noexcept {
+		if (!cropRect.has_value() || fbW <= 0 || fbH <= 0 || view[0] <= 0.0f || view[1] <= 0.0f) {
+			outUv[0] = -1.0f; outUv[1] = -1.0f; outUv[2] = 2.0f; outUv[3] = 2.0f;
+			return;
+		}
+		const nisaba::Transform ts = static_cast<nisaba::Transform>(layerXform);
+		auto devCrop = cropRect->transform(ts);
+		if (!devCrop.has_value()) {
+			outUv[0] = 2.0f; outUv[1] = 2.0f; outUv[2] = -1.0f; outUv[3] = -1.0f;
+			return;
+		}
+		const float sx = static_cast<float>(fbW) / view[0];
+		const float sy = static_cast<float>(fbH) / view[1];
+		const float px0 = std::floor(devCrop->left() * sx);
+		const float px1 = std::ceil(devCrop->right() * sx);
+		const float topY = std::floor(devCrop->top() * sy);
+		const float botY = std::ceil(devCrop->bottom() * sy);
+		const float glY0 = static_cast<float>(fbH) - botY;
+		const float glY1 = static_cast<float>(fbH) - topY;
+		outUv[0] = px0 / static_cast<float>(fbW);
+		outUv[1] = glY0 / static_cast<float>(fbH);
+		outUv[2] = px1 / static_cast<float>(fbW);
+		outUv[3] = glY1 / static_cast<float>(fbH);
+	}
+
+	void runFilterBlendPass(GLuint dstFbo, GLuint srcTex, GLuint dstTex,
+	                        int mode, float offU, float offV,
+	                        const Color& tintPremul,
+	                        const float roiUv[4], const float cropUv[4],
+	                        int fbW, int fbH, bool additiveSourceOver) {
+		glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+		glViewport(0, 0, fbW, fbH);
+		glDisable(GL_SCISSOR_TEST);
+		if (stencilEnabled) glDisable(GL_STENCIL_TEST);
+		glDisable(GL_CULL_FACE);
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+		if (additiveSourceOver) {
+			glEnable(GL_BLEND);
+			blendFuncSeparate(Blend{GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA});
+		} else {
+			glDisable(GL_BLEND);
+		}
+
+		useProgramCached(filterBlendShader.prog);
+		if (hasSamplerObjects) {
+			glBindSampler(0, 0);
+			glBindSampler(1, 0);
+			boundSampler = 0;
+		}
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, srcTex);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		if (dstTex != 0) {
+			glActiveTexture(GL_TEXTURE1);
+			glBindTexture(GL_TEXTURE_2D, dstTex);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		}
+		glActiveTexture(GL_TEXTURE0);
+		glUniform1i(locFilterBlendSrc, 0);
+		glUniform1i(locFilterBlendDst, 1);
+		glUniform1i(locFilterBlendMode, mode);
+		glUniform2f(locFilterBlendOffset, offU, offV);
+		glUniform4f(locFilterBlendColor, tintPremul.r, tintPremul.g, tintPremul.b, tintPremul.a);
+		glUniform4f(locFilterBlendRoiUv, roiUv[0], roiUv[1], roiUv[2], roiUv[3]);
+		glUniform4f(locFilterBlendCropUv, cropUv[0], cropUv[1], cropUv[2], cropUv[3]);
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+		boundTexture = 0;
+	}
+
+	void runFilterColorPass(GLuint dstFbo, GLuint srcTex,
+	                        const effects::ColorEffect& eff,
+	                        const float roiUv[4], const float cropUv[4],
+	                        int fbW, int fbH) {
+		glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+		glViewport(0, 0, fbW, fbH);
+		glDisable(GL_SCISSOR_TEST);
+		if (stencilEnabled) glDisable(GL_STENCIL_TEST);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_BLEND);
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+		useProgramCached(filterColorShader.prog);
+		if (hasSamplerObjects) {
+			glBindSampler(0, 0);
+			boundSampler = 0;
+		}
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, srcTex);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+		glUniform1i(locFilterColorSrc, 0);
+		int extKind = 0;
+		const auto* matPtr = &eff.matrix;
+		if (eff.is_extended()) {
+			const auto& en = *eff.ext_node;
+			if (en.kind == effects::ColorEffectExtKind::Table) {
+				extKind = 1;
+				int32_t packed[256];
+				for (int i = 0; i < 256; ++i) {
+					uint32_t w = static_cast<uint32_t>(en.lut_r[i]) |
+					             (static_cast<uint32_t>(en.lut_g[i]) << 8) |
+					             (static_cast<uint32_t>(en.lut_b[i]) << 16) |
+					             (static_cast<uint32_t>(en.lut_a[i]) << 24);
+					std::memcpy(&packed[i], &w, 4);
+				}
+				if (locFilterColorLut >= 0) glUniform4iv(locFilterColorLut, 64, packed);
+			} else if (en.kind == effects::ColorEffectExtKind::HslaMatrix) {
+				extKind = 2;
+				matPtr = &en.hsla_matrix;
+			} else if (en.kind == effects::ColorEffectExtKind::Luma) {
+				extKind = 3;
+			} else if (en.kind == effects::ColorEffectExtKind::HighContrast) {
+				extKind = 4;
+				if (locFilterColorHcParams >= 0) {
+					glUniform4f(locFilterColorHcParams,
+					            en.high_contrast.grayscale ? 1.0f : 0.0f,
+					            static_cast<float>(en.high_contrast.invert_style),
+					            en.high_contrast.contrast, 0.0f);
+				}
+			}
+		}
+		if (locFilterColorExtKind >= 0) glUniform1i(locFilterColorExtKind, extKind);
+		glUniform1i(locFilterColorHasMat, eff.has_matrix ? 1 : 0);
+		const auto& m = matPtr->m;
+		glUniform4f(locFilterColorMat0, m[0], m[1], m[2], m[3]);
+		glUniform4f(locFilterColorMat1, m[5], m[6], m[7], m[8]);
+		glUniform4f(locFilterColorMat2, m[10], m[11], m[12], m[13]);
+		glUniform4f(locFilterColorMat3, m[15], m[16], m[17], m[18]);
+		glUniform4f(locFilterColorMatBias, m[4], m[9], m[14], m[19]);
+		glUniform1i(locFilterColorTransfer, static_cast<int>(eff.transfer));
+		glUniform1i(locFilterColorHasBlend, eff.has_blend ? 1 : 0);
+		glUniform1i(locFilterColorBlendMode, eff.has_blend ? (static_cast<int>(eff.blend_mode) + 1) : 0);
+		const Color bc = Color(eff.blend_color).premultiplied();
+		glUniform4f(locFilterColorBlendCol, bc.r, bc.g, bc.b, bc.a);
+		glUniform4f(locFilterColorRoiUv, roiUv[0], roiUv[1], roiUv[2], roiUv[3]);
+		glUniform4f(locFilterColorCropUv, cropUv[0], cropUv[1], cropUv[2], cropUv[3]);
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+		boundTexture = 0;
+	}
+
+	int evalColorEffectDag(const effects::ColorEffect& eff,
+	                       int srcIdx, int fbW, int fbH,
+	                       const float roiUv[4], const float cropUv[4],
+	                       bool hasRoi, int roiX0, int roiY0, int roiX1, int roiY1) {
+		const float noCropUv[4] = {-1.0f, -1.0f, 2.0f, 2.0f};
+		auto acquireCleared = [&]() -> int {
+			const int idx = acquireLayerFbo(fbW, fbH);
+			glBindFramebuffer(GL_FRAMEBUFFER, layerPool[idx].fbo);
+			glDisable(GL_SCISSOR_TEST);
+			glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+			glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+			glClear(GL_COLOR_BUFFER_BIT);
+			return idx;
+		};
+		if (eff.is_extended()) {
+			const auto& en = *eff.ext_node;
+			if (en.kind == effects::ColorEffectExtKind::Compose) {
+				const int innerIdx = (en.child1 && en.child1->is_active())
+					? evalColorEffectDag(*en.child1, srcIdx, fbW, fbH, roiUv, noCropUv, hasRoi, roiX0, roiY0, roiX1, roiY1)
+					: srcIdx;
+				const int outIdx = (en.child0 && en.child0->is_active())
+					? evalColorEffectDag(*en.child0, innerIdx, fbW, fbH, roiUv, cropUv, hasRoi, roiX0, roiY0, roiX1, roiY1)
+					: innerIdx;
+				if (innerIdx != srcIdx && innerIdx != outIdx) layerPool[innerIdx].inUse = false;
+				return outIdx;
+			}
+			if (en.kind == effects::ColorEffectExtKind::Lerp) {
+				const int idx0 = (en.child0 && en.child0->is_active())
+					? evalColorEffectDag(*en.child0, srcIdx, fbW, fbH, roiUv, noCropUv, hasRoi, roiX0, roiY0, roiX1, roiY1)
+					: srcIdx;
+				const int idx1 = (en.child1 && en.child1->is_active())
+					? evalColorEffectDag(*en.child1, srcIdx, fbW, fbH, roiUv, noCropUv, hasRoi, roiX0, roiY0, roiX1, roiY1)
+					: srcIdx;
+				const int outIdx = acquireCleared();
+				FilterOpsParams p{};
+				p.roiDev[0] = hasRoi ? static_cast<float>(roiX0) : 0.0f;
+				p.roiDev[1] = hasRoi ? static_cast<float>(fbH - roiY1) : 0.0f;
+				p.roiDev[2] = hasRoi ? static_cast<float>(roiX1) : static_cast<float>(fbW);
+				p.roiDev[3] = hasRoi ? static_cast<float>(fbH - roiY0) : static_cast<float>(fbH);
+				p.cropDev[0] = cropUv[0] * static_cast<float>(fbW);
+				p.cropDev[1] = (1.0f - cropUv[3]) * static_cast<float>(fbH);
+				p.cropDev[2] = cropUv[2] * static_cast<float>(fbW);
+				p.cropDev[3] = (1.0f - cropUv[1]) * static_cast<float>(fbH);
+				p.fbSize[0] = static_cast<float>(fbW); p.fbSize[1] = static_cast<float>(fbH);
+				p.fbSize[2] = 1.0f / static_cast<float>(std::max(1, fbW));
+				p.fbSize[3] = 1.0f / static_cast<float>(std::max(1, fbH));
+				p.i0[0] = 6; p.i0[1] = 1;
+				p.p0[0] = 0.0f; p.p0[1] = en.lerp_t; p.p0[2] = 1.0f - en.lerp_t; p.p0[3] = 0.0f;
+				runFilterOpsPass(layerPool[outIdx].fbo, layerPool[idx1].colorTex, layerPool[idx0].colorTex, p, fbW, fbH);
+				if (idx0 != srcIdx) layerPool[idx0].inUse = false;
+				if (idx1 != srcIdx && idx1 != idx0) layerPool[idx1].inUse = false;
+				return outIdx;
+			}
+		}
+		const int outIdx = acquireCleared();
+		if (eff.is_active()) {
+			runFilterColorPass(layerPool[outIdx].fbo, layerPool[srcIdx].colorTex, eff, roiUv, cropUv, fbW, fbH);
+		} else {
+			runFilterBlendPass(layerPool[outIdx].fbo, layerPool[srcIdx].colorTex, 0,
+			                   0, 0.0f, 0.0f, Color(1, 1, 1, 1), roiUv, cropUv, fbW, fbH, false);
+		}
+		return outIdx;
+	}
+
+	RuntimeBlenderProg* getOrCreateRuntimeBlenderProg(const effects::RuntimeFilterSpec& spec) {
+		if (auto it = runtimeBlenderCache.find(spec.shader_hash); it != runtimeBlenderCache.end()) {
+			return (it->second.shader.prog != 0) ? &it->second : nullptr;
+		}
+		const bool isGles = detail::is_gles_or_webgl();
+		const char* header = isGles
+			? "#version 300 es\nprecision highp float;\nprecision highp int;\n"
+			: "#version 150 core\n";
+		static const char* rbVert =
+			"out vec2 vUv;\n"
+			"void main(void) {\n"
+			"	vec2 pos = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);\n"
+			"	vUv = 0.5 * pos + vec2(0.5);\n"
+			"	gl_Position = vec4(pos, 0.0, 1.0);\n"
+			"}\n";
+		std::string frag;
+		frag.reserve(spec.transformed_glsl.size() + 1024);
+		frag +=
+			"in vec2 vUv;\n"
+			"out vec4 outColor;\n"
+			"uniform sampler2D uSrcTex;\n"
+			"uniform sampler2D uDstTex;\n"
+			"uniform float uOpacity;\n"
+			"float saturate(float x) { return clamp(x, 0.0, 1.0); }\n"
+			"vec2 saturate(vec2 x) { return clamp(x, 0.0, 1.0); }\n"
+			"vec3 saturate(vec3 x) { return clamp(x, 0.0, 1.0); }\n"
+			"vec4 saturate(vec4 x) { return clamp(x, 0.0, 1.0); }\n"
+			"vec4 unpremul(vec4 c) { return vec4(c.a > 0.0001 ? c.rgb / c.a : vec3(0.0), c.a); }\n";
+		frag += spec.transformed_glsl;
+		frag +=
+			"\nvoid main(void) {\n"
+			"	vec4 src = texture(uSrcTex, vUv) * uOpacity;\n"
+			"	vec4 dst = texture(uDstTex, vUv);\n"
+			"	vec4 c = user_main(src, dst);\n"
+			"	float a = clamp(c.a, 0.0, 1.0);\n"
+			"	outColor = vec4(clamp(c.rgb, vec3(0.0), vec3(a)), a);\n"
+			"}\n";
+		RuntimeBlenderProg entry{};
+		if (createShader(entry.shader, "runtime_blender_shader", header, nullptr, rbVert, frag.c_str())) {
+			const GLuint p = entry.shader.prog;
+			entry.locSrcTex = glGetUniformLocation(p, "uSrcTex");
+			entry.locDstTex = glGetUniformLocation(p, "uDstTex");
+			entry.locOpacity = glGetUniformLocation(p, "uOpacity");
+			entry.userUniformLocs.reserve(spec.uniforms.size());
+			for (const auto& u : spec.uniforms) {
+				entry.userUniformLocs.push_back(glGetUniformLocation(p, u.name.c_str()));
+			}
+		}
+		auto [insIt, _] = runtimeBlenderCache.emplace(spec.shader_hash, std::move(entry));
+		return (insIt->second.shader.prog != 0) ? &insIt->second : nullptr;
+	}
+
+	void runFilterRuntimeBlenderPass(GLuint dstFbo, GLuint srcTex, GLuint bgTex,
+	                                 const effects::RuntimeFilterSpec& spec,
+	                                 float opacity, int fbW, int fbH) {
+		RuntimeBlenderProg* rbp = getOrCreateRuntimeBlenderProg(spec);
+		if (!rbp) return;
+		glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+		glViewport(0, 0, fbW, fbH);
+		glDisable(GL_SCISSOR_TEST);
+		glDisable(GL_STENCIL_TEST);
+		stencilEnabled = false;
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_BLEND);
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+		useProgramCached(rbp->shader.prog);
+		if (hasSamplerObjects) {
+			glBindSampler(0, 0);
+			glBindSampler(1, 0);
+			boundSampler = 0;
+		}
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, srcTex);
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, bgTex);
+		glActiveTexture(GL_TEXTURE0);
+		if (rbp->locSrcTex >= 0) glUniform1i(rbp->locSrcTex, 0);
+		if (rbp->locDstTex >= 0) glUniform1i(rbp->locDstTex, 1);
+		if (rbp->locOpacity >= 0) glUniform1f(rbp->locOpacity, opacity);
+		for (size_t idx = 0; idx < spec.uniforms.size() && idx < rbp->userUniformLocs.size(); ++idx) {
+			const GLint loc = rbp->userUniformLocs[idx];
+			const auto& u = spec.uniforms[idx];
+			if (loc < 0 || u.offset + u.size_bytes > spec.uniform_data.size()) continue;
+			const uint8_t* ptr = spec.uniform_data.data() + u.offset;
+			switch (u.type) {
+				case effects::RuntimeUniformType::Float: glUniform1fv(loc, u.count, reinterpret_cast<const float*>(ptr)); break;
+				case effects::RuntimeUniformType::Float2: glUniform2fv(loc, u.count, reinterpret_cast<const float*>(ptr)); break;
+				case effects::RuntimeUniformType::Float3: glUniform3fv(loc, u.count, reinterpret_cast<const float*>(ptr)); break;
+				case effects::RuntimeUniformType::Float4: glUniform4fv(loc, u.count, reinterpret_cast<const float*>(ptr)); break;
+				case effects::RuntimeUniformType::Mat2: glUniformMatrix2fv(loc, u.count, GL_FALSE, reinterpret_cast<const float*>(ptr)); break;
+				case effects::RuntimeUniformType::Mat3: glUniformMatrix3fv(loc, u.count, GL_FALSE, reinterpret_cast<const float*>(ptr)); break;
+				case effects::RuntimeUniformType::Mat4: glUniformMatrix4fv(loc, u.count, GL_FALSE, reinterpret_cast<const float*>(ptr)); break;
+				case effects::RuntimeUniformType::Int: glUniform1iv(loc, u.count, reinterpret_cast<const int*>(ptr)); break;
+			}
+		}
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+		boundTexture = 0;
+	}
+
+	RuntimeFilterProg* getOrCreateRuntimeFilterProg(const effects::RuntimeFilterSpec& spec) {
+		auto it = runtimeFilterCache.find(spec.shader_hash);
+		if (it != runtimeFilterCache.end()) {
+			return (it->second.shader.prog != 0) ? &it->second : nullptr;
+		}
+
+		const bool isGles = detail::is_gles_or_webgl();
+		const char* header = isGles
+			? "#version 300 es\nprecision highp float;\nprecision highp int;\n"
+			: "#version 150 core\n";
+		static const char* rtVert =
+			"out vec2 vUv;\n"
+			"void main(void) {\n"
+			"	vec2 pos = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);\n"
+			"	vUv = 0.5 * pos + vec2(0.5);\n"
+			"	gl_Position = vec4(pos, 0.0, 1.0);\n"
+			"}\n";
+
+		std::string frag;
+		frag.reserve(spec.transformed_glsl.size() + 1536);
+		frag +=
+			"in vec2 vUv;\n"
+			"out vec4 outColor;\n"
+			"uniform sampler2D uInputTex;\n"
+			"uniform vec2 uFbSize;\n"
+			"uniform vec4 uLayerMat0;\n"
+			"uniform vec2 uLayerMat1;\n"
+			"uniform vec4 uInvLayerMat0;\n"
+			"uniform vec2 uInvLayerMat1;\n"
+			"uniform vec4 uRoiUv;\n"
+			"uniform vec4 uCropUv;\n"
+			"float saturate(float x) { return clamp(x, 0.0, 1.0); }\n"
+			"vec2 saturate(vec2 x) { return clamp(x, 0.0, 1.0); }\n"
+			"vec3 saturate(vec3 x) { return clamp(x, 0.0, 1.0); }\n"
+			"vec4 saturate(vec4 x) { return clamp(x, 0.0, 1.0); }\n"
+			"vec4 unpremul(vec4 c) { return vec4(c.a > 0.0001 ? c.rgb / c.a : vec3(0.0), c.a); }\n"
+			"float _nisaba_to_linear_ch(float c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }\n"
+			"vec3 toLinearSrgb(vec3 c) { return vec3(_nisaba_to_linear_ch(c.r), _nisaba_to_linear_ch(c.g), _nisaba_to_linear_ch(c.b)); }\n"
+			"vec4 toLinearSrgb(vec4 c) { return vec4(toLinearSrgb(c.rgb), c.a); }\n"
+			"float _nisaba_from_linear_ch(float c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(max(c, 0.0), 1.0 / 2.4) - 0.055; }\n"
+			"vec3 fromLinearSrgb(vec3 c) { return vec3(_nisaba_from_linear_ch(c.r), _nisaba_from_linear_ch(c.g), _nisaba_from_linear_ch(c.b)); }\n"
+			"vec4 fromLinearSrgb(vec4 c) { return vec4(fromLinearSrgb(c.rgb), c.a); }\n"
+			"vec4 _nisaba_sample_input(vec2 lp) {\n"
+			"	vec2 dp = vec2(uLayerMat0.x * lp.x + uLayerMat0.z * lp.y + uLayerMat1.x,\n"
+			"	               uLayerMat0.y * lp.x + uLayerMat0.w * lp.y + uLayerMat1.y);\n"
+			"	vec2 uv = vec2(dp.x / uFbSize.x, 1.0 - dp.y / uFbSize.y);\n"
+			"	if (uv.x < uRoiUv.x || uv.x > uRoiUv.z || uv.y < uRoiUv.y || uv.y > uRoiUv.w) return vec4(0.0);\n"
+			"	return texture(uInputTex, uv);\n"
+			"}\n";
+		for (const auto& ch : spec.children) {
+			const std::string fn = "__nisaba_child_eval_" + std::to_string(ch.index);
+			if (spec.has_input_child && ch.index == spec.input_child_index) {
+				frag += "vec4 " + fn + "(vec2 p) { return _nisaba_sample_input(p); }\n";
+				frag += "vec4 " + fn + "(vec2 p, vec4 c) { return _nisaba_sample_input(p); }\n";
+			} else {
+				frag += "vec4 " + fn + "(vec2 p) { return vec4(0.0); }\n";
+				frag += "vec4 " + fn + "(vec2 p, vec4 c) { return vec4(0.0); }\n";
+			}
+		}
+		frag += spec.transformed_glsl;
+		frag +=
+			"\nvoid main(void) {\n"
+			"	if (vUv.x < uCropUv.x || vUv.x > uCropUv.z || vUv.y < uCropUv.y || vUv.y > uCropUv.w) {\n"
+			"		outColor = vec4(0.0);\n"
+			"		return;\n"
+			"	}\n"
+			"	vec2 devPos = vec2(vUv.x * uFbSize.x, (1.0 - vUv.y) * uFbSize.y);\n"
+			"	vec2 localPos = vec2(uInvLayerMat0.x * devPos.x + uInvLayerMat0.z * devPos.y + uInvLayerMat1.x,\n"
+			"	                     uInvLayerMat0.y * devPos.x + uInvLayerMat0.w * devPos.y + uInvLayerMat1.y);\n";
+		if (spec.has_color_in) {
+			frag += "	vec4 c = user_main(localPos, vec4(1.0));\n";
+		} else {
+			frag += "	vec4 c = user_main(localPos);\n";
+		}
+		frag +=
+			"	float a = clamp(c.a, 0.0, 1.0);\n"
+			"	outColor = vec4(clamp(c.rgb, vec3(0.0), vec3(a)), a);\n"
+			"}\n";
+
+		RuntimeFilterProg entry{};
+		if (createShader(entry.shader, "runtime_filter_shader", header, nullptr, rtVert, frag.c_str())) {
+			const GLuint p = entry.shader.prog;
+			entry.locInputTex = glGetUniformLocation(p, "uInputTex");
+			entry.locFbSize = glGetUniformLocation(p, "uFbSize");
+			entry.locLayerMat0 = glGetUniformLocation(p, "uLayerMat0");
+			entry.locLayerMat1 = glGetUniformLocation(p, "uLayerMat1");
+			entry.locInvLayerMat0 = glGetUniformLocation(p, "uInvLayerMat0");
+			entry.locInvLayerMat1 = glGetUniformLocation(p, "uInvLayerMat1");
+			entry.locRoiUv = glGetUniformLocation(p, "uRoiUv");
+			entry.locCropUv = glGetUniformLocation(p, "uCropUv");
+			entry.userUniformLocs.reserve(spec.uniforms.size());
+			for (const auto& u : spec.uniforms) {
+				entry.userUniformLocs.push_back(glGetUniformLocation(p, u.name.c_str()));
+			}
+		}
+		auto [insIt, _] = runtimeFilterCache.emplace(spec.shader_hash, std::move(entry));
+		return (insIt->second.shader.prog != 0) ? &insIt->second : nullptr;
+	}
+
+	void runFilterRuntimePass(GLuint dstFbo, GLuint srcTex,
+	                          const effects::RuntimeFilterSpec& spec,
+	                          const Transform2D& layerXform,
+	                          const float roiUv[4], const float cropUv[4],
+	                          int fbW, int fbH) {
+		RuntimeFilterProg* rfp = getOrCreateRuntimeFilterProg(spec);
+		if (!rfp) return;
+
+		glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+		glViewport(0, 0, fbW, fbH);
+		glDisable(GL_SCISSOR_TEST);
+		glDisable(GL_STENCIL_TEST);
+		stencilEnabled = false;
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_BLEND);
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+		useProgramCached(rfp->shader.prog);
+		if (hasSamplerObjects) {
+			glBindSampler(0, 0);
+			boundSampler = 0;
+		}
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, srcTex);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+		const float sxDev = (view[0] > 0.0f) ? (static_cast<float>(fbW) / view[0]) : 1.0f;
+		const float syDev = (view[1] > 0.0f) ? (static_cast<float>(fbH) / view[1]) : 1.0f;
+		const auto& m = layerXform.m;
+		const float a = m[0] * sxDev, b = m[1] * syDev;
+		const float c = m[2] * sxDev, d = m[3] * syDev;
+		const float tx = m[4] * sxDev, ty = m[5] * syDev;
+		const float det = a * d - b * c;
+		float ia = 1.0f, ib = 0.0f, ic = 0.0f, id = 1.0f, itx = 0.0f, ity = 0.0f;
+		if (std::abs(det) > 1e-8f) {
+			const float invD = 1.0f / det;
+			ia = d * invD; ib = -b * invD; ic = -c * invD; id = a * invD;
+			itx = (c * ty - d * tx) * invD;
+			ity = (b * tx - a * ty) * invD;
+		}
+
+		if (rfp->locInputTex >= 0) glUniform1i(rfp->locInputTex, 0);
+		if (rfp->locFbSize >= 0) glUniform2f(rfp->locFbSize, static_cast<float>(fbW), static_cast<float>(fbH));
+		if (rfp->locLayerMat0 >= 0) glUniform4f(rfp->locLayerMat0, a, b, c, d);
+		if (rfp->locLayerMat1 >= 0) glUniform2f(rfp->locLayerMat1, tx, ty);
+		if (rfp->locInvLayerMat0 >= 0) glUniform4f(rfp->locInvLayerMat0, ia, ib, ic, id);
+		if (rfp->locInvLayerMat1 >= 0) glUniform2f(rfp->locInvLayerMat1, itx, ity);
+		if (rfp->locRoiUv >= 0) glUniform4f(rfp->locRoiUv, roiUv[0], roiUv[1], roiUv[2], roiUv[3]);
+		if (rfp->locCropUv >= 0) glUniform4f(rfp->locCropUv, cropUv[0], cropUv[1], cropUv[2], cropUv[3]);
+
+		for (size_t idx = 0; idx < spec.uniforms.size() && idx < rfp->userUniformLocs.size(); ++idx) {
+			const GLint loc = rfp->userUniformLocs[idx];
+			const auto& u = spec.uniforms[idx];
+			if (loc < 0 || u.offset + u.size_bytes > spec.uniform_data.size()) continue;
+			const uint8_t* ptr = spec.uniform_data.data() + u.offset;
+			switch (u.type) {
+				case effects::RuntimeUniformType::Float:
+					glUniform1fv(loc, u.count, reinterpret_cast<const float*>(ptr));
+					break;
+				case effects::RuntimeUniformType::Float2:
+					glUniform2fv(loc, u.count, reinterpret_cast<const float*>(ptr));
+					break;
+				case effects::RuntimeUniformType::Float3:
+					glUniform3fv(loc, u.count, reinterpret_cast<const float*>(ptr));
+					break;
+				case effects::RuntimeUniformType::Float4:
+					glUniform4fv(loc, u.count, reinterpret_cast<const float*>(ptr));
+					break;
+				case effects::RuntimeUniformType::Mat2:
+					glUniformMatrix2fv(loc, u.count, GL_FALSE, reinterpret_cast<const float*>(ptr));
+					break;
+				case effects::RuntimeUniformType::Mat3:
+					glUniformMatrix3fv(loc, u.count, GL_FALSE, reinterpret_cast<const float*>(ptr));
+					break;
+				case effects::RuntimeUniformType::Mat4:
+					glUniformMatrix4fv(loc, u.count, GL_FALSE, reinterpret_cast<const float*>(ptr));
+					break;
+				case effects::RuntimeUniformType::Int:
+					glUniform1iv(loc, u.count, reinterpret_cast<const int*>(ptr));
+					break;
+			}
+		}
+
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+		boundTexture = 0;
+	}
+
+	struct FilterOpsParams {
+		float roiDev[4]{};
+		float cropDev[4]{-1e6f, -1e6f, 1e6f, 1e6f};
+		float fbSize[4]{};
+		float p0[4]{};
+		float p1[4]{};
+		float p2[4]{};
+		float p3[4]{};
+		float p4[4]{};
+		int32_t i0[4]{};
+		float kernel[28]{};
+	};
+
+	void computeFilterCropDev(const std::optional<nisaba::Rect>& cropRect,
+	                          const Transform2D& layerXform,
+	                          int fbW, int fbH,
+	                          float outDev[4]) const noexcept {
+		if (!cropRect.has_value() || fbW <= 0 || fbH <= 0 || view[0] <= 0.0f || view[1] <= 0.0f) {
+			outDev[0] = -1e6f; outDev[1] = -1e6f; outDev[2] = 1e6f; outDev[3] = 1e6f;
+			return;
+		}
+		const nisaba::Transform ts = static_cast<nisaba::Transform>(layerXform);
+		auto devCrop = cropRect->transform(ts);
+		if (!devCrop.has_value()) {
+			outDev[0] = 1e6f; outDev[1] = 1e6f; outDev[2] = -1e6f; outDev[3] = -1e6f;
+			return;
+		}
+		const float sx = static_cast<float>(fbW) / view[0];
+		const float sy = static_cast<float>(fbH) / view[1];
+		outDev[0] = std::floor(devCrop->left() * sx);
+		outDev[1] = std::floor(devCrop->top() * sy);
+		outDev[2] = std::ceil(devCrop->right() * sx);
+		outDev[3] = std::ceil(devCrop->bottom() * sy);
+	}
+
+	void runFilterOpsPass(GLuint dstFbo, GLuint srcTex, GLuint src2Tex,
+	                      const FilterOpsParams& params, int fbW, int fbH) {
+		if (filterOpsShader.prog == 0) return;
+		glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+		glViewport(0, 0, fbW, fbH);
+		glDisable(GL_SCISSOR_TEST);
+		glDisable(GL_STENCIL_TEST);
+		stencilEnabled = false;
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_BLEND);
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+		useProgramCached(filterOpsShader.prog);
+		if (hasSamplerObjects) {
+			glBindSampler(0, 0);
+			glBindSampler(1, 0);
+			boundSampler = 0;
+		}
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, srcTex);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, src2Tex != 0 ? src2Tex : srcTex);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glActiveTexture(GL_TEXTURE0);
+
+		if (locFilterOpsSrc >= 0) glUniform1i(locFilterOpsSrc, 0);
+		if (locFilterOpsSrc2 >= 0) glUniform1i(locFilterOpsSrc2, 1);
+		if (locFilterOpsRoiDev >= 0) glUniform4fv(locFilterOpsRoiDev, 1, params.roiDev);
+		if (locFilterOpsCropDev >= 0) glUniform4fv(locFilterOpsCropDev, 1, params.cropDev);
+		if (locFilterOpsFbSize >= 0) glUniform4fv(locFilterOpsFbSize, 1, params.fbSize);
+		if (locFilterOpsP0 >= 0) glUniform4fv(locFilterOpsP0, 1, params.p0);
+		if (locFilterOpsP1 >= 0) glUniform4fv(locFilterOpsP1, 1, params.p1);
+		if (locFilterOpsP2 >= 0) glUniform4fv(locFilterOpsP2, 1, params.p2);
+		if (locFilterOpsP3 >= 0) glUniform4fv(locFilterOpsP3, 1, params.p3);
+		if (locFilterOpsP4 >= 0) glUniform4fv(locFilterOpsP4, 1, params.p4);
+		if (locFilterOpsI0 >= 0) glUniform4iv(locFilterOpsI0, 1, params.i0);
+		if (locFilterOpsKernel >= 0) glUniform4fv(locFilterOpsKernel, 7, params.kernel);
+
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+		boundTexture = 0;
+	}
+
+	int evalImageFilterDag(const effects::ImageFilterNode* node,
+	                       int currentSrcPoolIdx,
+	                       int fbW, int fbH,
+	                       const LayerDesc& desc,
+	                       bool hasRoi,
+	                       int roiX0, int roiY0, int roiX1, int roiY1) {
+		if (!node || node->kind == effects::ImageFilterKind::None) {
+			return currentSrcPoolIdx;
+		}
+		if (filterBlendShader.prog == 0 || filterColorShader.prog == 0) {
+			return currentSrcPoolIdx;
+		}
+
+		const float invW = 1.0f / static_cast<float>(std::max(1, fbW));
+		const float invH = 1.0f / static_cast<float>(std::max(1, fbH));
+		const float roiUv[4] = {
+			hasRoi ? (static_cast<float>(roiX0) * invW) : 0.0f,
+			hasRoi ? (static_cast<float>(roiY0) * invH) : 0.0f,
+			hasRoi ? (static_cast<float>(roiX1) * invW) : 1.0f,
+			hasRoi ? (static_cast<float>(roiY1) * invH) : 1.0f
+		};
+		const float noCropUv[4] = {-1.0f, -1.0f, 2.0f, 2.0f};
+		float cropUv[4];
+		computeFilterCropUv(node->crop_rect, desc.layerTransform, fbW, fbH, cropUv);
+
+		const float sxDev = (view[0] > 0.0f) ? (static_cast<float>(fbW) / view[0]) : 1.0f;
+		const float syDev = (view[1] > 0.0f) ? (static_cast<float>(fbH) / view[1]) : 1.0f;
+		const auto& m = desc.layerTransform.m;
+		const float scaleX = std::hypot(m[0], m[1]) * sxDev;
+		const float scaleY = std::hypot(m[2], m[3]) * syDev;
+
+		auto acquireClearedFbo = [&]() -> int {
+			const int idx = acquireLayerFbo(fbW, fbH);
+			glBindFramebuffer(GL_FRAMEBUFFER, layerPool[idx].fbo);
+			glDisable(GL_SCISSOR_TEST);
+			glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+			glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+			glClear(GL_COLOR_BUFFER_BIT);
+			return idx;
+		};
+
+		auto releaseTemp = [&](int idx) {
+			if (idx >= 0 && idx != currentSrcPoolIdx) {
+				layerPool[idx].inUse = false;
+			}
+		};
+
+		auto evalChild = [&](size_t idx) -> int {
+			if (idx < node->inputs.size() && node->inputs[idx]) {
+				return evalImageFilterDag(node->inputs[idx].get(), currentSrcPoolIdx,
+				                          fbW, fbH, desc, hasRoi, roiX0, roiY0, roiX1, roiY1);
+			}
+			return currentSrcPoolIdx;
+		};
+
+		switch (node->kind) {
+			case effects::ImageFilterKind::None:
+				return currentSrcPoolIdx;
+
+			case effects::ImageFilterKind::Blur: {
+				const int inIdx = evalChild(0);
+				const float effSx = node->sigma_x * scaleX;
+				const float effSy = node->sigma_y * scaleY;
+				GLuint blurredTex = layerPool[inIdx].colorTex;
+				if (effSx > 0.001f || effSy > 0.001f) {
+					BlurResult br = gaussianBlurToFbo(
+						layerPool[inIdx].fbo, layerPool[inIdx].colorTex,
+						fbW, fbH, effSx, effSy,
+						hasRoi, roiX0, roiY0, roiX1, roiY1);
+					if (br.tex != 0) blurredTex = br.tex;
+				}
+				const int outIdx = acquireClearedFbo();
+				runFilterBlendPass(layerPool[outIdx].fbo, blurredTex, 0,
+				                   0, 0.0f, 0.0f, Color(1, 1, 1, 1),
+				                   roiUv, cropUv, fbW, fbH, false);
+				releaseTemp(inIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::DropShadow: {
+				const int fgIdx = evalChild(0);
+				const int tintIdx = acquireClearedFbo();
+				const Color sc = Color(node->color).premultiplied();
+				runFilterBlendPass(layerPool[tintIdx].fbo, layerPool[fgIdx].colorTex, 0,
+				                   -1, 0.0f, 0.0f, sc,
+				                   roiUv, noCropUv, fbW, fbH, false);
+				const float effSx = node->sigma_x * scaleX;
+				const float effSy = node->sigma_y * scaleY;
+				GLuint shTex = layerPool[tintIdx].colorTex;
+				if (effSx > 0.001f || effSy > 0.001f) {
+					BlurResult br = gaussianBlurToFbo(
+						layerPool[tintIdx].fbo, layerPool[tintIdx].colorTex,
+						fbW, fbH, effSx, effSy,
+						hasRoi, roiX0, roiY0, roiX1, roiY1);
+					if (br.tex != 0) shTex = br.tex;
+				}
+				const float effDx = (node->dx * m[0] + node->dy * m[2]) * sxDev;
+				const float effDy = (node->dx * m[1] + node->dy * m[3]) * syDev;
+				const int outIdx = acquireClearedFbo();
+				runFilterBlendPass(layerPool[outIdx].fbo, shTex, 0,
+				                   0, -effDx * invW, effDy * invH, Color(1, 1, 1, 1),
+				                   roiUv, cropUv, fbW, fbH, false);
+				if (!node->shadow_only) {
+					runFilterBlendPass(layerPool[outIdx].fbo, layerPool[fgIdx].colorTex, 0,
+					                   0, 0.0f, 0.0f, Color(1, 1, 1, 1),
+					                   roiUv, cropUv, fbW, fbH, true);
+				}
+				releaseTemp(tintIdx);
+				releaseTemp(fgIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::Offset: {
+				const int inIdx = evalChild(0);
+				const float effDx = (node->dx * m[0] + node->dy * m[2]) * sxDev;
+				const float effDy = (node->dx * m[1] + node->dy * m[3]) * syDev;
+				const int outIdx = acquireClearedFbo();
+				runFilterBlendPass(layerPool[outIdx].fbo, layerPool[inIdx].colorTex, 0,
+				                   0, -effDx * invW, effDy * invH, Color(1, 1, 1, 1),
+				                   roiUv, cropUv, fbW, fbH, false);
+				releaseTemp(inIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::ColorFilter: {
+				const int inIdx = evalChild(0);
+				const int outIdx = evalColorEffectDag(node->color_effect, inIdx, fbW, fbH,
+				                                      roiUv, cropUv, hasRoi, roiX0, roiY0, roiX1, roiY1);
+				if (outIdx != inIdx) releaseTemp(inIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::Compose: {
+				const int innerIdx = (node->inputs.size() >= 2 && node->inputs[1])
+					? evalImageFilterDag(node->inputs[1].get(), currentSrcPoolIdx,
+					                     fbW, fbH, desc, hasRoi, roiX0, roiY0, roiX1, roiY1)
+					: currentSrcPoolIdx;
+				int outIdx = (node->inputs.size() >= 1 && node->inputs[0])
+					? evalImageFilterDag(node->inputs[0].get(), innerIdx,
+					                     fbW, fbH, desc, hasRoi, roiX0, roiY0, roiX1, roiY1)
+					: innerIdx;
+				if (innerIdx != outIdx) {
+					releaseTemp(innerIdx);
+				}
+				if (node->crop_rect.has_value()) {
+					const int croppedIdx = acquireClearedFbo();
+					runFilterBlendPass(layerPool[croppedIdx].fbo, layerPool[outIdx].colorTex, 0,
+					                   0, 0.0f, 0.0f, Color(1, 1, 1, 1),
+					                   roiUv, cropUv, fbW, fbH, false);
+					releaseTemp(outIdx);
+					outIdx = croppedIdx;
+				}
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::Merge: {
+				const int outIdx = acquireClearedFbo();
+				for (size_t i = 0; i < node->inputs.size(); ++i) {
+					const int childIdx = evalChild(i);
+					runFilterBlendPass(layerPool[outIdx].fbo, layerPool[childIdx].colorTex, 0,
+					                   0, 0.0f, 0.0f, Color(1, 1, 1, 1),
+					                   roiUv, cropUv, fbW, fbH, true);
+					releaseTemp(childIdx);
+				}
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::Blend: {
+				const int bgIdx = evalChild(0);
+				const int fgIdx = evalChild(1);
+				const int outIdx = acquireClearedFbo();
+				runFilterBlendPass(layerPool[outIdx].fbo,
+				                   layerPool[fgIdx].colorTex,
+				                   layerPool[bgIdx].colorTex,
+				                   static_cast<int>(node->blend_mode) + 1,
+				                   0.0f, 0.0f, Color(1, 1, 1, 1),
+				                   roiUv, cropUv, fbW, fbH, false);
+				if (fgIdx != bgIdx) {
+					releaseTemp(fgIdx);
+				}
+				releaseTemp(bgIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::RuntimeShader: {
+				const int inIdx = evalChild(0);
+				if (!node->runtime_spec) return inIdx;
+				const int outIdx = acquireClearedFbo();
+				runFilterRuntimePass(layerPool[outIdx].fbo, layerPool[inIdx].colorTex,
+				                     *node->runtime_spec, desc.layerTransform,
+				                     roiUv, cropUv, fbW, fbH);
+				releaseTemp(inIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::Dilate:
+			case effects::ImageFilterKind::Erode: {
+				const int inIdx = evalChild(0);
+				const int op = (node->kind == effects::ImageFilterKind::Dilate) ? 1 : 2;
+				const int rx = std::clamp(static_cast<int>(std::round(node->sigma_x * scaleX)), 0, 64);
+				const int ry = std::clamp(static_cast<int>(std::round(node->sigma_y * scaleY)), 0, 64);
+				FilterOpsParams p{};
+				p.roiDev[0] = hasRoi ? static_cast<float>(roiX0) : 0.0f;
+				p.roiDev[1] = hasRoi ? static_cast<float>(fbH - roiY1) : 0.0f;
+				p.roiDev[2] = hasRoi ? static_cast<float>(roiX1) : static_cast<float>(fbW);
+				p.roiDev[3] = hasRoi ? static_cast<float>(fbH - roiY0) : static_cast<float>(fbH);
+				p.fbSize[0] = static_cast<float>(fbW); p.fbSize[1] = static_cast<float>(fbH);
+				p.fbSize[2] = invW; p.fbSize[3] = invH;
+				// Horizontal pass (uncropped)
+				const int tmpIdx = acquireClearedFbo();
+				p.i0[0] = op; p.i0[1] = rx;
+				p.p0[0] = 1.0f; p.p0[1] = 0.0f;
+				runFilterOpsPass(layerPool[tmpIdx].fbo, layerPool[inIdx].colorTex, 0, p, fbW, fbH);
+				// Vertical pass (cropped)
+				const int outIdx = acquireClearedFbo();
+				computeFilterCropDev(node->crop_rect, desc.layerTransform, fbW, fbH, p.cropDev);
+				p.i0[1] = ry;
+				p.p0[0] = 0.0f; p.p0[1] = 1.0f;
+				runFilterOpsPass(layerPool[outIdx].fbo, layerPool[tmpIdx].colorTex, 0, p, fbW, fbH);
+				releaseTemp(tmpIdx);
+				releaseTemp(inIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::MatrixConvolution: {
+				const int inIdx = evalChild(0);
+				const int outIdx = acquireClearedFbo();
+				FilterOpsParams p{};
+				p.roiDev[0] = hasRoi ? static_cast<float>(roiX0) : 0.0f;
+				p.roiDev[1] = hasRoi ? static_cast<float>(fbH - roiY1) : 0.0f;
+				p.roiDev[2] = hasRoi ? static_cast<float>(roiX1) : static_cast<float>(fbW);
+				p.roiDev[3] = hasRoi ? static_cast<float>(fbH - roiY0) : static_cast<float>(fbH);
+				computeFilterCropDev(node->crop_rect, desc.layerTransform, fbW, fbH, p.cropDev);
+				p.fbSize[0] = static_cast<float>(fbW); p.fbSize[1] = static_cast<float>(fbH);
+				p.fbSize[2] = invW; p.fbSize[3] = invH;
+				p.i0[0] = 3;
+				p.i0[1] = std::clamp(node->kernel_w, 1, 5);
+				p.i0[2] = std::clamp(node->kernel_h, 1, 5);
+				p.i0[3] = static_cast<int32_t>(node->tile_mode);
+				p.p0[0] = static_cast<float>(node->kernel_offset_x);
+				p.p0[1] = static_cast<float>(node->kernel_offset_y);
+				p.p0[2] = node->gain;
+				p.p0[3] = node->bias;
+				p.p1[0] = node->convolve_alpha ? 1.0f : 0.0f;
+				const size_t kn = std::min<size_t>(node->kernel.size(), 25);
+				for (size_t k = 0; k < kn; ++k) p.kernel[k] = node->kernel[k];
+				runFilterOpsPass(layerPool[outIdx].fbo, layerPool[inIdx].colorTex, 0, p, fbW, fbH);
+				releaseTemp(inIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::DisplacementMap: {
+				const int dispIdx = evalChild(0);
+				const int colIdx = evalChild(1);
+				const int outIdx = acquireClearedFbo();
+				FilterOpsParams p{};
+				p.roiDev[0] = hasRoi ? static_cast<float>(roiX0) : 0.0f;
+				p.roiDev[1] = hasRoi ? static_cast<float>(fbH - roiY1) : 0.0f;
+				p.roiDev[2] = hasRoi ? static_cast<float>(roiX1) : static_cast<float>(fbW);
+				p.roiDev[3] = hasRoi ? static_cast<float>(fbH - roiY0) : static_cast<float>(fbH);
+				computeFilterCropDev(node->crop_rect, desc.layerTransform, fbW, fbH, p.cropDev);
+				p.fbSize[0] = static_cast<float>(fbW); p.fbSize[1] = static_cast<float>(fbH);
+				p.fbSize[2] = invW; p.fbSize[3] = invH;
+				p.i0[0] = 4;
+				p.i0[1] = static_cast<int32_t>(node->x_channel);
+				p.i0[2] = static_cast<int32_t>(node->y_channel);
+				p.p0[0] = node->disp_scale * scaleX;
+				p.p0[1] = node->disp_scale * scaleY;
+				runFilterOpsPass(layerPool[outIdx].fbo, layerPool[colIdx].colorTex, layerPool[dispIdx].colorTex, p, fbW, fbH);
+				if (colIdx != dispIdx) releaseTemp(colIdx);
+				releaseTemp(dispIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::Magnifier: {
+				const int inIdx = evalChild(0);
+				const int outIdx = acquireClearedFbo();
+				FilterOpsParams p{};
+				p.roiDev[0] = hasRoi ? static_cast<float>(roiX0) : 0.0f;
+				p.roiDev[1] = hasRoi ? static_cast<float>(fbH - roiY1) : 0.0f;
+				p.roiDev[2] = hasRoi ? static_cast<float>(roiX1) : static_cast<float>(fbW);
+				p.roiDev[3] = hasRoi ? static_cast<float>(fbH - roiY0) : static_cast<float>(fbH);
+				computeFilterCropDev(node->crop_rect, desc.layerTransform, fbW, fbH, p.cropDev);
+				p.fbSize[0] = static_cast<float>(fbW); p.fbSize[1] = static_cast<float>(fbH);
+				p.fbSize[2] = invW; p.fbSize[3] = invH;
+				p.i0[0] = 5;
+				const nisaba::Transform ts = static_cast<nisaba::Transform>(desc.layerTransform);
+				if (auto dr = node->src_rect.transform(ts)) {
+					p.p0[0] = dr->left() * sxDev; p.p0[1] = dr->top() * syDev;
+					p.p0[2] = dr->right() * sxDev; p.p0[3] = dr->bottom() * syDev;
+				}
+				p.p1[0] = node->magnifier_inset * scaleX;
+				p.p1[1] = node->magnifier_inset * scaleY;
+				runFilterOpsPass(layerPool[outIdx].fbo, layerPool[inIdx].colorTex, 0, p, fbW, fbH);
+				releaseTemp(inIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::Arithmetic: {
+				const int bgIdx = evalChild(0);
+				const int fgIdx = evalChild(1);
+				const int outIdx = acquireClearedFbo();
+				FilterOpsParams p{};
+				p.roiDev[0] = hasRoi ? static_cast<float>(roiX0) : 0.0f;
+				p.roiDev[1] = hasRoi ? static_cast<float>(fbH - roiY1) : 0.0f;
+				p.roiDev[2] = hasRoi ? static_cast<float>(roiX1) : static_cast<float>(fbW);
+				p.roiDev[3] = hasRoi ? static_cast<float>(fbH - roiY0) : static_cast<float>(fbH);
+				computeFilterCropDev(node->crop_rect, desc.layerTransform, fbW, fbH, p.cropDev);
+				p.fbSize[0] = static_cast<float>(fbW); p.fbSize[1] = static_cast<float>(fbH);
+				p.fbSize[2] = invW; p.fbSize[3] = invH;
+				p.i0[0] = 6;
+				p.i0[1] = node->enforce_premul ? 1 : 0;
+				p.p0[0] = node->k1; p.p0[1] = node->k2; p.p0[2] = node->k3; p.p0[3] = node->k4;
+				runFilterOpsPass(layerPool[outIdx].fbo, layerPool[fgIdx].colorTex, layerPool[bgIdx].colorTex, p, fbW, fbH);
+				if (fgIdx != bgIdx) releaseTemp(fgIdx);
+				releaseTemp(bgIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::MatrixTransform: {
+				const int inIdx = evalChild(0);
+				const int outIdx = acquireClearedFbo();
+				FilterOpsParams p{};
+				p.roiDev[0] = hasRoi ? static_cast<float>(roiX0) : 0.0f;
+				p.roiDev[1] = hasRoi ? static_cast<float>(fbH - roiY1) : 0.0f;
+				p.roiDev[2] = hasRoi ? static_cast<float>(roiX1) : static_cast<float>(fbW);
+				p.roiDev[3] = hasRoi ? static_cast<float>(fbH - roiY0) : static_cast<float>(fbH);
+				computeFilterCropDev(node->crop_rect, desc.layerTransform, fbW, fbH, p.cropDev);
+				p.fbSize[0] = static_cast<float>(fbW); p.fbSize[1] = static_cast<float>(fbH);
+				p.fbSize[2] = invW; p.fbSize[3] = invH;
+				p.i0[0] = 7;
+				p.i0[1] = static_cast<int32_t>(node->filter_quality);
+				const nisaba::Transform devScale = nisaba::Transform::from_scale(sxDev, syDev);
+				const nisaba::Transform fullTs = devScale.pre_concat(static_cast<nisaba::Transform>(desc.layerTransform));
+				if (auto invF = node->filter_transform.invert()) {
+					if (auto invFull = fullTs.invert()) {
+						const nisaba::Transform devInv = fullTs.pre_concat(*invF).pre_concat(*invFull);
+						p.p0[0] = devInv.sx; p.p0[1] = devInv.ky; p.p0[2] = devInv.kx; p.p0[3] = devInv.sy;
+						p.p1[0] = devInv.tx; p.p1[1] = devInv.ty;
+						runFilterOpsPass(layerPool[outIdx].fbo, layerPool[inIdx].colorTex, 0, p, fbW, fbH);
+					}
+				}
+				releaseTemp(inIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::Tile: {
+				const int inIdx = evalChild(0);
+				const int outIdx = acquireClearedFbo();
+				FilterOpsParams p{};
+				p.roiDev[0] = hasRoi ? static_cast<float>(roiX0) : 0.0f;
+				p.roiDev[1] = hasRoi ? static_cast<float>(fbH - roiY1) : 0.0f;
+				p.roiDev[2] = hasRoi ? static_cast<float>(roiX1) : static_cast<float>(fbW);
+				p.roiDev[3] = hasRoi ? static_cast<float>(fbH - roiY0) : static_cast<float>(fbH);
+				computeFilterCropDev(node->crop_rect, desc.layerTransform, fbW, fbH, p.cropDev);
+				p.fbSize[0] = static_cast<float>(fbW); p.fbSize[1] = static_cast<float>(fbH);
+				p.fbSize[2] = invW; p.fbSize[3] = invH;
+				p.i0[0] = 8;
+				const nisaba::Transform ts = static_cast<nisaba::Transform>(desc.layerTransform);
+				if (auto ds = node->src_rect.transform(ts)) {
+					p.p0[0] = ds->left() * sxDev; p.p0[1] = ds->top() * syDev;
+					p.p0[2] = ds->width() * sxDev; p.p0[3] = ds->height() * syDev;
+				}
+				if (auto dd = node->dst_rect.transform(ts)) {
+					p.p1[0] = dd->left() * sxDev; p.p1[1] = dd->top() * syDev;
+					p.p1[2] = dd->right() * sxDev; p.p1[3] = dd->bottom() * syDev;
+				}
+				runFilterOpsPass(layerPool[outIdx].fbo, layerPool[inIdx].colorTex, 0, p, fbW, fbH);
+				releaseTemp(inIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::AlphaThreshold: {
+				const int inIdx = evalChild(0);
+				const int outIdx = acquireClearedFbo();
+				FilterOpsParams p{};
+				p.roiDev[0] = hasRoi ? static_cast<float>(roiX0) : 0.0f;
+				p.roiDev[1] = hasRoi ? static_cast<float>(fbH - roiY1) : 0.0f;
+				p.roiDev[2] = hasRoi ? static_cast<float>(roiX1) : static_cast<float>(fbW);
+				p.roiDev[3] = hasRoi ? static_cast<float>(fbH - roiY0) : static_cast<float>(fbH);
+				computeFilterCropDev(node->crop_rect, desc.layerTransform, fbW, fbH, p.cropDev);
+				p.fbSize[0] = static_cast<float>(fbW); p.fbSize[1] = static_cast<float>(fbH);
+				p.fbSize[2] = invW; p.fbSize[3] = invH;
+				p.i0[0] = 9;
+				const nisaba::Transform ts = static_cast<nisaba::Transform>(desc.layerTransform);
+				if (auto dr = node->src_rect.transform(ts)) {
+					p.p0[0] = dr->left() * sxDev; p.p0[1] = dr->top() * syDev;
+					p.p0[2] = dr->right() * sxDev; p.p0[3] = dr->bottom() * syDev;
+				} else {
+					p.p0[0] = 1e6f; p.p0[1] = 1e6f; p.p0[2] = -1e6f; p.p0[3] = -1e6f;
+				}
+				p.p1[0] = node->inner_min;
+				p.p1[1] = node->outer_max;
+				runFilterOpsPass(layerPool[outIdx].fbo, layerPool[inIdx].colorTex, 0, p, fbW, fbH);
+				releaseTemp(inIdx);
+				return outIdx;
+			}
+
+			case effects::ImageFilterKind::Lighting: {
+				const int inIdx = evalChild(0);
+				const int outIdx = acquireClearedFbo();
+				FilterOpsParams p{};
+				p.roiDev[0] = hasRoi ? static_cast<float>(roiX0) : 0.0f;
+				p.roiDev[1] = hasRoi ? static_cast<float>(fbH - roiY1) : 0.0f;
+				p.roiDev[2] = hasRoi ? static_cast<float>(roiX1) : static_cast<float>(fbW);
+				p.roiDev[3] = hasRoi ? static_cast<float>(fbH - roiY0) : static_cast<float>(fbH);
+				computeFilterCropDev(node->crop_rect, desc.layerTransform, fbW, fbH, p.cropDev);
+				p.fbSize[0] = static_cast<float>(fbW); p.fbSize[1] = static_cast<float>(fbH);
+				p.fbSize[2] = invW; p.fbSize[3] = invH;
+				p.i0[0] = 10;
+				p.i0[1] = static_cast<int32_t>(node->lighting_kind);
+				p.p0[0] = node->light_pos.x; p.p0[1] = node->light_pos.y; p.p0[2] = node->light_pos.z; p.p0[3] = node->surface_scale;
+				p.p1[0] = node->light_target.x; p.p1[1] = node->light_target.y; p.p1[2] = node->light_target.z; p.p1[3] = node->light_kd_ks;
+				p.p2[0] = node->color.red(); p.p2[1] = node->color.green(); p.p2[2] = node->color.blue(); p.p2[3] = node->shininess;
+				p.p3[0] = node->specular_exponent;
+				p.p3[1] = std::cos(node->cutoff_angle * 3.14159265358979323846f / 180.0f);
+				p.p3[2] = node->cutoff_angle;
+				const nisaba::Transform devScale = nisaba::Transform::from_scale(sxDev, syDev);
+				const nisaba::Transform fullTs = devScale.pre_concat(static_cast<nisaba::Transform>(desc.layerTransform));
+				const nisaba::Transform invFull = fullTs.invert().value_or(nisaba::Transform());
+				p.p4[0] = invFull.sx; p.p4[1] = invFull.ky; p.p4[2] = invFull.kx; p.p4[3] = invFull.sy;
+				p.kernel[0] = invFull.tx; p.kernel[1] = invFull.ty;
+				runFilterOpsPass(layerPool[outIdx].fbo, layerPool[inIdx].colorTex, 0, p, fbW, fbH);
+				releaseTemp(inIdx);
+				return outIdx;
+			}
+		}
+		return currentSrcPoolIdx;
+	}
+
 	void popLayer(const Call& call, int& activeClipDepth, bool& usedProgrammableBlend) {
 		if (activeLayers.empty()) return;
 		const RuntimeLayer rl = activeLayers.back();
 		activeLayers.pop_back();
-		LayerFbo& lf = layerPool[rl.poolIndex];
+		const int lfW = layerPool[rl.poolIndex].w;
+		const int lfH = layerPool[rl.poolIndex].h;
 
 		LayerDesc desc;
 		bool hasDesc = false;
@@ -1675,29 +2754,168 @@ struct GL3Renderer::Impl {
 			hasDesc = true;
 		}
 
-		GLuint layerColorTex = lf.colorTex;
-		const bool doBlur = hasDesc && (desc.postBlurSigmaX > 0.001f || desc.postBlurSigmaY > 0.001f);
-		GLuint blurredTex = 0;
-		if (doBlur) {
-			int roiX0 = 0, roiY0 = 0, roiX1 = lf.w, roiY1 = lf.h;
+		const bool doMaskBlur = hasDesc && desc.maskFilter.has_value() && desc.maskFilter->is_blur();
+		const bool useGeneralDag = hasDesc && desc.imageFilter.has_value() &&
+		                           desc.imageFilter->is_active() &&
+		                           !desc.isDropShadow &&
+		                           !(desc.postBlurSigmaX > 0.001f || desc.postBlurSigmaY > 0.001f);
+		const bool doExtColor = hasDesc && desc.extColorEffect.has_value() && desc.extColorEffect->is_active();
+		const bool doCustomBlender = hasDesc && desc.blender.has_value() && desc.blender->is_custom();
+
+		int dagResultPoolIdx = -1;
+		if (doMaskBlur || useGeneralDag || doExtColor || doCustomBlender) {
+			int roiX0 = 0, roiY0 = 0, roiX1 = lfW, roiY1 = lfH;
 			const bool hasRoi = desc.hasBounds && view[0] > 0.0f && view[1] > 0.0f;
 			if (hasRoi) {
-				const float sx = static_cast<float>(lf.w) / view[0];
-				const float sy = static_cast<float>(lf.h) / view[1];
-				roiX0 = std::clamp(static_cast<int>(std::floor(desc.bounds[0] * sx)), 0, lf.w);
-				roiX1 = std::clamp(static_cast<int>(std::ceil(desc.bounds[2] * sx)), 0, lf.w);
-				const int topY = std::clamp(static_cast<int>(std::floor(desc.bounds[1] * sy)), 0, lf.h);
-				const int botY = std::clamp(static_cast<int>(std::ceil(desc.bounds[3] * sy)), 0, lf.h);
-				roiY0 = lf.h - botY;
-				roiY1 = lf.h - topY;
+				const float sx = static_cast<float>(lfW) / view[0];
+				const float sy = static_cast<float>(lfH) / view[1];
+				roiX0 = std::clamp(static_cast<int>(std::floor(desc.bounds[0] * sx)), 0, lfW);
+				roiX1 = std::clamp(static_cast<int>(std::ceil(desc.bounds[2] * sx)), 0, lfW);
+				const int topY = std::clamp(static_cast<int>(std::floor(desc.bounds[1] * sy)), 0, lfH);
+				const int botY = std::clamp(static_cast<int>(std::ceil(desc.bounds[3] * sy)), 0, lfH);
+				roiY0 = lfH - botY;
+				roiY1 = lfH - topY;
 			}
-			BlurResult br = gaussianBlurToFbo(lf.fbo, lf.colorTex, lf.w, lf.h,
+			const bool inNestedLayer = !activeLayers.empty();
+			const int vpX = inNestedLayer ? 0 : baseViewport[0];
+			const int vpY = inNestedLayer ? 0 : baseViewport[1];
+			const int vpW = inNestedLayer ? layerPool[activeLayers.back().poolIndex].w : baseViewport[2];
+			const int vpH = inNestedLayer ? layerPool[activeLayers.back().poolIndex].h : baseViewport[3];
+
+			int curIdx = rl.poolIndex;
+			if (doMaskBlur && filterBlendShader.prog != 0) {
+				const auto& mf = *desc.maskFilter;
+				const float sxDev = (view[0] > 0.0f) ? (static_cast<float>(lfW) / view[0]) : 1.0f;
+				const float syDev = (view[1] > 0.0f) ? (static_cast<float>(lfH) / view[1]) : 1.0f;
+				float effSx = mf.sigma * sxDev;
+				float effSy = mf.sigma * syDev;
+				if (mf.respect_ctm) {
+					const auto& m = desc.layerTransform.m;
+					effSx *= std::hypot(m[0], m[1]);
+					effSy *= std::hypot(m[2], m[3]);
+				}
+				GLuint blurTex = layerPool[curIdx].colorTex;
+				if (effSx > 0.001f || effSy > 0.001f) {
+					BlurResult br = gaussianBlurToFbo(
+						layerPool[curIdx].fbo, layerPool[curIdx].colorTex,
+						lfW, lfH, effSx, effSy,
+						hasRoi, roiX0, roiY0, roiX1, roiY1);
+					if (br.tex != 0) blurTex = br.tex;
+				}
+				const int maskOutIdx = acquireLayerFbo(lfW, lfH);
+				glBindFramebuffer(GL_FRAMEBUFFER, layerPool[maskOutIdx].fbo);
+				glDisable(GL_SCISSOR_TEST);
+				glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+				glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+				glClear(GL_COLOR_BUFFER_BIT);
+
+				const float invW = 1.0f / static_cast<float>(std::max(1, lfW));
+				const float invH = 1.0f / static_cast<float>(std::max(1, lfH));
+				const float roiUv[4] = {
+					hasRoi ? (static_cast<float>(roiX0) * invW) : 0.0f,
+					hasRoi ? (static_cast<float>(roiY0) * invH) : 0.0f,
+					hasRoi ? (static_cast<float>(roiX1) * invW) : 1.0f,
+					hasRoi ? (static_cast<float>(roiY1) * invH) : 1.0f
+				};
+				const float noCropUv[4] = {-1.0f, -1.0f, 2.0f, 2.0f};
+				const int maskMode = -2 - static_cast<int>(mf.style);
+				runFilterBlendPass(layerPool[maskOutIdx].fbo, blurTex, layerPool[curIdx].colorTex,
+				                   maskMode, 0.0f, 0.0f, desc.maskTintColor.premultiplied(),
+				                   roiUv, noCropUv, lfW, lfH, false);
+				curIdx = maskOutIdx;
+			}
+			if (useGeneralDag) {
+				const int nextIdx = evalImageFilterDag(desc.imageFilter->node().get(),
+				                                       curIdx, lfW, lfH,
+				                                       desc, hasRoi, roiX0, roiY0, roiX1, roiY1);
+				if (curIdx != rl.poolIndex && curIdx != nextIdx) {
+					layerPool[curIdx].inUse = false;
+				}
+				curIdx = nextIdx;
+			}
+			if (doExtColor && filterColorShader.prog != 0) {
+				const float invW = 1.0f / static_cast<float>(std::max(1, lfW));
+				const float invH = 1.0f / static_cast<float>(std::max(1, lfH));
+				const float roiUv[4] = {
+					hasRoi ? (static_cast<float>(roiX0) * invW) : 0.0f,
+					hasRoi ? (static_cast<float>(roiY0) * invH) : 0.0f,
+					hasRoi ? (static_cast<float>(roiX1) * invW) : 1.0f,
+					hasRoi ? (static_cast<float>(roiY1) * invH) : 1.0f
+				};
+				const float noCropUv[4] = {-1.0f, -1.0f, 2.0f, 2.0f};
+				const int nextIdx = evalColorEffectDag(*desc.extColorEffect, curIdx, lfW, lfH,
+				                                       roiUv, noCropUv, hasRoi, roiX0, roiY0, roiX1, roiY1);
+				if (curIdx != rl.poolIndex && curIdx != nextIdx) {
+					layerPool[curIdx].inUse = false;
+				}
+				curIdx = nextIdx;
+			}
+			if (doCustomBlender) {
+				const int dstSnapIdx = acquireLayerFbo(lfW, lfH);
+				glDisable(GL_SCISSOR_TEST);
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, rl.parentFbo);
+				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, layerPool[dstSnapIdx].fbo);
+				glBlitFramebuffer(0, 0, lfW, lfH, 0, 0, lfW, lfH, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+				const int blendOutIdx = acquireLayerFbo(lfW, lfH);
+				const auto& b = *desc.blender;
+				const float op = std::clamp(desc.opacity, 0.0f, 1.0f);
+				if (b.kind == effects::BlenderKind::Arithmetic) {
+					FilterOpsParams fp{};
+					fp.roiDev[0] = 0.0f; fp.roiDev[1] = 0.0f;
+					fp.roiDev[2] = static_cast<float>(lfW); fp.roiDev[3] = static_cast<float>(lfH);
+					fp.fbSize[0] = static_cast<float>(lfW); fp.fbSize[1] = static_cast<float>(lfH);
+					fp.fbSize[2] = 1.0f / static_cast<float>(std::max(1, lfW));
+					fp.fbSize[3] = 1.0f / static_cast<float>(std::max(1, lfH));
+					fp.i0[0] = 6;
+					fp.i0[1] = b.enforce_premul ? 1 : 0;
+					fp.p0[0] = b.k1 * op; fp.p0[1] = b.k2 * op; fp.p0[2] = b.k3; fp.p0[3] = b.k4;
+					runFilterOpsPass(layerPool[blendOutIdx].fbo, layerPool[curIdx].colorTex,
+					                 layerPool[dstSnapIdx].colorTex, fp, lfW, lfH);
+				} else if (b.kind == effects::BlenderKind::Runtime && b.runtime_spec) {
+					runFilterRuntimeBlenderPass(layerPool[blendOutIdx].fbo, layerPool[curIdx].colorTex,
+					                            layerPool[dstSnapIdx].colorTex, *b.runtime_spec, op, lfW, lfH);
+				}
+				layerPool[dstSnapIdx].inUse = false;
+				if (curIdx != rl.poolIndex) layerPool[curIdx].inUse = false;
+				curIdx = blendOutIdx;
+			}
+			dagResultPoolIdx = curIdx;
+
+			glViewport(vpX, vpY, vpW, vpH);
+			glEnable(GL_BLEND);
+			glEnable(GL_CULL_FACE);
+			if (scissorEnabled) {
+				glEnable(GL_SCISSOR_TEST);
+				glScissor(currentScissor[0], currentScissor[1], currentScissor[2], currentScissor[3]);
+			} else {
+				glDisable(GL_SCISSOR_TEST);
+			}
+		}
+
+		GLuint layerColorTex = (dagResultPoolIdx >= 0) ? layerPool[dagResultPoolIdx].colorTex : layerPool[rl.poolIndex].colorTex;
+		const bool doBlur = !useGeneralDag && hasDesc && (desc.postBlurSigmaX > 0.001f || desc.postBlurSigmaY > 0.001f);
+		GLuint blurredTex = 0;
+		if (doBlur) {
+			int roiX0 = 0, roiY0 = 0, roiX1 = lfW, roiY1 = lfH;
+			const bool hasRoi = desc.hasBounds && view[0] > 0.0f && view[1] > 0.0f;
+			if (hasRoi) {
+				const float sx = static_cast<float>(lfW) / view[0];
+				const float sy = static_cast<float>(lfH) / view[1];
+				roiX0 = std::clamp(static_cast<int>(std::floor(desc.bounds[0] * sx)), 0, lfW);
+				roiX1 = std::clamp(static_cast<int>(std::ceil(desc.bounds[2] * sx)), 0, lfW);
+				const int topY = std::clamp(static_cast<int>(std::floor(desc.bounds[1] * sy)), 0, lfH);
+				const int botY = std::clamp(static_cast<int>(std::ceil(desc.bounds[3] * sy)), 0, lfH);
+				roiY0 = lfH - botY;
+				roiY1 = lfH - topY;
+			}
+			BlurResult br = gaussianBlurToFbo(layerPool[rl.poolIndex].fbo, layerPool[rl.poolIndex].colorTex, lfW, lfH,
 			                                  desc.postBlurSigmaX, desc.postBlurSigmaY,
 			                                  hasRoi, roiX0, roiY0, roiX1, roiY1);
 			if (br.tex != 0) {
 				blurredTex = br.tex;
 			} else {
-				blurredTex = lf.colorTex;
+				blurredTex = layerPool[rl.poolIndex].colorTex;
 			}
 		}
 
@@ -1733,17 +2951,16 @@ struct GL3Renderer::Impl {
 		};
 
 		if (hasDesc && desc.isDropShadow) {
-			const GLuint shadowSrcTex = doBlur ? blurredTex : lf.colorTex;
+			const GLuint shadowSrcTex = doBlur ? blurredTex : layerPool[rl.poolIndex].colorTex;
 			if (call.triangleCount == 18) {
-				const int compIdx = acquireLayerFbo(lf.w, lf.h);
-				LayerFbo& cf = layerPool[compIdx];
+				const int compIdx = acquireLayerFbo(lfW, lfH);
 				const bool inNestedLayer = !activeLayers.empty();
 				const int vpX = inNestedLayer ? 0 : baseViewport[0];
 				const int vpY = inNestedLayer ? 0 : baseViewport[1];
 				const int vpW = inNestedLayer ? layerPool[activeLayers.back().poolIndex].w : baseViewport[2];
 				const int vpH = inNestedLayer ? layerPool[activeLayers.back().poolIndex].h : baseViewport[3];
-				glBindFramebuffer(GL_FRAMEBUFFER, cf.fbo);
-				glViewport(0, 0, lf.w, lf.h);
+				glBindFramebuffer(GL_FRAMEBUFFER, layerPool[compIdx].fbo);
+				glViewport(0, 0, lfW, lfH);
 				if (scissorEnabled) glDisable(GL_SCISSOR_TEST);
 				enableStencil(false);
 				glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -1751,25 +2968,25 @@ struct GL3Renderer::Impl {
 				glClear(GL_COLOR_BUFFER_BIT);
 				blendFuncSeparate(Blend{GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA});
 				drawQuad(call.triangleOffset, call.uniformOffset + call.uniformStride, shadowSrcTex, ShaderBucket::FastCore);
-				drawQuad(call.triangleOffset + 6, call.uniformOffset + 2 * call.uniformStride, lf.colorTex, ShaderBucket::FastCore);
+				drawQuad(call.triangleOffset + 6, call.uniformOffset + 2 * call.uniformStride, layerPool[rl.poolIndex].colorTex, ShaderBucket::FastCore);
 
 				glViewport(vpX, vpY, vpW, vpH);
 				if (scissorEnabled) glEnable(GL_SCISSOR_TEST);
 				restoreParentState();
 				blendFuncSeparate(call.blendFunc);
-				drawQuad(call.triangleOffset + 12, call.uniformOffset, cf.colorTex, call.bucket);
-				cf.inUse = false;
+				drawQuad(call.triangleOffset + 12, call.uniformOffset, layerPool[compIdx].colorTex, call.bucket);
+				layerPool[compIdx].inUse = false;
 			} else {
 				restoreParentState();
 				if (call.triangleCount == 12) {
 					blendFuncSeparate(Blend{GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA});
 					drawQuad(call.triangleOffset, call.uniformOffset + call.uniformStride, shadowSrcTex, ShaderBucket::FastCore);
-					drawQuad(call.triangleOffset + 6, call.uniformOffset, lf.colorTex, call.bucket);
+					drawQuad(call.triangleOffset + 6, call.uniformOffset, layerPool[rl.poolIndex].colorTex, call.bucket);
 				} else if (call.triangleCount == 6) {
 					drawQuad(call.triangleOffset, call.uniformOffset, shadowSrcTex, call.bucket);
 				}
 			}
-			lf.inUse = false;
+			layerPool[rl.poolIndex].inUse = false;
 			return;
 		}
 
@@ -1778,12 +2995,20 @@ struct GL3Renderer::Impl {
 		}
 
 		restoreParentState();
+		if (doCustomBlender) {
+			blendFuncSeparate(Blend{GL_ONE, GL_ZERO, GL_ONE, GL_ZERO});
+		} else {
+			blendFuncSeparate(call.blendFunc);
+		}
 
 		if (call.triangleCount > 0) {
 			drawQuad(call.triangleOffset, call.uniformOffset, layerColorTex, call.bucket);
 		}
 
-		lf.inUse = false;
+		if (dagResultPoolIdx >= 0 && dagResultPoolIdx != rl.poolIndex) {
+			layerPool[dagResultPoolIdx].inUse = false;
+		}
+		layerPool[rl.poolIndex].inUse = false;
 	}
 };
 
@@ -2030,17 +3255,6 @@ bool GL3Renderer::init() {
 		"	outA = clamp(outA, 0.0, 1.0);\n"
 		"	return vec4(clamp(outRgb, vec3(0.0), vec3(outA)), outA);\n"
 		"}\n"
-		"vec4 apply_color_matrix(vec4 premul) {\n"
-		"	vec4 s = (premul.a > 1e-5) ? vec4(premul.rgb / premul.a, premul.a) : vec4(0.0);\n"
-		"	vec4 res = vec4(\n"
-		"		dot(colorMat0, s) + colorMatBias.x,\n"
-		"		dot(colorMat1, s) + colorMatBias.y,\n"
-		"		dot(colorMat2, s) + colorMatBias.z,\n"
-		"		dot(colorMat3, s) + colorMatBias.w\n"
-		"	);\n"
-		"	res = clamp(res, 0.0, 1.0);\n"
-		"	return vec4(res.rgb * res.a, res.a);\n"
-		"}\n"
 		"float srgb_ch_to_linear(float c) {\n"
 		"	return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);\n"
 		"}\n"
@@ -2057,6 +3271,19 @@ bool GL3Renderer::init() {
 		"	}\n"
 		"	s = clamp(s, 0.0, 1.0);\n"
 		"	return vec4(s * premul.a, premul.a);\n"
+		"}\n";
+
+	static const char* colorMatrixHelperGlsl =
+		"vec4 apply_color_matrix(vec4 premul) {\n"
+		"	vec4 s = (premul.a > 1e-5) ? vec4(premul.rgb / premul.a, premul.a) : vec4(0.0);\n"
+		"	vec4 res = vec4(\n"
+		"		dot(colorMat0, s) + colorMatBias.x,\n"
+		"		dot(colorMat1, s) + colorMatBias.y,\n"
+		"		dot(colorMat2, s) + colorMatBias.z,\n"
+		"		dot(colorMat3, s) + colorMatBias.w\n"
+		"	);\n"
+		"	res = clamp(res, 0.0, 1.0);\n"
+		"	return vec4(res.rgb * res.a, res.a);\n"
 		"}\n";
 
 	static const char* shadowHelpersGlsl =
@@ -2152,6 +3379,72 @@ bool GL3Renderer::init() {
 		"}\n";
 
 	static const char* multiGradHelpersGlsl =
+		"int perlin_wrap(int v, int period) {\n"
+		"	if (period <= 0) return v;\n"
+		"	int m = v % period;\n"
+		"	return (m < 0) ? (m + period) : m;\n"
+		"}\n"
+		"vec2 perlin_grad2(int ix, int iy, int ch, uint seed_u) {\n"
+		"	uint h = uint(ix) * 374761393u + uint(iy) * 668265263u + uint(ch) * 2147483647u + seed_u * 1274126177u;\n"
+		"	h = (h ^ (h >> 13u)) * 1274126177u;\n"
+		"	uint idx = (h ^ (h >> 16u)) & 7u;\n"
+		"	if (idx == 0u) return vec2( 1.0,  0.0);\n"
+		"	if (idx == 1u) return vec2(-1.0,  0.0);\n"
+		"	if (idx == 2u) return vec2( 0.0,  1.0);\n"
+		"	if (idx == 3u) return vec2( 0.0, -1.0);\n"
+		"	if (idx == 4u) return vec2( 0.70710678,  0.70710678);\n"
+		"	if (idx == 5u) return vec2(-0.70710678,  0.70710678);\n"
+		"	if (idx == 6u) return vec2( 0.70710678, -0.70710678);\n"
+		"	return vec2(-0.70710678, -0.70710678);\n"
+		"}\n"
+		"float perlin_2d_ch(vec2 p, int ch, uint seed_u, int px, int py) {\n"
+		"	vec2 fl = floor(p);\n"
+		"	int ix = int(fl.x);\n"
+		"	int iy = int(fl.y);\n"
+		"	vec2 t = p - fl;\n"
+		"	int x0 = perlin_wrap(ix, px);\n"
+		"	int x1 = perlin_wrap(ix + 1, px);\n"
+		"	int y0 = perlin_wrap(iy, py);\n"
+		"	int y1 = perlin_wrap(iy + 1, py);\n"
+		"	float n00 = dot(perlin_grad2(x0, y0, ch, seed_u), t);\n"
+		"	float n10 = dot(perlin_grad2(x1, y0, ch, seed_u), t - vec2(1.0, 0.0));\n"
+		"	float n01 = dot(perlin_grad2(x0, y1, ch, seed_u), t - vec2(0.0, 1.0));\n"
+		"	float n11 = dot(perlin_grad2(x1, y1, ch, seed_u), t - vec2(1.0, 1.0));\n"
+		"	vec2 uv = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);\n"
+		"	return mix(mix(n00, n10, uv.x), mix(n01, n11, uv.x), uv.y);\n"
+		"}\n"
+		"vec4 eval_perlin_noise(vec2 pt, bool isTurb) {\n"
+		"	int octaves = clamp(gradStopCount, 0, 16);\n"
+		"	float opacity = clamp(gradParams0.w, 0.0, 1.0);\n"
+		"	if (octaves <= 0) {\n"
+		"		if (isTurb) return vec4(0.0);\n"
+		"		float a0 = 0.5 * opacity;\n"
+		"		return vec4(0.5 * a0, 0.5 * a0, 0.5 * a0, a0);\n"
+		"	}\n"
+		"	uint seed_u = uint(int(floor(gradParams0.z)));\n"
+		"	int px = (gradParams1.z > 0.5) ? max(1, int(gradParams1.x + 0.5)) : 0;\n"
+		"	int py = (gradParams1.z > 0.5) ? max(1, int(gradParams1.y + 0.5)) : 0;\n"
+		"	vec2 f = pt * gradParams0.xy;\n"
+		"	float amp = 1.0;\n"
+		"	vec4 acc = vec4(0.0);\n"
+		"	for (int o = 0; o < 16; ++o) {\n"
+		"		if (o >= octaves) break;\n"
+		"		vec4 n = vec4(\n"
+		"			perlin_2d_ch(f, 0, seed_u, px, py),\n"
+		"			perlin_2d_ch(f, 1, seed_u, px, py),\n"
+		"			perlin_2d_ch(f, 2, seed_u, px, py),\n"
+		"			perlin_2d_ch(f, 3, seed_u, px, py)\n"
+		"		);\n"
+		"		acc += (isTurb ? abs(n) : n) * amp;\n"
+		"		f *= 2.0;\n"
+		"		amp *= 0.5;\n"
+		"		px *= 2;\n"
+		"		py *= 2;\n"
+		"	}\n"
+		"	vec4 col = clamp(isTurb ? acc : (acc * 0.5 + 0.5), 0.0, 1.0);\n"
+		"	float a = clamp(col.a * opacity, 0.0, 1.0);\n"
+		"	return vec4(col.rgb * a, a);\n"
+		"}\n"
 		"float get_stop_pos(int idx) {\n"
 		"	vec4 v = gradStopPos[idx >> 2];\n"
 		"	int r = idx & 3;\n"
@@ -2162,6 +3455,9 @@ bool GL3Renderer::init() {
 		"}\n"
 		"vec4 eval_multi_gradient() {\n"
 		"	vec2 pt = (paintMat * vec3(fpos, 1.0)).xy;\n"
+		"	if (gradKind == 5 || gradKind == 6) {\n"
+		"		return eval_perlin_noise(pt, gradKind == 6);\n"
+		"	}\n"
 		"	float t = 0.0;\n"
 		"	if (gradKind == 1) {\n"
 		"		t = (gradParams0.z > 0.5) ? 1.0 : pt.x;\n"
@@ -2913,7 +4209,7 @@ bool GL3Renderer::init() {
 		"}\n";
 	const std::string fastCoreFrag = fastUboBlock + varyingsTex + varyingsFull + sdfAndScissorGlsl + fastCoreBodyGlsl;
 	const std::string effectsFrag  = fullUboBlock + varyingsTex + "uniform sampler2D dstTex;\n" + varyingsFull +
-		effectsHelpersGlsl + sdfAndScissorGlsl + shadowHelpersGlsl + multiGradHelpersGlsl + effectsBodyGlsl;
+		effectsHelpersGlsl + colorMatrixHelperGlsl + sdfAndScissorGlsl + shadowHelpersGlsl + multiGradHelpersGlsl + effectsBodyGlsl;
 
 	checkGLError(m_impl->flags, "init start");
 
@@ -3046,6 +4342,345 @@ bool GL3Renderer::init() {
 			m_impl->locBlurSigma = glGetUniformLocation(m_impl->blurShader.prog, "uSigma");
 			m_impl->locBlurUvBounds = glGetUniformLocation(m_impl->blurShader.prog, "uUvBounds");
 		}
+		const std::string filterBlendFrag =
+			"uniform sampler2D uSrcTex;\n"
+			"uniform sampler2D uDstTex;\n"
+			"uniform int uMode;\n"
+			"uniform vec2 uSrcOffsetUv;\n"
+			"uniform vec4 uColor;\n"
+			"uniform vec4 uRoiUv;\n"
+			"uniform vec4 uCropUv;\n"
+			"in vec2 vUv;\n"
+			"out vec4 outColor;\n"
+			+ std::string(effectsHelpersGlsl) +
+			"void main(void) {\n"
+			"	if (vUv.x < uCropUv.x || vUv.x > uCropUv.z || vUv.y < uCropUv.y || vUv.y > uCropUv.w) {\n"
+			"		outColor = vec4(0.0);\n"
+			"		return;\n"
+			"	}\n"
+			"	vec2 suv = vUv + uSrcOffsetUv;\n"
+			"	vec4 s = (suv.x < uRoiUv.x || suv.x > uRoiUv.z || suv.y < uRoiUv.y || suv.y > uRoiUv.w)\n"
+			"		? vec4(0.0) : texture(uSrcTex, suv);\n"
+			"	if (uMode == 0) { outColor = s; return; }\n"
+			"	if (uMode == -1) { outColor = uColor * s.a; return; }\n"
+			"	vec4 d = (vUv.x < uRoiUv.x || vUv.x > uRoiUv.z || vUv.y < uRoiUv.y || vUv.y > uRoiUv.w)\n"
+			"		? vec4(0.0) : texture(uDstTex, vUv);\n"
+			"	if (uMode == -2) { outColor = uColor * s.a; return; }\n"
+			"	if (uMode == -3) { outColor = uColor * max(d.a, s.a); return; }\n"
+			"	if (uMode == -4) { outColor = uColor * (s.a * (1.0 - d.a)); return; }\n"
+			"	if (uMode == -5) { outColor = uColor * (s.a * d.a); return; }\n"
+			"	outColor = nisaba_blend(s, d, uMode);\n"
+			"}\n";
+		if (createShader(m_impl->filterBlendShader, "filter_blend_shader", shaderHeader, nullptr, blurVertShader, filterBlendFrag.c_str())) {
+			m_impl->locFilterBlendSrc = glGetUniformLocation(m_impl->filterBlendShader.prog, "uSrcTex");
+			m_impl->locFilterBlendDst = glGetUniformLocation(m_impl->filterBlendShader.prog, "uDstTex");
+			m_impl->locFilterBlendMode = glGetUniformLocation(m_impl->filterBlendShader.prog, "uMode");
+			m_impl->locFilterBlendOffset = glGetUniformLocation(m_impl->filterBlendShader.prog, "uSrcOffsetUv");
+			m_impl->locFilterBlendColor = glGetUniformLocation(m_impl->filterBlendShader.prog, "uColor");
+			m_impl->locFilterBlendRoiUv = glGetUniformLocation(m_impl->filterBlendShader.prog, "uRoiUv");
+			m_impl->locFilterBlendCropUv = glGetUniformLocation(m_impl->filterBlendShader.prog, "uCropUv");
+		}
+		const std::string filterColorFrag =
+			"uniform sampler2D uSrcTex;\n"
+			"uniform int uHasMat;\n"
+			"uniform vec4 uMat0;\n"
+			"uniform vec4 uMat1;\n"
+			"uniform vec4 uMat2;\n"
+			"uniform vec4 uMat3;\n"
+			"uniform vec4 uMatBias;\n"
+			"uniform int uTransfer;\n"
+			"uniform int uHasBlend;\n"
+			"uniform int uBlendMode;\n"
+			"uniform vec4 uBlendCol;\n"
+			"uniform vec4 uRoiUv;\n"
+			"uniform vec4 uCropUv;\n"
+			"uniform int uExtKind;\n"
+			"uniform vec4 uHcParams;\n"
+			"uniform ivec4 uLut[64];\n"
+			"in vec2 vUv;\n"
+			"out vec4 outColor;\n"
+			+ std::string(effectsHelpersGlsl) +
+			"vec3 cf_rgb_to_hsl(vec3 c) {\n"
+			"	float maxC = max(max(c.r, c.g), c.b);\n"
+			"	float minC = min(min(c.r, c.g), c.b);\n"
+			"	float l = 0.5 * (maxC + minC);\n"
+			"	float d = maxC - minC;\n"
+			"	if (d <= 1e-6) return vec3(0.0, 0.0, l);\n"
+			"	float s = (l > 0.5) ? (d / max(2.0 - maxC - minC, 1e-6)) : (d / max(maxC + minC, 1e-6));\n"
+			"	float h = (maxC == c.r) ? ((c.g - c.b) / d + (c.g < c.b ? 6.0 : 0.0))\n"
+			"	        : ((maxC == c.g) ? ((c.b - c.r) / d + 2.0) : ((c.r - c.g) / d + 4.0));\n"
+			"	return vec3(h / 6.0, s, l);\n"
+			"}\n"
+			"float cf_hue2rgb(float p, float q, float t) {\n"
+			"	if (t < 0.0) t += 1.0;\n"
+			"	if (t > 1.0) t -= 1.0;\n"
+			"	if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;\n"
+			"	if (t < 0.5) return q;\n"
+			"	if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;\n"
+			"	return p;\n"
+			"}\n"
+			"vec3 cf_hsl_to_rgb(vec3 hsl) {\n"
+			"	float h = fract(hsl.x); float s = clamp(hsl.y, 0.0, 1.0); float l = clamp(hsl.z, 0.0, 1.0);\n"
+			"	if (s <= 1e-6) return vec3(l);\n"
+			"	float q = (l < 0.5) ? (l * (1.0 + s)) : (l + s - l * s);\n"
+			"	float p = 2.0 * l - q;\n"
+			"	return vec3(cf_hue2rgb(p, q, h + 1.0 / 3.0), cf_hue2rgb(p, q, h), cf_hue2rgb(p, q, h - 1.0 / 3.0));\n"
+			"}\n"
+			"int cf_fetch_lut(int idx) {\n"
+			"	ivec4 v = uLut[idx >> 2];\n"
+			"	int c = idx & 3;\n"
+			"	if (c == 0) return v.x;\n"
+			"	if (c == 1) return v.y;\n"
+			"	if (c == 2) return v.z;\n"
+			"	return v.w;\n"
+			"}\n"
+			"vec4 eval_filter_matrix(vec4 premul) {\n"
+			"	vec4 s = (premul.a > 1e-5) ? vec4(premul.rgb / premul.a, premul.a) : vec4(0.0);\n"
+			"	vec4 res = vec4(\n"
+			"		dot(uMat0, s) + uMatBias.x,\n"
+			"		dot(uMat1, s) + uMatBias.y,\n"
+			"		dot(uMat2, s) + uMatBias.z,\n"
+			"		dot(uMat3, s) + uMatBias.w\n"
+			"	);\n"
+			"	res = clamp(res, 0.0, 1.0);\n"
+			"	return vec4(res.rgb * res.a, res.a);\n"
+			"}\n"
+			"void main(void) {\n"
+			"	if (vUv.x < uCropUv.x || vUv.x > uCropUv.z || vUv.y < uCropUv.y || vUv.y > uCropUv.w) {\n"
+			"		outColor = vec4(0.0);\n"
+			"		return;\n"
+			"	}\n"
+			"	vec4 c = (vUv.x < uRoiUv.x || vUv.x > uRoiUv.z || vUv.y < uRoiUv.y || vUv.y > uRoiUv.w)\n"
+			"		? vec4(0.0) : texture(uSrcTex, vUv);\n"
+			"	if (uExtKind == 1) {\n"
+			"		vec4 s = (c.a > 1e-5) ? vec4(clamp(c.rgb / c.a, 0.0, 1.0), c.a) : vec4(0.0);\n"
+			"		int r8 = int(clamp(s.r * 255.0 + 0.5, 0.0, 255.0));\n"
+			"		int g8 = int(clamp(s.g * 255.0 + 0.5, 0.0, 255.0));\n"
+			"		int b8 = int(clamp(s.b * 255.0 + 0.5, 0.0, 255.0));\n"
+			"		int a8 = int(clamp(s.a * 255.0 + 0.5, 0.0, 255.0));\n"
+			"		float nr = float(cf_fetch_lut(r8) & 255) / 255.0;\n"
+			"		float ng = float((cf_fetch_lut(g8) >> 8) & 255) / 255.0;\n"
+			"		float nb = float((cf_fetch_lut(b8) >> 16) & 255) / 255.0;\n"
+			"		float na = float((cf_fetch_lut(a8) >> 24) & 255) / 255.0;\n"
+			"		outColor = vec4(vec3(nr, ng, nb) * na, na); return;\n"
+			"	} else if (uExtKind == 2) {\n"
+			"		vec4 s = (c.a > 1e-5) ? vec4(clamp(c.rgb / c.a, 0.0, 1.0), c.a) : vec4(0.0);\n"
+			"		vec4 hsla = vec4(cf_rgb_to_hsl(s.rgb), s.a);\n"
+			"		float nh = dot(uMat0, hsla) + uMatBias.x;\n"
+			"		float ns = clamp(dot(uMat1, hsla) + uMatBias.y, 0.0, 1.0);\n"
+			"		float nl = clamp(dot(uMat2, hsla) + uMatBias.z, 0.0, 1.0);\n"
+			"		float na = clamp(dot(uMat3, hsla) + uMatBias.w, 0.0, 1.0);\n"
+			"		outColor = vec4(cf_hsl_to_rgb(vec3(nh, ns, nl)) * na, na); return;\n"
+			"	} else if (uExtKind == 3) {\n"
+			"		float lum = clamp(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);\n"
+			"		outColor = vec4(0.0, 0.0, 0.0, lum); return;\n"
+			"	} else if (uExtKind == 4) {\n"
+			"		vec4 s = (c.a > 1e-5) ? vec4(clamp(c.rgb / c.a, 0.0, 1.0), c.a) : vec4(0.0);\n"
+			"		vec3 rgb = s.rgb;\n"
+			"		if (uHcParams.x > 0.5) rgb = vec3(dot(rgb, vec3(0.2126, 0.7152, 0.0722)));\n"
+			"		int invS = int(uHcParams.y + 0.5);\n"
+			"		if (invS == 1) rgb = vec3(1.0) - rgb;\n"
+			"		else if (invS == 2) { vec3 hsl = cf_rgb_to_hsl(rgb); rgb = cf_hsl_to_rgb(vec3(hsl.x, hsl.y, 1.0 - hsl.z)); }\n"
+			"		if (abs(uHcParams.z) > 1e-5) {\n"
+			"			float cf = clamp(uHcParams.z, -0.99, 0.99); float m = (1.0 + cf) / (1.0 - cf);\n"
+			"			rgb = clamp(m * (rgb - vec3(0.5)) + vec3(0.5), 0.0, 1.0);\n"
+			"		}\n"
+			"		outColor = vec4(rgb * s.a, s.a); return;\n"
+			"	}\n"
+			"	if (uHasMat != 0) c = eval_filter_matrix(c);\n"
+			"	if (uTransfer != 0) c = apply_color_transfer(c, uTransfer);\n"
+			"	if (uHasBlend != 0) c = nisaba_blend(uBlendCol, c, uBlendMode);\n"
+			"	outColor = c;\n"
+			"}\n";
+		if (createShader(m_impl->filterColorShader, "filter_color_shader", shaderHeader, nullptr, blurVertShader, filterColorFrag.c_str())) {
+			m_impl->locFilterColorSrc = glGetUniformLocation(m_impl->filterColorShader.prog, "uSrcTex");
+			m_impl->locFilterColorHasMat = glGetUniformLocation(m_impl->filterColorShader.prog, "uHasMat");
+			m_impl->locFilterColorMat0 = glGetUniformLocation(m_impl->filterColorShader.prog, "uMat0");
+			m_impl->locFilterColorMat1 = glGetUniformLocation(m_impl->filterColorShader.prog, "uMat1");
+			m_impl->locFilterColorMat2 = glGetUniformLocation(m_impl->filterColorShader.prog, "uMat2");
+			m_impl->locFilterColorMat3 = glGetUniformLocation(m_impl->filterColorShader.prog, "uMat3");
+			m_impl->locFilterColorMatBias = glGetUniformLocation(m_impl->filterColorShader.prog, "uMatBias");
+			m_impl->locFilterColorTransfer = glGetUniformLocation(m_impl->filterColorShader.prog, "uTransfer");
+			m_impl->locFilterColorHasBlend = glGetUniformLocation(m_impl->filterColorShader.prog, "uHasBlend");
+			m_impl->locFilterColorBlendMode = glGetUniformLocation(m_impl->filterColorShader.prog, "uBlendMode");
+			m_impl->locFilterColorBlendCol = glGetUniformLocation(m_impl->filterColorShader.prog, "uBlendCol");
+			m_impl->locFilterColorRoiUv = glGetUniformLocation(m_impl->filterColorShader.prog, "uRoiUv");
+			m_impl->locFilterColorCropUv = glGetUniformLocation(m_impl->filterColorShader.prog, "uCropUv");
+			m_impl->locFilterColorExtKind = glGetUniformLocation(m_impl->filterColorShader.prog, "uExtKind");
+			m_impl->locFilterColorHcParams = glGetUniformLocation(m_impl->filterColorShader.prog, "uHcParams");
+			m_impl->locFilterColorLut = glGetUniformLocation(m_impl->filterColorShader.prog, "uLut");
+		}
+		static const char* filterOpsFrag =
+			"uniform sampler2D uSrcTex;\n"
+			"uniform sampler2D uSrc2Tex;\n"
+			"uniform vec4 uRoiDev;\n"
+			"uniform vec4 uCropDev;\n"
+			"uniform vec4 uFbSize;\n"
+			"uniform vec4 uP0;\n"
+			"uniform vec4 uP1;\n"
+			"uniform vec4 uP2;\n"
+			"uniform vec4 uP3;\n"
+			"uniform vec4 uP4;\n"
+			"uniform ivec4 uI0;\n"
+			"uniform vec4 uKernel[7];\n"
+			"in vec2 vUv;\n"
+			"out vec4 outColor;\n"
+			"vec2 dev_to_uv(vec2 dp) { return vec2(dp.x * uFbSize.z, 1.0 - dp.y * uFbSize.w); }\n"
+			"vec4 sample_clamped(sampler2D t, vec2 dp) {\n"
+			"	vec2 cp = clamp(dp, uRoiDev.xy + vec2(0.5), uRoiDev.zw - vec2(0.5));\n"
+			"	return texture(t, dev_to_uv(cp));\n"
+			"}\n"
+			"vec4 sample_dev(sampler2D t, vec2 dp) {\n"
+			"	if (dp.x < uRoiDev.x || dp.x > uRoiDev.z || dp.y < uRoiDev.y || dp.y > uRoiDev.w) return vec4(0.0);\n"
+			"	return sample_clamped(t, dp);\n"
+			"}\n"
+			"float get_k(int idx) {\n"
+			"	vec4 v = uKernel[idx >> 2];\n"
+			"	int c = idx & 3;\n"
+			"	if (c == 0) return v.x;\n"
+			"	if (c == 1) return v.y;\n"
+			"	if (c == 2) return v.z;\n"
+			"	return v.w;\n"
+			"}\n"
+			"float read_ch(vec4 c, int ch) {\n"
+			"	if (ch == 0) return c.r;\n"
+			"	if (ch == 1) return c.g;\n"
+			"	if (ch == 2) return c.b;\n"
+			"	return c.a;\n"
+			"}\n"
+			"void main(void) {\n"
+			"	vec2 devPos = vec2(vUv.x * uFbSize.x, (1.0 - vUv.y) * uFbSize.y);\n"
+			"	if (devPos.x < uCropDev.x || devPos.x > uCropDev.z || devPos.y < uCropDev.y || devPos.y > uCropDev.w) {\n"
+			"		outColor = vec4(0.0); return;\n"
+			"	}\n"
+			"	int op = uI0.x;\n"
+			"	vec4 res = vec4(0.0);\n"
+			"	if (op == 1 || op == 2) {\n"
+			"		int r = clamp(uI0.y, 0, 64);\n"
+			"		vec2 stepDir = uP0.xy;\n"
+			"		vec4 acc = sample_clamped(uSrcTex, devPos - stepDir * float(r));\n"
+			"		for (int k = -64; k <= 64; ++k) {\n"
+			"			if (k < -r + 1 || k > r) continue;\n"
+			"			vec4 s = sample_clamped(uSrcTex, devPos + stepDir * float(k));\n"
+			"			acc = (op == 1) ? max(acc, s) : min(acc, s);\n"
+			"		}\n"
+			"		acc.rgb = min(acc.rgb, vec3(acc.a));\n"
+			"		res = acc;\n"
+			"	} else if (op == 3) {\n"
+			"		int kw = clamp(uI0.y, 1, 5); int kh = clamp(uI0.z, 1, 5); int tileMode = uI0.w;\n"
+			"		vec2 target = uP0.xy; float gain = uP0.z; float bias = uP0.w;\n"
+			"		bool convAlpha = (uP1.x > 0.5);\n"
+			"		vec4 sum = vec4(0.0);\n"
+			"		vec2 roiSz = max(uRoiDev.zw - uRoiDev.xy, vec2(1.0));\n"
+			"		for (int ky = 0; ky < 5; ++ky) {\n"
+			"			if (ky >= kh) break;\n"
+			"			for (int kx = 0; kx < 5; ++kx) {\n"
+			"				if (kx >= kw) break;\n"
+			"				float kv = get_k(ky * kw + kx);\n"
+			"				if (kv == 0.0) continue;\n"
+			"				vec2 sp = devPos + vec2(float(kx) - target.x, float(ky) - target.y);\n"
+			"				vec4 s;\n"
+			"				if (tileMode == 2) s = sample_dev(uSrcTex, sp);\n"
+			"				else if (tileMode == 1) s = sample_clamped(uSrcTex, uRoiDev.xy + mod(sp - uRoiDev.xy, roiSz));\n"
+			"				else s = sample_clamped(uSrcTex, sp);\n"
+			"				sum += s * kv;\n"
+			"			}\n"
+			"		}\n"
+			"		vec4 center = sample_clamped(uSrcTex, devPos);\n"
+			"		float a = clamp(convAlpha ? (sum.a * gain + bias) : center.a, 0.0, 1.0);\n"
+			"		res = vec4(clamp(sum.rgb * gain + vec3(bias), vec3(0.0), vec3(a)), a);\n"
+			"	} else if (op == 4) {\n"
+			"		vec4 d = sample_dev(uSrc2Tex, devPos);\n"
+			"		vec4 du = vec4(d.a > 1e-4 ? clamp(d.rgb / d.a, 0.0, 1.0) : vec3(0.0), d.a);\n"
+			"		float dx = (read_ch(du, uI0.y) - 0.5) * uP0.x;\n"
+			"		float dy = (read_ch(du, uI0.z) - 0.5) * uP0.y;\n"
+			"		res = sample_dev(uSrcTex, devPos + vec2(dx, dy));\n"
+			"	} else if (op == 5) {\n"
+			"		if (devPos.x >= uP0.x && devPos.x <= uP0.z && devPos.y >= uP0.y && devPos.y <= uP0.w) {\n"
+			"			vec2 sz = max(uP0.zw - uP0.xy, vec2(1e-3));\n"
+			"			vec2 t = (devPos - uP0.xy) / sz;\n"
+			"			vec2 ins = min(max(uP1.xy, vec2(0.0)), sz * 0.45);\n"
+			"			vec2 b = ins / sz;\n"
+			"			float wt = 1.0;\n"
+			"			if (b.x > 1e-4 || b.y > 1e-4) {\n"
+			"				float wx = (b.x > 1e-4) ? (min(t.x, 1.0 - t.x) / b.x) : 1.0;\n"
+			"				float wy = (b.y > 1e-4) ? (min(t.y, 1.0 - t.y) / b.y) : 1.0;\n"
+			"				float m = clamp(min(wx, wy), 0.0, 1.0);\n"
+			"				wt = m * m * (3.0 - 2.0 * m);\n"
+			"			}\n"
+			"			vec2 zpos = (uP0.xy + ins) + t * (sz - 2.0 * ins);\n"
+			"			res = sample_dev(uSrcTex, mix(devPos, zpos, wt));\n"
+			"		}\n"
+			"	} else if (op == 6) {\n"
+			"		vec4 fg = sample_dev(uSrcTex, devPos);\n"
+			"		vec4 bg = sample_dev(uSrc2Tex, devPos);\n"
+			"		res = clamp(uP0.x * fg * bg + uP0.y * fg + uP0.z * bg + vec4(uP0.w), 0.0, 1.0);\n"
+			"		if (uI0.y != 0) res.rgb = min(res.rgb, vec3(res.a));\n"
+			"	} else if (op == 7) {\n"
+			"		vec2 sp = vec2(uP0.x * devPos.x + uP0.z * devPos.y + uP1.x,\n"
+			"		               uP0.y * devPos.x + uP0.w * devPos.y + uP1.y);\n"
+			"		if (sp.x >= uRoiDev.x && sp.x <= uRoiDev.z && sp.y >= uRoiDev.y && sp.y <= uRoiDev.w) {\n"
+			"			if (uI0.y == 0) sp = floor(sp) + vec2(0.5);\n"
+			"			res = sample_clamped(uSrcTex, sp);\n"
+			"		}\n"
+			"	} else if (op == 8) {\n"
+			"		if (devPos.x >= uP1.x && devPos.x <= uP1.z && devPos.y >= uP1.y && devPos.y <= uP1.w) {\n"
+			"			vec2 ssz = max(uP0.zw, vec2(1e-3));\n"
+			"			vec2 sp = uP0.xy + mod(devPos - uP0.xy, ssz);\n"
+			"			res = sample_dev(uSrcTex, sp);\n"
+			"		}\n"
+			"	} else if (op == 9) {\n"
+			"		bool inside = (devPos.x >= uP0.x && devPos.x <= uP0.z && devPos.y >= uP0.y && devPos.y <= uP0.w);\n"
+			"		vec4 c = sample_dev(uSrcTex, devPos);\n"
+			"		float newA = clamp(inside ? max(c.a, uP1.x) : min(c.a, uP1.y), 0.0, 1.0);\n"
+			"		vec3 rgb = (c.a > 1e-4) ? clamp(c.rgb * (newA / c.a), vec3(0.0), vec3(newA)) : vec3(0.0);\n"
+			"		res = vec4(rgb, newA);\n"
+			"	} else if (op == 10) {\n"
+			"		int lkind = uI0.y; float surfScale = uP0.w;\n"
+			"		float a00 = sample_clamped(uSrcTex, devPos + vec2(-1.0, -1.0)).a;\n"
+			"		float a10 = sample_clamped(uSrcTex, devPos + vec2( 0.0, -1.0)).a;\n"
+			"		float a20 = sample_clamped(uSrcTex, devPos + vec2( 1.0, -1.0)).a;\n"
+			"		float a01 = sample_clamped(uSrcTex, devPos + vec2(-1.0,  0.0)).a;\n"
+			"		float a11 = sample_clamped(uSrcTex, devPos).a;\n"
+			"		float a21 = sample_clamped(uSrcTex, devPos + vec2( 1.0,  0.0)).a;\n"
+			"		float a02 = sample_clamped(uSrcTex, devPos + vec2(-1.0,  1.0)).a;\n"
+			"		float a12 = sample_clamped(uSrcTex, devPos + vec2( 0.0,  1.0)).a;\n"
+			"		float a22 = sample_clamped(uSrcTex, devPos + vec2( 1.0,  1.0)).a;\n"
+			"		float ddx = (-a00 + a20 - 2.0 * a01 + 2.0 * a21 - a02 + a22) * (surfScale * 0.25);\n"
+			"		float ddy = (-a00 - 2.0 * a10 - a20 + a02 + 2.0 * a12 + a22) * (surfScale * 0.25);\n"
+			"		vec3 N = normalize(vec3(-ddx, -ddy, 1.0));\n"
+			"		vec2 lp = vec2(uP4.x * devPos.x + uP4.z * devPos.y + uKernel[0].x,\n"
+			"		               uP4.y * devPos.x + uP4.w * devPos.y + uKernel[0].y);\n"
+			"		vec3 L = (lkind == 0 || lkind == 1) ? normalize(uP0.xyz) : normalize(uP0.xyz - vec3(lp, surfScale * a11));\n"
+			"		float atten = 1.0;\n"
+			"		if (lkind == 4 || lkind == 5) {\n"
+			"			vec3 S = normalize(uP1.xyz - uP0.xyz);\n"
+			"			float cosA = dot(-L, S);\n"
+			"			atten = (cosA <= 0.0 || (uP3.z < 180.0 && cosA < uP3.y)) ? 0.0 : pow(cosA, max(uP3.x, 0.0));\n"
+			"		}\n"
+			"		bool isSpec = (lkind == 1 || lkind == 3 || lkind == 5);\n"
+			"		float inten = isSpec ? (uP1.w * pow(max(dot(N, normalize(L + vec3(0.0, 0.0, 1.0))), 0.0), max(uP2.w, 1e-4)) * atten)\n"
+			"		                     : (uP1.w * max(dot(N, L), 0.0) * atten);\n"
+			"		vec3 rgb = clamp(inten * uP2.rgb, 0.0, 1.0);\n"
+			"		res = vec4(rgb, isSpec ? max(max(rgb.r, rgb.g), rgb.b) : 1.0);\n"
+			"	}\n"
+			"	outColor = res;\n"
+			"}\n";
+		if (createShader(m_impl->filterOpsShader, "filter_ops_shader", shaderHeader, nullptr, blurVertShader, filterOpsFrag)) {
+			const GLuint p = m_impl->filterOpsShader.prog;
+			m_impl->locFilterOpsSrc = glGetUniformLocation(p, "uSrcTex");
+			m_impl->locFilterOpsSrc2 = glGetUniformLocation(p, "uSrc2Tex");
+			m_impl->locFilterOpsRoiDev = glGetUniformLocation(p, "uRoiDev");
+			m_impl->locFilterOpsCropDev = glGetUniformLocation(p, "uCropDev");
+			m_impl->locFilterOpsFbSize = glGetUniformLocation(p, "uFbSize");
+			m_impl->locFilterOpsP0 = glGetUniformLocation(p, "uP0");
+			m_impl->locFilterOpsP1 = glGetUniformLocation(p, "uP1");
+			m_impl->locFilterOpsP2 = glGetUniformLocation(p, "uP2");
+			m_impl->locFilterOpsP3 = glGetUniformLocation(p, "uP3");
+			m_impl->locFilterOpsP4 = glGetUniformLocation(p, "uP4");
+			m_impl->locFilterOpsI0 = glGetUniformLocation(p, "uI0");
+			m_impl->locFilterOpsKernel = glGetUniformLocation(p, "uKernel");
+		}
 	}
 
 	if (m_impl->flags & CreateFlags::StencilStrokes) {
@@ -3150,6 +4785,17 @@ void GL3Renderer::shutdown() {
 	deleteShader(m_impl->circleVertShader);
 	deleteShader(m_impl->rectVertShader);
 	deleteShader(m_impl->blurShader);
+	deleteShader(m_impl->filterBlendShader);
+	deleteShader(m_impl->filterColorShader);
+	deleteShader(m_impl->filterOpsShader);
+	for (auto& [hash, rfp] : m_impl->runtimeFilterCache) {
+		deleteShader(rfp.shader);
+	}
+	m_impl->runtimeFilterCache.clear();
+	for (auto& [hash, rbp] : m_impl->runtimeBlenderCache) {
+		deleteShader(rbp.shader);
+	}
+	m_impl->runtimeBlenderCache.clear();
 	for (int t = 0; t < 3; ++t) {
 		for (int k = 0; k < 2; ++k) {
 			if (m_impl->blurTierFbo[t][k] != 0) {
@@ -4331,7 +5977,8 @@ void GL3Renderer::popLayer(const LayerDesc& desc, const Scissor& parentScissor, 
 	}
 
 	Paint popPaint;
-	popPaint.innerColor = Color(1.0f, 1.0f, 1.0f, std::clamp(desc.opacity, 0.0f, 1.0f));
+	const bool hasCustomBlender = desc.blender.has_value() && desc.blender->is_custom();
+	popPaint.innerColor = Color(1.0f, 1.0f, 1.0f, hasCustomBlender ? 1.0f : std::clamp(desc.opacity, 0.0f, 1.0f));
 	popPaint.outerColor = popPaint.innerColor;
 	popPaint.hasColorMatrix = desc.hasColorMatrix;
 	popPaint.colorMatrix = desc.colorMatrix;

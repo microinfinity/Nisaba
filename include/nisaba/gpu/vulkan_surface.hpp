@@ -45,6 +45,9 @@ public:
     [[nodiscard]] VkRenderPass render_pass_load() const noexcept { return render_pass_load_; }
     [[nodiscard]] VkFramebuffer framebuffer() const noexcept { return framebuffer_; }
     [[nodiscard]] VkCommandBuffer current_command_buffer() const noexcept { return command_buffer_; }
+    [[nodiscard]] VkImage color_image() const noexcept { return color_image_; }
+    [[nodiscard]] VkImageView color_view() const noexcept { return color_view_; }
+    [[nodiscard]] bool in_render_pass() const noexcept { return in_render_pass_; }
 
     void begin_render_pass(nisaba::Color clear_color, bool load_previous = false);
     void end_render_pass();

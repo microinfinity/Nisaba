@@ -1496,6 +1496,213 @@ Shader::Shader(ComposeShader comp)
     : type_(Type::ComposeShader),
       complex_(std::make_shared<ComposeShader>(std::move(comp))) {}
 
+Shader::Shader(PerlinNoiseShader noise)
+    : type_(Type::PerlinNoise),
+      complex_(std::make_shared<PerlinNoiseShader>(std::move(noise))) {}
+
+namespace {
+
+inline int32_t perlin_wrap(int32_t v, int32_t period) noexcept {
+    if (period <= 0) return v;
+    int32_t m = v % period;
+    return (m < 0) ? (m + period) : m;
+}
+
+inline void perlin_grad2(int32_t ix, int32_t iy, int32_t ch, uint32_t seed_u, float& gx, float& gy) noexcept {
+    uint32_t h = static_cast<uint32_t>(ix) * 374761393u +
+                 static_cast<uint32_t>(iy) * 668265263u +
+                 static_cast<uint32_t>(ch) * 2147483647u +
+                 seed_u * 1274126177u;
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    const uint32_t idx = (h ^ (h >> 16u)) & 7u;
+    static constexpr float kGx[8] = {1.0f, -1.0f, 0.0f, 0.0f, 0.70710678f, -0.70710678f, 0.70710678f, -0.70710678f};
+    static constexpr float kGy[8] = {0.0f, 0.0f, 1.0f, -1.0f, 0.70710678f, 0.70710678f, -0.70710678f, -0.70710678f};
+    gx = kGx[idx];
+    gy = kGy[idx];
+}
+
+inline float perlin_2d_channel(float px, float py, int32_t ch, uint32_t seed_u, int32_t period_x, int32_t period_y) noexcept {
+    const float fx_floor = std::floor(px);
+    const float fy_floor = std::floor(py);
+    const int32_t ix = static_cast<int32_t>(fx_floor);
+    const int32_t iy = static_cast<int32_t>(fy_floor);
+    const float tx = px - fx_floor;
+    const float ty = py - fy_floor;
+
+    const int32_t x0 = perlin_wrap(ix, period_x);
+    const int32_t x1 = perlin_wrap(ix + 1, period_x);
+    const int32_t y0 = perlin_wrap(iy, period_y);
+    const int32_t y1 = perlin_wrap(iy + 1, period_y);
+
+    float g00x, g00y, g10x, g10y, g01x, g01y, g11x, g11y;
+    perlin_grad2(x0, y0, ch, seed_u, g00x, g00y);
+    perlin_grad2(x1, y0, ch, seed_u, g10x, g10y);
+    perlin_grad2(x0, y1, ch, seed_u, g01x, g01y);
+    perlin_grad2(x1, y1, ch, seed_u, g11x, g11y);
+
+    const float n00 = g00x * tx + g00y * ty;
+    const float n10 = g10x * (tx - 1.0f) + g10y * ty;
+    const float n01 = g01x * tx + g01y * (ty - 1.0f);
+    const float n11 = g11x * (tx - 1.0f) + g11y * (ty - 1.0f);
+
+    const float u = tx * tx * tx * (tx * (tx * 6.0f - 15.0f) + 10.0f);
+    const float v = ty * ty * ty * (ty * (ty * 6.0f - 15.0f) + 10.0f);
+    const float nx0 = n00 + u * (n10 - n00);
+    const float nx1 = n01 + u * (n11 - n01);
+    return nx0 + v * (nx1 - nx0);
+}
+
+} // namespace
+
+std::optional<PerlinNoiseShader> PerlinNoiseShader::create_impl(
+    PerlinNoiseType type,
+    float base_freq_x,
+    float base_freq_y,
+    int num_octaves,
+    float seed,
+    std::optional<IntSize> tile_size,
+    Transform transform
+) {
+    if (!std::isfinite(base_freq_x) || !std::isfinite(base_freq_y) ||
+        base_freq_x < 0.0f || base_freq_y < 0.0f || num_octaves < 0) {
+        return std::nullopt;
+    }
+    PerlinNoiseShader p;
+    p.noise_type_ = type;
+    p.base_freq_x_ = base_freq_x;
+    p.base_freq_y_ = base_freq_y;
+    p.num_octaves_ = std::clamp(num_octaves, 0, 16);
+    p.seed_ = std::isfinite(seed) ? seed : 0.0f;
+    p.tile_size_ = tile_size;
+    p.transform_ = transform;
+
+    if (tile_size.has_value() && tile_size->width() > 0 && tile_size->height() > 0) {
+        const float tw = static_cast<float>(tile_size->width());
+        const float th = static_cast<float>(tile_size->height());
+        if (p.base_freq_x_ > 0.0f) {
+            const float lo = std::floor(tw * p.base_freq_x_) / tw;
+            const float hi = std::ceil(tw * p.base_freq_x_) / tw;
+            p.base_freq_x_ = (lo > 0.0f && (p.base_freq_x_ / lo) < (hi / p.base_freq_x_)) ? lo : hi;
+        }
+        if (p.base_freq_y_ > 0.0f) {
+            const float lo = std::floor(th * p.base_freq_y_) / th;
+            const float hi = std::ceil(th * p.base_freq_y_) / th;
+            p.base_freq_y_ = (lo > 0.0f && (p.base_freq_y_ / lo) < (hi / p.base_freq_y_)) ? lo : hi;
+        }
+    }
+
+    p.update_inv();
+    return p;
+}
+
+std::optional<PerlinNoiseShader> PerlinNoiseShader::create_fractal_noise(
+    float base_freq_x, float base_freq_y, int num_octaves, float seed,
+    std::optional<IntSize> tile_size, Transform transform
+) {
+    return create_impl(PerlinNoiseType::FractalNoise, base_freq_x, base_freq_y, num_octaves, seed, tile_size, transform);
+}
+
+std::optional<PerlinNoiseShader> PerlinNoiseShader::create_turbulence(
+    float base_freq_x, float base_freq_y, int num_octaves, float seed,
+    std::optional<IntSize> tile_size, Transform transform
+) {
+    return create_impl(PerlinNoiseType::Turbulence, base_freq_x, base_freq_y, num_octaves, seed, tile_size, transform);
+}
+
+void PerlinNoiseShader::update_inv() noexcept {
+    inv_ts_ = transform_.invert();
+}
+
+void PerlinNoiseShader::set_transform(const Transform& ts) noexcept {
+    transform_ = ts;
+    update_inv();
+}
+
+void PerlinNoiseShader::post_concat(const Transform& ts) noexcept {
+    transform_ = transform_.post_concat(ts);
+    update_inv();
+}
+
+void PerlinNoiseShader::apply_opacity(float opacity) noexcept {
+    opacity_ = std::clamp(opacity_ * opacity, 0.0f, 1.0f);
+}
+
+Color PerlinNoiseShader::sample(float x, float y) const noexcept {
+    if (num_octaves_ <= 0) {
+        return (noise_type_ == PerlinNoiseType::FractalNoise)
+            ? Color::from_rgba_unchecked(0.5f, 0.5f, 0.5f, 0.5f * opacity_)
+            : Color::TRANSPARENT;
+    }
+
+    Point lp = Point::from_xy(x, y);
+    if (inv_ts_.has_value()) {
+        inv_ts_->map_point(lp);
+    }
+
+    const uint32_t seed_u = static_cast<uint32_t>(static_cast<int32_t>(std::floor(seed_)));
+    int32_t base_px = 0;
+    int32_t base_py = 0;
+    if (tile_size_.has_value() && tile_size_->width() > 0 && tile_size_->height() > 0) {
+        base_px = std::max(1, static_cast<int32_t>(std::round(static_cast<float>(tile_size_->width()) * base_freq_x_)));
+        base_py = std::max(1, static_cast<int32_t>(std::round(static_cast<float>(tile_size_->height()) * base_freq_y_)));
+    }
+
+    float ch_out[4]{0.0f, 0.0f, 0.0f, 0.0f};
+    const bool is_turb = (noise_type_ == PerlinNoiseType::Turbulence);
+
+    float fx = lp.x * base_freq_x_;
+    float fy = lp.y * base_freq_y_;
+    float amp = 1.0f;
+    int32_t px = base_px;
+    int32_t py = base_py;
+
+    for (int o = 0; o < num_octaves_; ++o) {
+        for (int c = 0; c < 4; ++c) {
+            float n = perlin_2d_channel(fx, fy, c, seed_u, px, py);
+            ch_out[c] += (is_turb ? std::abs(n) : n) * amp;
+        }
+        fx *= 2.0f;
+        fy *= 2.0f;
+        amp *= 0.5f;
+        px *= 2;
+        py *= 2;
+    }
+
+    for (int c = 0; c < 4; ++c) {
+        float v = is_turb ? ch_out[c] : (ch_out[c] * 0.5f + 0.5f);
+        ch_out[c] = std::clamp(v, 0.0f, 1.0f);
+    }
+    return Color::from_rgba_unchecked(ch_out[0], ch_out[1], ch_out[2], std::clamp(ch_out[3] * opacity_, 0.0f, 1.0f));
+}
+
+PremultipliedColor PerlinNoiseShader::sample_premul(float x, float y) const noexcept {
+    return sample(x, y).premultiply();
+}
+
+void PerlinNoiseShader::shade_span(float x, float y, uint32_t count, PremultipliedColorU8* dst) const noexcept {
+    for (uint32_t i = 0; i < count; ++i) {
+        dst[i] = sample_premul(x + static_cast<float>(i), y).to_color_u8();
+    }
+}
+
+Shader Shader::create_fractal_noise(
+    float base_freq_x, float base_freq_y, int num_octaves, float seed,
+    std::optional<IntSize> tile_size, Transform transform
+) {
+    auto n = PerlinNoiseShader::create_fractal_noise(base_freq_x, base_freq_y, num_octaves, seed, tile_size, transform);
+    if (!n) return Shader::from_color(Color::TRANSPARENT);
+    return Shader(std::move(*n));
+}
+
+Shader Shader::create_turbulence(
+    float base_freq_x, float base_freq_y, int num_octaves, float seed,
+    std::optional<IntSize> tile_size, Transform transform
+) {
+    auto n = PerlinNoiseShader::create_turbulence(base_freq_x, base_freq_y, num_octaves, seed, tile_size, transform);
+    if (!n) return Shader::from_color(Color::TRANSPARENT);
+    return Shader(std::move(*n));
+}
+
 Shader Shader::create_compose(Shader dst, Shader src, BlendMode mode) {
     return Shader(ComposeShader(std::move(dst), std::move(src), mode));
 }
@@ -1538,6 +1745,10 @@ const ComposeShader& Shader::compose_shader() const noexcept {
     return *std::get<std::shared_ptr<ComposeShader>>(complex_);
 }
 
+const PerlinNoiseShader& Shader::perlin_noise() const noexcept {
+    return *std::get<std::shared_ptr<PerlinNoiseShader>>(complex_);
+}
+
 bool Shader::is_opaque() const noexcept {
     switch (type_) {
         case Type::SolidColor:
@@ -1566,6 +1777,8 @@ bool Shader::is_opaque() const noexcept {
             const auto& ptr = std::get<std::shared_ptr<ComposeShader>>(complex_);
             return ptr ? ptr->is_opaque() : false;
         }
+        case Type::PerlinNoise:
+            return false;
     }
     return false;
 }
@@ -1667,6 +1880,14 @@ void Shader::apply_opacity(float opacity) noexcept {
             ptr->apply_opacity(opacity);
             break;
         }
+        case Type::PerlinNoise: {
+            auto& ptr = std::get<std::shared_ptr<PerlinNoiseShader>>(complex_);
+            if (ptr.use_count() > 1) {
+                ptr = std::make_shared<PerlinNoiseShader>(*ptr);
+            }
+            ptr->apply_opacity(opacity);
+            break;
+        }
     }
 }
 
@@ -1722,6 +1943,14 @@ void Shader::transform(const Transform& ts) noexcept {
             ptr->transform(ts);
             break;
         }
+        case Type::PerlinNoise: {
+            auto& ptr = std::get<std::shared_ptr<PerlinNoiseShader>>(complex_);
+            if (ptr.use_count() > 1) {
+                ptr = std::make_shared<PerlinNoiseShader>(*ptr);
+            }
+            ptr->post_concat(ts);
+            break;
+        }
     }
 }
 
@@ -1751,6 +1980,10 @@ Color Shader::sample(float x, float y) const noexcept {
         }
         case Type::ComposeShader: {
             const auto& ptr = std::get<std::shared_ptr<ComposeShader>>(complex_);
+            return ptr ? ptr->sample(x, y) : Color::TRANSPARENT;
+        }
+        case Type::PerlinNoise: {
+            const auto& ptr = std::get<std::shared_ptr<PerlinNoiseShader>>(complex_);
             return ptr ? ptr->sample(x, y) : Color::TRANSPARENT;
         }
     }
@@ -1783,6 +2016,10 @@ PremultipliedColor Shader::sample_premul(float x, float y) const noexcept {
         }
         case Type::ComposeShader: {
             const auto& ptr = std::get<std::shared_ptr<ComposeShader>>(complex_);
+            return ptr ? ptr->sample_premul(x, y) : PremultipliedColor{};
+        }
+        case Type::PerlinNoise: {
+            const auto& ptr = std::get<std::shared_ptr<PerlinNoiseShader>>(complex_);
             return ptr ? ptr->sample_premul(x, y) : PremultipliedColor{};
         }
     }
@@ -1829,6 +2066,13 @@ void Shader::shade_span(float x, float y, uint32_t count, PremultipliedColorU8* 
         }
     } else if (type_ == Type::Pattern) {
         const auto& ptr = std::get<std::shared_ptr<Pattern>>(complex_);
+        if (ptr) {
+            ptr->shade_span(x, y, count, dst);
+        } else {
+            std::fill_n(dst, count, PremultipliedColorU8::TRANSPARENT);
+        }
+    } else if (type_ == Type::PerlinNoise) {
+        const auto& ptr = std::get<std::shared_ptr<PerlinNoiseShader>>(complex_);
         if (ptr) {
             ptr->shade_span(x, y, count, dst);
         } else {

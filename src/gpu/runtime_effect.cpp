@@ -858,6 +858,7 @@ RuntimeEffect::Result RuntimeEffect::MakeForShader(std::string_view sksl) {
     effect->children_ = std::move(children);
     effect->default_uniforms_ = std::move(default_uniforms);
     effect->declared_functions_ = std::move(declared_functions);
+    effect->source_code_ = std::string(sksl);
     effect->transformed_code_ = std::move(transformed_code);
     effect->has_color_in_ = has_color_in;
     effect->uniform_size_ = current_offset;
@@ -1005,6 +1006,29 @@ std::shared_ptr<Shader> RuntimeShaderBuilder::makeShader(const Transform2D* loca
 std::shared_ptr<Shader> RuntimeShaderBuilder::makeShader(const nisaba::Transform* localMatrix) {
     Transform2D lm = localMatrix ? Transform2D(*localMatrix) : Transform2D::identity();
     return std::make_shared<RuntimeShader>(effect_, uniform_data_, lm, children_);
+}
+
+effects::ImageFilter RuntimeShaderBuilder::make_image_filter(
+    std::string_view input_child_name,
+    std::optional<effects::ImageFilter> input,
+    std::optional<Rect> crop_rect
+) const {
+    if (!effect_) return effects::ImageFilter{};
+    auto spec = effects::parse_runtime_filter_source(effect_->source_code(), nullptr, input_child_name);
+    if (!spec) return effects::ImageFilter{};
+    for (const auto& eu : effect_->uniforms()) {
+        if (eu.offset + eu.sizeInBytes > uniform_data_.size()) continue;
+        for (const auto& su : spec->uniforms) {
+            if (su.name == eu.name) {
+                const size_t ncopy = std::min(su.size_bytes, eu.sizeInBytes);
+                if (su.offset + ncopy <= spec->uniform_data.size()) {
+                    std::memcpy(spec->uniform_data.data() + su.offset, uniform_data_.data() + eu.offset, ncopy);
+                }
+                break;
+            }
+        }
+    }
+    return effects::ImageFilter::runtime_shader(std::move(spec), std::move(input), crop_rect);
 }
 
 } // namespace nisaba::gpu

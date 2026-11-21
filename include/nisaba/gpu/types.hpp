@@ -11,8 +11,13 @@
 #include "nisaba/math/point.hpp"
 #include "nisaba/math/rect.hpp"
 #include "nisaba/math/transform.hpp"
+#include "nisaba/effects/image_filter.hpp"
+#include "nisaba/effects/mask_filter.hpp"
+#include "nisaba/effects/blender.hpp"
 
 namespace nisaba::gpu {
+
+class Shader;
 
 inline constexpr float PI = 3.14159265358979323846f;
 inline constexpr float KAPPA90 = 0.5522847493f; // Length proportional to radius of cubic bezier handle for 90deg arcs
@@ -373,6 +378,12 @@ struct LayerDesc {
 	float shadowDy{0.0f};
 	Color shadowColor{0.0f, 0.0f, 0.0f, 0.0f};
 	bool shadowOnly{false};
+	std::optional<effects::ImageFilter> imageFilter{std::nullopt};
+	std::optional<effects::MaskFilter> maskFilter{std::nullopt};
+	std::optional<effects::ColorEffect> extColorEffect{std::nullopt};
+	std::optional<effects::Blender> blender{std::nullopt};
+	Color maskTintColor{1.0f, 1.0f, 1.0f, 1.0f};
+	Transform2D layerTransform{Transform2D::identity()};
 };
 
 // -------------------------------------------------------------
@@ -383,7 +394,9 @@ enum class GradientKind : uint8_t {
 	Linear = 1,
 	Radial = 2,
 	Sweep = 3,
-	TwoPointConical = 4
+	TwoPointConical = 4,
+	PerlinFractal = 5,
+	PerlinTurbulence = 6
 };
 
 enum class SpreadKind : uint8_t {
@@ -418,7 +431,7 @@ struct Paint {
 	std::array<float, 4> gradParams0{};
 	std::array<float, 4> gradParams1{};
 	std::array<GradientStopGPU, 16> gradStops{};
-	std::shared_ptr<class Shader> customShader{nullptr};
+	std::shared_ptr<nisaba::gpu::Shader> customShader{nullptr};
 
 	[[nodiscard]] bool hasAdvancedGradient() const noexcept {
 		return gradientKind != GradientKind::None;
@@ -431,7 +444,7 @@ struct Paint {
 		return p;
 	}
 
-	static Paint custom(std::shared_ptr<class Shader> sh) {
+	static Paint custom(std::shared_ptr<nisaba::gpu::Shader> sh) {
 		Paint p;
 		p.customShader = std::move(sh);
 		return p;

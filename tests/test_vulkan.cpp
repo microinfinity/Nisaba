@@ -497,6 +497,333 @@ void test_vulkan_text_and_svg_parity() {
     std::cout << "  -> Vulkan Text & SVG Parity OK" << std::endl;
 }
 
+void test_vulkan_layers_and_image_filter_dag_parity() {
+    std::cout << "Testing Vulkan Offscreen Layers & Phase 1.1 Composable ImageFilter DAG parity..." << std::endl;
+
+    auto device = VulkanDevice::create();
+    assert(device != nullptr && device->is_valid());
+
+    // 1. SaveLayer opacity + bounds + Blur & DropShadow ImageFilter
+    verify_vulkan_parity(device, 240, 200, Color::from_rgba8(22, 28, 42, 255),
+        "VK SaveLayer + Blur & DropShadow",
+        [&](ICanvas& c, bool) {
+            Paint lp(Color::from_rgba8(255, 255, 255, 180));
+            c.save_layer_bounds(*Rect::from_xywh(10.0f, 10.0f, 100.0f, 80.0f), lp);
+            c.fill_rect(*Rect::from_xywh(15.0f, 15.0f, 55.0f, 55.0f), Paint(Color::from_rgba8(230, 50, 50, 255)));
+            c.fill_rect(*Rect::from_xywh(45.0f, 30.0f, 55.0f, 55.0f), Paint(Color::from_rgba8(40, 120, 240, 255)));
+            c.restore();
+
+            Paint bp(Color::from_rgba8(220, 90, 50, 255));
+            bp.set_image_filter(effects::ImageFilter::blur(3.0f, 1.5f));
+            c.fill_round_rect(*Rect::from_xywh(130.0f, 20.0f, 80.0f, 55.0f), 8.0f, 8.0f, bp);
+
+            Paint dsp(Color::from_rgba8(50, 190, 130, 255));
+            dsp.set_image_filter(effects::ImageFilter::drop_shadow(
+                6.0f, 6.0f, 3.0f, 3.0f, Color::from_rgba8(0, 0, 0, 200), false));
+            c.fill_rect(*Rect::from_xywh(30.0f, 115.0f, 80.0f, 50.0f), dsp);
+        },
+        {{30, 30}, {55, 45}, {170, 47}, {70, 140}, {114, 168}}, 12, 4.5f);
+
+    // 2. Composable DAG: Compose + Offset + ColorFilter + CropRect + Merge + Blend
+    verify_vulkan_parity(device, 260, 200, Color::from_rgba8(22, 26, 36, 255),
+        "VK Composable ImageFilter DAG",
+        [&](ICanvas& c, bool) {
+            Paint p1(Color::from_rgba8(230, 60, 50, 255));
+            auto crop = Rect::from_xywh(35.0f, 25.0f, 55.0f, 55.0f);
+            p1.set_image_filter(effects::ImageFilter::compose(
+                effects::ImageFilter::color_filter(effects::ColorEffect::invert(), std::nullopt, crop),
+                effects::ImageFilter::offset(15.0f, 10.0f)
+            ));
+            c.fill_rect(*Rect::from_xywh(15.0f, 15.0f, 65.0f, 65.0f), p1);
+
+            Paint pm(Color::from_rgba8(240, 80, 50, 255));
+            auto sh = effects::ImageFilter::blur(2.5f,
+                effects::ImageFilter::offset(14.0f, 10.0f,
+                    effects::ImageFilter::color_filter(
+                        effects::ColorEffect::mode(Color::from_rgba8(40, 120, 250, 210), BlendMode::SourceIn))));
+            pm.set_image_filter(effects::ImageFilter::merge(sh, std::optional<effects::ImageFilter>{std::nullopt}));
+            c.fill_rect(*Rect::from_xywh(130.0f, 25.0f, 65.0f, 55.0f), pm);
+
+            Paint pb(Color::from_rgba8(200, 120, 60, 255));
+            auto bg_branch = effects::ImageFilter::offset(-10.0f, 0.0f,
+                effects::ImageFilter::color_filter(
+                    effects::ColorEffect::mode(Color::from_rgba8(80, 180, 240, 255), BlendMode::SourceIn)));
+            auto fg_branch = effects::ImageFilter::offset(10.0f, 0.0f);
+            pb.set_image_filter(effects::ImageFilter::blend(BlendMode::Screen, bg_branch, fg_branch));
+            c.fill_rect(*Rect::from_xywh(80.0f, 120.0f, 65.0f, 55.0f), pb);
+        },
+        {{55, 50}, {22, 22}, {92, 50}, {160, 50}, {202, 65}, {76, 145}, {112, 145}, {148, 145}}, 12, 4.5f);
+
+    std::cout << "  -> Vulkan Offscreen Layers & Phase 1.1 ImageFilter DAG Parity OK" << std::endl;
+}
+
+void test_vulkan_mask_filter_and_perlin_noise_parity() {
+    std::cout << "Testing Vulkan Phase 1.3 BlurMaskFilter & Phase 1.4 PerlinNoiseShader parity..." << std::endl;
+
+    auto device = VulkanDevice::create();
+    assert(device != nullptr && device->is_valid());
+
+    verify_vulkan_parity(device, 260, 200, Color::from_rgba8(20, 24, 34, 255),
+        "VK BlurMaskFilter 4 Modes",
+        [&](ICanvas& c, bool) {
+            const effects::BlurStyle styles[4] = {
+                effects::BlurStyle::Normal,
+                effects::BlurStyle::Solid,
+                effects::BlurStyle::Outer,
+                effects::BlurStyle::Inner
+            };
+            const Color colors[4] = {
+                Color::from_rgba8(240, 80, 60, 255),
+                Color::from_rgba8(60, 200, 120, 255),
+                Color::from_rgba8(70, 150, 250, 255),
+                Color::from_rgba8(240, 190, 50, 255)
+            };
+            for (int i = 0; i < 4; ++i) {
+                Paint p(colors[i]);
+                p.set_mask_filter(effects::MaskFilter::blur(styles[i], 4.0f));
+                float x = 15.0f + static_cast<float>(i % 2) * 125.0f;
+                float y = 18.0f + static_cast<float>(i / 2) * 95.0f;
+                c.fill_round_rect(*Rect::from_xywh(x, y, 90.0f, 65.0f), 10.0f, 10.0f, p);
+            }
+        },
+        {{60, 50}, {185, 50}, {60, 145}, {15, 145}, {185, 145}, {137, 145}}, 12, 3.5f);
+
+    verify_vulkan_parity(device, 260, 200, Color::from_rgba8(20, 24, 34, 255),
+        "VK PerlinNoiseShader Fractal & Turbulence",
+        [&](ICanvas& c, bool) {
+            Paint pf(Shader::create_fractal_noise(0.05f, 0.05f, 4, 3.0f));
+            c.fill_rect(*Rect::from_xywh(15.0f, 20.0f, 105.0f, 160.0f), pf);
+
+            Paint pt(Shader::create_turbulence(0.0625f, 0.0625f, 4, 11.0f, IntSize::from_wh(32, 32)));
+            c.fill_rect(*Rect::from_xywh(135.0f, 20.0f, 105.0f, 160.0f), pt);
+        },
+        {{40, 50}, {85, 110}, {165, 65}, {210, 140}}, 4, 1.5f);
+
+    std::cout << "  -> Vulkan BlurMaskFilter & PerlinNoiseShader Parity OK" << std::endl;
+}
+
+void test_vulkan_runtime_shader_image_filter_parity() {
+    std::cout << "Testing Vulkan Phase 1.2 RuntimeShader ImageFilter parity..." << std::endl;
+
+    auto device = VulkanDevice::create();
+    assert(device != nullptr && device->is_valid());
+
+    const char* kPostFxSrc = R"(
+        uniform shader content;
+        uniform float shift;
+        uniform vec3 gain;
+        vec4 main(vec2 pos) {
+            vec4 cr = content.eval(pos + vec2(shift, 0.0));
+            vec4 cg = content.eval(pos);
+            vec4 cb = content.eval(pos - vec2(shift, 0.0));
+            float a = max(max(cr.a, cg.a), cb.a);
+            return vec4(cr.r * gain.r, cg.g * gain.g, cb.b * gain.b, a);
+        }
+    )";
+
+    verify_vulkan_parity(device, 220, 160, Color::from_rgba8(18, 22, 32, 255),
+        "VK RuntimeShader ImageFilter",
+        [&](ICanvas& c, bool) {
+            effects::RuntimeFilterUniforms u;
+            u.set_float("shift", 7.0f).set_vec3("gain", 1.0f, 0.85f, 0.95f);
+            auto crop = Rect::from_xywh(16.0f, 16.0f, 188.0f, 128.0f);
+            Paint lp;
+            lp.set_image_filter(effects::ImageFilter::runtime_shader(kPostFxSrc, u, "content", std::nullopt, crop));
+            c.save_layer_bounds(*Rect::from_xywh(10.0f, 10.0f, 200.0f, 140.0f), lp);
+            c.fill_rect(*Rect::from_xywh(45.0f, 35.0f, 130.0f, 90.0f), Paint(Color::from_rgba8(240, 210, 230, 255)));
+            c.restore();
+        },
+        {{41, 80}, {110, 80}, {178, 80}, {10, 10}}, 4, 1.5f);
+
+    std::cout << "  -> Vulkan RuntimeShader ImageFilter Parity OK" << std::endl;
+}
+
+void test_vulkan_phase2_and_lighting_parity() {
+    std::cout << "Testing Vulkan Phase 2 (Morphology/Conv/Distort/Arith/Xform/Tile/Alpha) & Phase 4.1 (3D Lighting) parity..." << std::endl;
+
+    auto device = VulkanDevice::create();
+    assert(device != nullptr && device->is_valid());
+
+    verify_vulkan_parity(device, 260, 220, Color::from_rgba8(16, 20, 28, 255),
+        "VK Dilate/Erode/Conv/Arith",
+        [&](ICanvas& c, bool) {
+            Paint pd(Color::from_rgba8(240, 80, 50, 255));
+            pd.set_image_filter(effects::ImageFilter::dilate(4.0f, 4.0f));
+            c.fill_rect(*Rect::from_xywh(20.0f, 20.0f, 45.0f, 45.0f), pd);
+
+            Paint pe(Color::from_rgba8(60, 210, 120, 255));
+            pe.set_image_filter(effects::ImageFilter::erode(4.0f, 4.0f));
+            c.fill_rect(*Rect::from_xywh(95.0f, 20.0f, 45.0f, 45.0f), pe);
+
+            Paint pc(Color::from_rgba8(80, 150, 240, 255));
+            pc.set_image_filter(effects::ImageFilter::matrix_convolution(
+                3, 3, {-1, -1, -1, -1, 9, -1, -1, -1, -1}, 1.0f, 0.0f, 1, 1, effects::FilterTileMode::Clamp, false));
+            c.fill_rect(*Rect::from_xywh(175.0f, 20.0f, 55.0f, 45.0f), pc);
+
+            Paint pa(Color::from_rgba8(220, 40, 60, 255));
+            auto bgf = effects::ImageFilter::color_filter(
+                effects::ColorEffect::mode(Color::from_rgba8(40, 200, 220, 255), BlendMode::SourceIn));
+            pa.set_image_filter(effects::ImageFilter::arithmetic(0.0f, 0.5f, 0.5f, 0.0f, true, bgf, std::nullopt));
+            c.fill_rect(*Rect::from_xywh(20.0f, 110.0f, 80.0f, 65.0f), pa);
+        },
+        {{18, 42}, {117, 42}, {97, 42}, {200, 42}, {60, 140}}, 8, 2.5f);
+
+    verify_vulkan_parity(device, 260, 220, Color::from_rgba8(16, 20, 28, 255),
+        "VK Disp/Mag/Xform/Tile/Alpha",
+        [&](ICanvas& c, bool) {
+            Paint pdm(Color::from_rgba8(230, 180, 50, 255));
+            auto disp_src = effects::ImageFilter::color_filter(
+                effects::ColorEffect::mode(Color::from_rgba8(255, 128, 0, 255), BlendMode::SourceIn));
+            pdm.set_image_filter(effects::ImageFilter::displacement_map(
+                effects::ColorChannel::R, effects::ColorChannel::G, 16.0f, disp_src, std::nullopt));
+            c.fill_rect(*Rect::from_xywh(25.0f, 20.0f, 40.0f, 40.0f), pdm);
+
+            Paint pmag;
+            pmag.set_image_filter(effects::ImageFilter::magnifier(*Rect::from_xywh(90.0f, 15.0f, 70.0f, 70.0f), 12.0f));
+            c.save_layer_bounds(*Rect::from_xywh(85.0f, 10.0f, 80.0f, 80.0f), pmag);
+            c.fill_rect(*Rect::from_xywh(105.0f, 30.0f, 40.0f, 40.0f), Paint(Color::from_rgba8(240, 90, 160, 255)));
+            c.restore();
+
+            Paint pmx(Color::from_rgba8(90, 220, 210, 255));
+            pmx.set_image_filter(effects::ImageFilter::matrix_transform(Transform::from_translate(12.0f, 8.0f), FilterQuality::Bilinear));
+            c.fill_rect(*Rect::from_xywh(180.0f, 20.0f, 45.0f, 45.0f), pmx);
+
+            Paint ptl;
+            ptl.set_image_filter(effects::ImageFilter::tile(*Rect::from_xywh(20.0f, 115.0f, 20.0f, 20.0f), *Rect::from_xywh(20.0f, 115.0f, 80.0f, 60.0f)));
+            c.save_layer_bounds(*Rect::from_xywh(15.0f, 110.0f, 90.0f, 70.0f), ptl);
+            c.fill_rect(*Rect::from_xywh(20.0f, 115.0f, 10.0f, 10.0f), Paint(Color::from_rgba8(240, 210, 60, 255)));
+            c.restore();
+
+            Paint pat(Color::from_rgba8(180, 100, 240, 128));
+            pat.set_image_filter(effects::ImageFilter::alpha_threshold(*Rect::from_xywh(140.0f, 125.0f, 60.0f, 50.0f), 0.9f, 0.2f));
+            c.fill_rect(*Rect::from_xywh(120.0f, 115.0f, 100.0f, 70.0f), pat);
+        },
+        {{40, 40}, {125, 50}, {210, 48}, {45, 140}, {170, 150}, {126, 150}}, 10, 3.0f);
+
+    verify_vulkan_parity(device, 260, 220, Color::from_rgba8(16, 20, 28, 255),
+        "VK 3D Surface Lighting",
+        [&](ICanvas& c, bool) {
+            auto bump = effects::ImageFilter::blur(3.0f);
+            Paint p1(Color::WHITE);
+            p1.set_image_filter(effects::ImageFilter::distant_lit_diffuse(
+                effects::Point3{0.5f, -0.5f, 1.0f}, Color::from_rgba8(255, 220, 180, 255), 6.0f, 1.0f, bump));
+            c.fill_oval(*Rect::from_xywh(23.0f, 28.0f, 64.0f, 64.0f), p1);
+
+            Paint p2(Color::WHITE);
+            p2.set_image_filter(effects::ImageFilter::point_lit_specular(
+                effects::Point3{135.0f, 45.0f, 60.0f}, Color::from_rgba8(140, 210, 255, 255), 8.0f, 1.0f, 12.0f, bump));
+            c.fill_oval(*Rect::from_xywh(113.0f, 28.0f, 64.0f, 64.0f), p2);
+
+            Paint p3(Color::WHITE);
+            p3.set_image_filter(effects::ImageFilter::spot_lit_diffuse(
+                effects::Point3{120.0f, 130.0f, 90.0f}, effects::Point3{130.0f, 155.0f, 0.0f},
+                4.0f, 45.0f, Color::from_rgba8(255, 180, 220, 255), 6.0f, 1.0f, bump));
+            c.fill_oval(*Rect::from_xywh(95.0f, 120.0f, 70.0f, 70.0f), p3);
+        },
+        {{55, 60}, {32, 42}, {145, 60}, {130, 155}}, 14, 4.5f);
+
+    std::cout << "  -> Vulkan Phase 2 & Phase 4.1 3D Lighting Parity OK" << std::endl;
+}
+
+void test_vulkan_phase3_and_phase4_2_parity() {
+    std::cout << "Testing Vulkan Phase 3.1 (Ext ColorEffect), Phase 3.2 (PathEffect) & Phase 4.2 (Blender/ShaderMask) parity..." << std::endl;
+
+    auto device = VulkanDevice::create();
+    assert(device != nullptr && device->is_valid());
+
+    verify_vulkan_parity(device, 260, 220, Color::from_rgba8(24, 34, 52, 255),
+        "VK Extended ColorEffects",
+        [&](ICanvas& c, bool) {
+            auto grad = Shader(*LinearGradient::create(
+                Point::from_xy(0.0f, 0.0f), Point::from_xy(260.0f, 0.0f),
+                {GradientStop::create(0.0f, Color::from_rgba8(240, 60, 40, 255)),
+                 GradientStop::create(0.5f, Color::from_rgba8(60, 220, 100, 255)),
+                 GradientStop::create(1.0f, Color::from_rgba8(50, 100, 240, 255))}
+            ));
+
+            std::array<uint8_t, 256> post{};
+            for (int i = 0; i < 256; ++i) post[i] = static_cast<uint8_t>((i / 64) * 64);
+            Paint p_tbl(grad);
+            p_tbl.set_color_filter(effects::ColorEffect::table(post));
+            c.fill_rect(*Rect::from_xywh(10.0f, 10.0f, 240.0f, 32.0f), p_tbl);
+
+            effects::ColorMatrix hmat = effects::ColorMatrix::identity();
+            hmat.m[4] = 0.33f;
+            Paint p_hsla(grad);
+            p_hsla.set_color_filter(effects::ColorEffect::hsla_matrix(hmat));
+            c.fill_rect(*Rect::from_xywh(10.0f, 52.0f, 240.0f, 32.0f), p_hsla);
+
+            Paint p_luma(grad);
+            p_luma.set_color_filter(effects::ColorEffect::luma());
+            c.fill_rect(*Rect::from_xywh(10.0f, 94.0f, 240.0f, 32.0f), p_luma);
+
+            Paint p_hc(grad);
+            p_hc.set_color_filter(effects::ColorEffect::high_contrast(
+                effects::HighContrastConfig{false, effects::HighContrastInvertStyle::InvertLightness, 0.25f}));
+            c.fill_rect(*Rect::from_xywh(10.0f, 136.0f, 240.0f, 32.0f), p_hc);
+
+            Paint p_lerp(grad);
+            p_lerp.set_color_filter(effects::ColorEffect::lerp(0.5f, effects::ColorEffect::invert(), effects::ColorEffect::grayscale()));
+            c.fill_rect(*Rect::from_xywh(10.0f, 178.0f, 240.0f, 32.0f), p_lerp);
+        },
+        {{60, 25}, {180, 25}, {60, 68}, {130, 110}, {130, 152}, {130, 194}}, 8, 2.5f);
+
+    verify_vulkan_parity(device, 260, 220, Color::from_rgba8(24, 34, 52, 255),
+        "VK Composable PathEffects",
+        [&](ICanvas& c, bool) {
+            Stroke st; st.width = 4.0f;
+            Paint p1(Color::from_rgba8(240, 100, 60, 255));
+            p1.set_path_effect(effects::PathEffect::corner(14.0f));
+            c.fill_rect(*Rect::from_xywh(15.0f, 15.0f, 65.0f, 55.0f), p1);
+
+            Paint p2(Color::from_rgba8(80, 220, 140, 255));
+            p2.set_path_effect(effects::PathEffect::trim(0.15f, 0.75f));
+            c.stroke_rect(*Rect::from_xywh(100.0f, 15.0f, 65.0f, 55.0f), p2, st);
+
+            Path dot = PathBuilder::from_circle(0.0f, 0.0f, 3.5f).value();
+            Paint p4(Color::from_rgba8(240, 200, 60, 255));
+            p4.set_path_effect(effects::PathEffect::path_1d(dot, 12.0f, 0.0f, effects::Path1DStyle::Rotate));
+            c.stroke_rect(*Rect::from_xywh(20.0f, 105.0f, 80.0f, 80.0f), p4, st);
+
+            Paint p5(Color::from_rgba8(220, 100, 240, 255));
+            p5.set_path_effect(effects::PathEffect::path_2d(Transform::from_scale(14.0f, 14.0f), dot));
+            c.fill_rect(*Rect::from_xywh(135.0f, 105.0f, 100.0f, 80.0f), p5);
+        },
+        {{45, 42}, {16, 16}, {130, 15}, {185, 145}}, 12, 3.5f);
+
+    verify_vulkan_parity(device, 260, 220, Color::from_rgba8(24, 34, 52, 255),
+        "VK Blenders & ShaderMaskFilter",
+        [&](ICanvas& c, bool) {
+            Paint pa(Color::from_rgba8(230, 60, 50, 255));
+            pa.set_blender(effects::Blender::arithmetic(0.0f, 0.6f, 0.4f, 0.0f, true));
+            c.fill_rect(*Rect::from_xywh(15.0f, 20.0f, 70.0f, 75.0f), pa);
+
+            const char* kMaxBlend = R"(
+                uniform float gain;
+                vec4 main(vec4 src, vec4 dst) {
+                    return vec4(clamp(max(src.rgb * gain, dst.rgb), 0.0, 1.0), 1.0);
+                }
+            )";
+            effects::RuntimeFilterUniforms bu;
+            bu.set_float("gain", 0.9f);
+            Paint pr(Color::from_rgba8(240, 180, 40, 255));
+            pr.set_blender(effects::Blender::runtime(kMaxBlend, bu));
+            c.fill_rect(*Rect::from_xywh(100.0f, 20.0f, 70.0f, 75.0f), pr);
+
+            auto mask_grad = Shader(*LinearGradient::create(
+                Point::from_xy(20.0f, 0.0f), Point::from_xy(220.0f, 0.0f),
+                {GradientStop::create(0.0f, Color::from_rgba8(255, 255, 255, 0)),
+                 GradientStop::create(1.0f, Color::from_rgba8(255, 255, 255, 255))}
+            ));
+            Paint psm(Color::from_rgba8(80, 230, 160, 255));
+            psm.set_mask_filter(effects::MaskFilter::shader(mask_grad));
+            c.fill_rect(*Rect::from_xywh(20.0f, 120.0f, 200.0f, 75.0f), psm);
+        },
+        {{50, 55}, {135, 55}, {40, 155}, {120, 155}, {200, 155}}, 6, 2.0f);
+
+    std::cout << "  -> Vulkan Phase 3.1, Phase 3.2 & Phase 4.2 Parity OK" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "Running Nisaba Vulkan GPU Backend Test Suite" << std::endl;
@@ -508,9 +835,14 @@ int main() {
     test_vulkan_gradients_and_color_filters();
     test_vulkan_geometry_clip_blend_and_shadows();
     test_vulkan_text_and_svg_parity();
+    test_vulkan_layers_and_image_filter_dag_parity();
+    test_vulkan_mask_filter_and_perlin_noise_parity();
+    test_vulkan_runtime_shader_image_filter_parity();
+    test_vulkan_phase2_and_lighting_parity();
+    test_vulkan_phase3_and_phase4_2_parity();
 
     std::cout << "========================================" << std::endl;
-    std::cout << "All Nisaba Vulkan GPU tests PASSED (6/6)!" << std::endl;
+    std::cout << "All Nisaba Vulkan GPU tests PASSED (11/11)!" << std::endl;
     std::cout << "========================================" << std::endl;
 
     return 0;

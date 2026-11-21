@@ -49,6 +49,9 @@ struct CanvasLayerState {
     PixmapMut saved_pixmap{};
     Paint composite_paint{};
     std::optional<ScreenIntRect> device_bounds{};
+    Transform layer_transform{};
+    std::optional<effects::MaskFilter> mask_filter{std::nullopt};
+    Color mask_tint{Color::WHITE};
 };
 
 class Canvas : public ICanvas {
@@ -117,6 +120,26 @@ public:
         }
 
         const ScreenIntRect bounds = *layer.device_bounds;
+        if (layer.mask_filter.has_value() && layer.mask_filter->is_active()) {
+            auto mut_layer = layer.backing_pixmap.as_mut();
+            const size_t bpp = mut_layer.bytes_per_pixel();
+            uint8_t* ptr = mut_layer.row_raw(bounds.y()) + static_cast<size_t>(bounds.x()) * bpp;
+            if (auto sub = PixmapMut::from_raw_parts(
+                    ptr,
+                    bounds.width(),
+                    bounds.height(),
+                    mut_layer.stride_bytes(),
+                    mut_layer.format())) {
+                effects::apply_mask_blur_cpu(
+                    *sub,
+                    layer.mask_filter->style,
+                    layer.mask_filter->sigma,
+                    layer.mask_tint,
+                    layer.layer_transform,
+                    layer.mask_filter->respect_ctm
+                );
+            }
+        }
         if (layer.composite_paint.has_image_filter()) {
             const auto& imgf = *layer.composite_paint.image_filter;
             auto mut_layer = layer.backing_pixmap.as_mut();
@@ -128,100 +151,13 @@ public:
                     bounds.height(),
                     mut_layer.stride_bytes(),
                     mut_layer.format())) {
-                if (imgf.kind == effects::ImageFilterKind::Blur) {
-                    effects::gaussian_blur_pixmap_xy(*sub, imgf.sigma_x, imgf.sigma_y);
-                } else if (imgf.kind == effects::ImageFilterKind::DropShadow) {
-                    if (auto shadow_pix = Pixmap::allocate(sub->width(), sub->height(), sub->format())) {
-                        auto shadow_mut = shadow_pix->as_mut();
-                        PremultipliedColorU8 sc = imgf.color.premultiply().to_color_u8();
-                        const bool is_bgra = (sub->format() == PixelFormat::BGRA8888);
-                        if (is_bgra) {
-                            sc = PremultipliedColorU8::from_rgba_unchecked(sc.b, sc.g, sc.r, sc.a);
-                        }
-                        const uint32_t sw = sub->width();
-                        const uint32_t sh = sub->height();
-                        if (sub->format() == PixelFormat::RGBA8888 || is_bgra) {
-                            for (uint32_t y = 0; y < sh; ++y) {
-                                const auto* src_row = sub->row(y);
-                                auto* dst_row = shadow_mut.row(y);
-                                for (uint32_t x = 0; x < sw; ++x) {
-                                    uint32_t a = src_row[x].a;
-                                    if (a == 0) continue;
-                                    dst_row[x] = PremultipliedColorU8::from_rgba_unchecked(
-                                        static_cast<uint8_t>((sc.r * a + 128u) / 255u),
-                                        static_cast<uint8_t>((sc.g * a + 128u) / 255u),
-                                        static_cast<uint8_t>((sc.b * a + 128u) / 255u),
-                                        static_cast<uint8_t>((sc.a * a + 128u) / 255u)
-                                    );
-                                }
-                            }
-                        } else {
-                            PremultipliedColorU8 rgba_sc = imgf.color.premultiply().to_color_u8();
-                            for (uint32_t y = 0; y < sh; ++y) {
-                                for (uint32_t x = 0; x < sw; ++x) {
-                                    if (auto px = sub->pixel(x, y)) {
-                                        uint32_t a = px->a;
-                                        if (a == 0) continue;
-                                        shadow_mut.set_pixel(x, y, PremultipliedColorU8::from_rgba_unchecked(
-                                            static_cast<uint8_t>((rgba_sc.r * a + 128u) / 255u),
-                                            static_cast<uint8_t>((rgba_sc.g * a + 128u) / 255u),
-                                            static_cast<uint8_t>((rgba_sc.b * a + 128u) / 255u),
-                                            static_cast<uint8_t>((rgba_sc.a * a + 128u) / 255u)
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-
-                        effects::gaussian_blur_pixmap_xy(shadow_mut, imgf.sigma_x, imgf.sigma_y);
-
-                        const int32_t dx_i = static_cast<int32_t>(std::round(imgf.dx));
-                        const int32_t dy_i = static_cast<int32_t>(std::round(imgf.dy));
-                        const int32_t iw = static_cast<int32_t>(sw);
-                        const int32_t ih = static_cast<int32_t>(sh);
-                        if (sub->format() == PixelFormat::RGBA8888 || is_bgra) {
-                            for (int32_t y = 0; y < ih; ++y) {
-                                int32_t sy = y - dy_i;
-                                auto* fg_row = sub->row(static_cast<size_t>(y));
-                                const auto* sh_row = (sy >= 0 && sy < ih) ? shadow_mut.row(static_cast<size_t>(sy)) : nullptr;
-                                for (int32_t x = 0; x < iw; ++x) {
-                                    int32_t sx = x - dx_i;
-                                    PremultipliedColorU8 sp = (sh_row && sx >= 0 && sx < iw)
-                                        ? sh_row[sx]
-                                        : PremultipliedColorU8::TRANSPARENT;
-                                    if (!imgf.shadow_only) {
-                                        PremultipliedColorU8 fg = fg_row[x];
-                                        if (fg.a > 0) {
-                                            simd::blend_source_over_span(&sp, &fg, 1);
-                                        }
-                                    }
-                                    fg_row[x] = sp;
-                                }
-                            }
-                        } else {
-                            for (int32_t y = 0; y < ih; ++y) {
-                                int32_t sy = y - dy_i;
-                                for (int32_t x = 0; x < iw; ++x) {
-                                    int32_t sx = x - dx_i;
-                                    PremultipliedColorU8 sp = PremultipliedColorU8::TRANSPARENT;
-                                    if (sy >= 0 && sy < ih && sx >= 0 && sx < iw) {
-                                        if (auto px = shadow_mut.pixel(static_cast<uint32_t>(sx), static_cast<uint32_t>(sy))) {
-                                            sp = *px;
-                                        }
-                                    }
-                                    if (!imgf.shadow_only) {
-                                        if (auto fg = sub->pixel(static_cast<uint32_t>(x), static_cast<uint32_t>(y))) {
-                                            if (fg->a > 0) {
-                                                simd::blend_source_over_span(&sp, &*fg, 1);
-                                            }
-                                        }
-                                    }
-                                    sub->set_pixel(static_cast<uint32_t>(x), static_cast<uint32_t>(y), sp);
-                                }
-                            }
-                        }
-                    }
-                }
+                effects::apply_image_filter_cpu(
+                    *sub,
+                    imgf,
+                    static_cast<int32_t>(bounds.x()),
+                    static_cast<int32_t>(bounds.y()),
+                    layer.layer_transform
+                );
             }
         }
 
@@ -252,6 +188,22 @@ public:
         px_paint.opacity = layer.composite_paint.shader.is_solid_color()
             ? std::clamp(layer.composite_paint.shader.solid_color().alpha(), 0.0f, 1.0f)
             : 1.0f;
+
+        if (layer.composite_paint.has_custom_blender()) {
+            const Mask* m = current_mask();
+            layer.composite_paint.blender->composite_cpu(
+                pixmap_,
+                layer.backing_pixmap.as_ref(),
+                static_cast<int32_t>(composite_clip->x()),
+                static_cast<int32_t>(composite_clip->y()),
+                static_cast<int32_t>(composite_clip->right()),
+                static_cast<int32_t>(composite_clip->bottom()),
+                px_paint.opacity,
+                m ? m->data() : nullptr,
+                m ? m->width() : 0u
+            );
+            return;
+        }
 
         painter::draw_pixmap(
             pixmap_, 0, 0, layer.backing_pixmap.as_ref(), px_paint,
@@ -478,7 +430,11 @@ public:
 
     void fill_rect(const Rect& rect, const Paint& paint) override {
         if (!scissor_clip_.has_value()) return;
-        if (paint.has_image_filter()) {
+        if (paint.has_path_effect()) {
+            fill_path(PathBuilder::from_rect(rect), paint, FillRule::Winding);
+            return;
+        }
+        if (paint.has_layer_filter()) {
             draw_with_image_filter(rect, paint, 0.0f, [&](const Paint& inner) {
                 painter::fill_rect(pixmap_, rect, inner, current_transform_, current_mask(), scissor_clip_);
             });
@@ -490,7 +446,22 @@ public:
 
     void fill_path(const Path& path, const Paint& paint, FillRule fill_rule = FillRule::Winding) override {
         if (!scissor_clip_.has_value()) return;
-        if (paint.has_image_filter()) {
+        if (paint.has_path_effect()) {
+            const auto& pe = *paint.path_effect;
+            Path mod = pe.apply(path);
+            Paint p2 = paint;
+            p2.clear_path_effect();
+            if (pe.needs_source_clip()) {
+                save();
+                clip_path(path, fill_rule);
+                fill_path(mod, p2, fill_rule);
+                restore();
+            } else {
+                fill_path(mod, p2, fill_rule);
+            }
+            return;
+        }
+        if (paint.has_layer_filter()) {
             draw_with_image_filter(path.bounds(), paint, 0.0f, [&](const Paint& inner) {
                 painter::fill_path(pixmap_, path, inner, fill_rule, current_transform_, current_mask(), scissor_clip_);
             });
@@ -502,7 +473,26 @@ public:
 
     void stroke_path(const Path& path, const Paint& paint, const Stroke& stroke) override {
         if (!scissor_clip_.has_value()) return;
-        if (paint.has_image_filter()) {
+        if (paint.has_path_effect()) {
+            const auto& pe = *paint.path_effect;
+            Path mod = pe.apply(path);
+            Paint p2 = paint;
+            p2.clear_path_effect();
+            if (pe.produces_fill_geometry()) {
+                if (pe.needs_source_clip()) {
+                    save();
+                    clip_path(path, FillRule::Winding);
+                    fill_path(mod, p2, FillRule::Winding);
+                    restore();
+                } else {
+                    fill_path(mod, p2, FillRule::Winding);
+                }
+            } else {
+                stroke_path(mod, p2, stroke);
+            }
+            return;
+        }
+        if (paint.has_layer_filter()) {
             const float margin = stroke_filter_margin(stroke);
             draw_with_image_filter(path.bounds(), paint, margin, [&](const Paint& inner) {
                 painter::stroke_path(pixmap_, path, inner, stroke, current_transform_, current_mask(), scissor_clip_);
@@ -515,7 +505,7 @@ public:
 
     void stroke_line(Point p0, Point p1, const Paint& paint, const Stroke& stroke) {
         if (!scissor_clip_.has_value()) return;
-        if (paint.has_image_filter()) {
+        if (paint.has_layer_filter()) {
             const float x0 = std::min(p0.x, p1.x);
             const float y0 = std::min(p0.y, p1.y);
             const float x1 = std::max(p0.x, p1.x);
@@ -537,7 +527,11 @@ public:
 
     void stroke_rect(const Rect& rect, const Paint& paint, const Stroke& stroke) override {
         if (!scissor_clip_.has_value()) return;
-        if (paint.has_image_filter()) {
+        if (paint.has_path_effect()) {
+            stroke_path(PathBuilder::from_rect(rect), paint, stroke);
+            return;
+        }
+        if (paint.has_layer_filter()) {
             const float margin = stroke_filter_margin(stroke);
             draw_with_image_filter(rect, paint, margin, [&](const Paint& inner) {
                 stroke_rect(rect, inner, stroke);
@@ -573,7 +567,7 @@ public:
 
     void fill_round_rect(const Rect& rect, float rx, float ry, const Paint& paint) override {
         if (!scissor_clip_.has_value()) return;
-        if (paint.has_image_filter()) {
+        if (paint.has_layer_filter()) {
             draw_with_image_filter(rect, paint, 0.0f, [&](const Paint& inner) {
                 painter::fill_round_rect(pixmap_, rect, rx, ry, inner, current_transform_, current_mask(), scissor_clip_);
             });
@@ -585,7 +579,7 @@ public:
 
     void stroke_round_rect(const Rect& rect, float rx, float ry, const Paint& paint, const Stroke& stroke) override {
         if (!scissor_clip_.has_value()) return;
-        if (paint.has_image_filter()) {
+        if (paint.has_layer_filter()) {
             const float margin = stroke_filter_margin(stroke);
             draw_with_image_filter(rect, paint, margin, [&](const Paint& inner) {
                 painter::stroke_round_rect(pixmap_, rect, rx, ry, inner, stroke, current_transform_, current_mask(), scissor_clip_);
@@ -659,7 +653,7 @@ public:
             }
         }
 
-        if (paint.has_image_filter()) {
+        if (paint.has_layer_filter()) {
             auto lb = Rect::from_xywh(cx - radius, cy - radius, radius * 2.0f, radius * 2.0f);
             const float margin = stroke_filter_margin(stroke);
             draw_with_image_filter(lb, paint, margin, [&](const Paint& inner) {
@@ -673,7 +667,7 @@ public:
 
     void fill_circle(float cx, float cy, float radius, const Paint& paint) {
         if (!scissor_clip_.has_value()) return;
-        if (paint.has_image_filter()) {
+        if (paint.has_layer_filter()) {
             auto lb = Rect::from_xywh(cx - radius, cy - radius, radius * 2.0f, radius * 2.0f);
             draw_with_image_filter(lb, paint, 0.0f, [&](const Paint& inner) {
                 painter::fill_circle(pixmap_, cx, cy, radius, inner, current_transform_, current_mask(), scissor_clip_);
@@ -1086,37 +1080,186 @@ private:
         float extra_margin,
         DrawFn&& draw_fn
     ) {
-        if (!paint.image_filter.has_value()) return;
-        const auto& imgf = *paint.image_filter;
-        std::optional<Rect> padded_bounds = std::nullopt;
-        if (local_bounds.has_value()) {
-            const float pad_x = std::ceil(imgf.sigma_x * 3.0f) + 2.0f + std::abs(imgf.dx) + extra_margin;
-            const float pad_y = std::ceil(imgf.sigma_y * 3.0f) + 2.0f + std::abs(imgf.dy) + extra_margin;
-            padded_bounds = Rect::from_xywh(
-                local_bounds->x() - pad_x,
-                local_bounds->y() - pad_y,
-                local_bounds->width() + 2.0f * pad_x,
-                local_bounds->height() + 2.0f * pad_y
-            );
+        if (paint.has_custom_blender()) {
+            const float mask_pad = (paint.has_mask_filter() && paint.mask_filter->is_blur())
+                ? (std::ceil(paint.mask_filter->sigma * 3.0f) + 2.0f) : 0.0f;
+            std::optional<Rect> padded_bounds = std::nullopt;
+            if (local_bounds.has_value()) {
+                Rect base = paint.has_image_filter() ? paint.image_filter->map_layer_bounds(*local_bounds) : *local_bounds;
+                const float tot = extra_margin + mask_pad + 1.0f;
+                padded_bounds = Rect::from_xywh(base.x() - tot, base.y() - tot, base.width() + 2.0f * tot, base.height() + 2.0f * tot);
+            }
+            Paint layer_paint(Color::WHITE);
+            layer_paint.blender = paint.blender;
+            Paint inner_paint = paint;
+            inner_paint.blender = std::nullopt;
+            inner_paint.blend_mode = BlendMode::SourceOver;
+            push_layer_internal(padded_bounds, layer_paint, false, 0.0f);
+            if (inner_paint.has_layer_filter()) {
+                draw_with_image_filter(local_bounds, inner_paint, extra_margin, std::forward<DrawFn>(draw_fn));
+            } else {
+                Paint resolved = resolve_paint(inner_paint);
+                draw_fn(resolved);
+            }
+            restore();
+            return;
         }
-        Paint layer_paint(Color::WHITE);
-        layer_paint.blend_mode = paint.blend_mode;
-        layer_paint.image_filter = imgf;
 
-        Paint inner_paint = resolve_paint(paint);
-        inner_paint.blend_mode = BlendMode::SourceOver;
-        inner_paint.image_filter = std::nullopt;
+        if (paint.has_image_filter()) {
+            const auto& imgf = *paint.image_filter;
+            const float mask_pad = (paint.has_mask_filter() && paint.mask_filter->is_blur())
+                ? (std::ceil(paint.mask_filter->sigma * 3.0f) + 2.0f) : 0.0f;
+            std::optional<Rect> padded_bounds = std::nullopt;
+            if (local_bounds.has_value()) {
+                const Rect mapped = imgf.map_layer_bounds(*local_bounds);
+                const float tot = extra_margin + mask_pad;
+                padded_bounds = Rect::from_xywh(
+                    mapped.x() - tot,
+                    mapped.y() - tot,
+                    mapped.width() + 2.0f * tot,
+                    mapped.height() + 2.0f * tot
+                );
+            }
+            Paint layer_paint(Color::WHITE);
+            layer_paint.blend_mode = paint.blend_mode;
+            layer_paint.image_filter = imgf;
 
-        push_layer_internal(padded_bounds, layer_paint, false, 0.0f);
-        draw_fn(inner_paint);
-        restore();
+            Paint inner_paint = paint;
+            inner_paint.blend_mode = BlendMode::SourceOver;
+            inner_paint.image_filter = std::nullopt;
+
+            push_layer_internal(padded_bounds, layer_paint, false, 0.0f);
+            if (inner_paint.has_layer_filter()) {
+                draw_with_image_filter(local_bounds, inner_paint, extra_margin, std::forward<DrawFn>(draw_fn));
+            } else {
+                Paint resolved = resolve_paint(inner_paint);
+                draw_fn(resolved);
+            }
+            restore();
+            return;
+        }
+
+        if (paint.has_extended_color_filter() && !paint.is_solid_color()) {
+            std::optional<Rect> padded_bounds = std::nullopt;
+            if (local_bounds.has_value()) {
+                const float tot = extra_margin + 1.0f;
+                padded_bounds = Rect::from_xywh(
+                    local_bounds->x() - tot, local_bounds->y() - tot,
+                    local_bounds->width() + 2.0f * tot, local_bounds->height() + 2.0f * tot);
+            }
+            Paint layer_paint(Color::WHITE);
+            layer_paint.blend_mode = paint.blend_mode;
+            layer_paint.color_effect = paint.color_effect;
+
+            Paint inner_paint = paint;
+            inner_paint.blend_mode = BlendMode::SourceOver;
+            inner_paint.clear_color_filter();
+
+            push_layer_internal(padded_bounds, layer_paint, false, 0.0f);
+            if (inner_paint.has_layer_filter()) {
+                draw_with_image_filter(local_bounds, inner_paint, extra_margin, std::forward<DrawFn>(draw_fn));
+            } else {
+                Paint resolved = resolve_paint(inner_paint);
+                draw_fn(resolved);
+            }
+            restore();
+            return;
+        }
+
+        if (paint.has_mask_filter()) {
+            const auto& mf = *paint.mask_filter;
+            if (mf.is_shader()) {
+                std::optional<Rect> padded_bounds = std::nullopt;
+                if (local_bounds.has_value()) {
+                    const float tot = extra_margin + 1.0f;
+                    padded_bounds = Rect::from_xywh(
+                        local_bounds->x() - tot, local_bounds->y() - tot,
+                        local_bounds->width() + 2.0f * tot, local_bounds->height() + 2.0f * tot);
+                }
+                Paint outer_paint(Color::WHITE);
+                outer_paint.blend_mode = paint.blend_mode;
+                push_layer_internal(padded_bounds, outer_paint, false, 0.0f);
+
+                Paint inner_paint = paint;
+                inner_paint.blend_mode = BlendMode::SourceOver;
+                inner_paint.clear_mask_filter();
+                Paint resolved = resolve_paint(inner_paint);
+                draw_fn(resolved);
+
+                Paint mask_p(*mf.mask_shader);
+                mask_p.blend_mode = BlendMode::DestinationIn;
+                Rect cover = padded_bounds.value_or(
+                    Rect::from_xywh(0.0f, 0.0f, static_cast<float>(width()), static_cast<float>(height())).value());
+                fill_rect(cover, mask_p);
+                restore();
+                return;
+            }
+            float pad = std::ceil(mf.sigma * 3.0f) + 2.0f + extra_margin;
+            if (!mf.respect_ctm) {
+                const float min_scale = std::min(
+                    std::hypot(current_transform_.sx, current_transform_.ky),
+                    std::hypot(current_transform_.kx, current_transform_.sy)
+                );
+                if (min_scale > 1e-4f) {
+                    pad = std::ceil((mf.sigma / min_scale) * 3.0f) + 2.0f + extra_margin;
+                }
+            }
+            std::optional<Rect> padded_bounds = std::nullopt;
+            if (local_bounds.has_value()) {
+                padded_bounds = Rect::from_xywh(
+                    local_bounds->x() - pad,
+                    local_bounds->y() - pad,
+                    local_bounds->width() + 2.0f * pad,
+                    local_bounds->height() + 2.0f * pad
+                );
+            }
+
+            Paint mask_draw_paint = paint;
+            mask_draw_paint.set_color(Color::WHITE);
+            mask_draw_paint.clear_color_filter();
+            mask_draw_paint.clear_image_filter();
+            mask_draw_paint.clear_mask_filter();
+            mask_draw_paint.blend_mode = BlendMode::SourceOver;
+
+            if (paint.is_solid_color()) {
+                Color tint = paint.shader.solid_color();
+                if (auto cf = paint.effective_color_effect()) {
+                    tint = cf->transform(tint);
+                }
+                Paint layer_paint(Color::WHITE);
+                layer_paint.blend_mode = paint.blend_mode;
+                push_layer_internal(padded_bounds, layer_paint, false, 0.0f, mf, tint);
+                draw_fn(mask_draw_paint);
+                restore();
+            } else {
+                Paint outer_paint(Color::WHITE);
+                outer_paint.blend_mode = paint.blend_mode;
+                push_layer_internal(padded_bounds, outer_paint, false, 0.0f);
+
+                push_layer_internal(padded_bounds, Paint(Color::WHITE), false, 0.0f, mf, Color::WHITE);
+                draw_fn(mask_draw_paint);
+                restore();
+
+                Paint shade_paint = paint;
+                shade_paint.clear_image_filter();
+                shade_paint.clear_mask_filter();
+                shade_paint.blend_mode = BlendMode::SourceIn;
+                Rect cover = padded_bounds.value_or(
+                    Rect::from_xywh(0.0f, 0.0f, static_cast<float>(width()), static_cast<float>(height())).value());
+                fill_rect(cover, shade_paint);
+                restore();
+            }
+            return;
+        }
     }
 
     void push_layer_internal(
         std::optional<Rect> bounds,
         const Paint& paint,
         bool with_backdrop,
-        float blur_sigma
+        float blur_sigma,
+        std::optional<effects::MaskFilter> mask_filter = std::nullopt,
+        Color mask_tint = Color::WHITE
     ) {
         auto dev_bounds = detail::clip_layer_bounds(
             bounds, current_transform_, width(), height(), scissor_clip_
@@ -1202,7 +1345,10 @@ private:
             .backing_pixmap = std::move(*off),
             .saved_pixmap = pixmap_,
             .composite_paint = paint,
-            .device_bounds = b
+            .device_bounds = b,
+            .layer_transform = current_transform_,
+            .mask_filter = mask_filter,
+            .mask_tint = mask_tint
         });
         pixmap_ = layer_stack_.back().backing_pixmap.as_mut();
         if (bounds.has_value() && current_transform_.has_skew()) {

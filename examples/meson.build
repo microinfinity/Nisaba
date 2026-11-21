@@ -30,6 +30,19 @@ showcase_effects_exe = executable('showcase_effects',
   dependencies : nisaba_dep
 )
 
+showcase_effects_adv_deps = [nisaba_dep]
+showcase_effects_adv_args = []
+if get_option('enable_gpu')
+  showcase_effects_adv_deps += [extra_deps]
+  showcase_effects_adv_args += ['-DNISABA_HAS_GPU=1']
+endif
+
+showcase_effects_advanced_exe = executable('showcase_effects_advanced',
+  'showcase_effects_advanced.cpp',
+  cpp_args : showcase_effects_adv_args,
+  dependencies : showcase_effects_adv_deps
+)
+
 showcase_svg_exe = executable('showcase_svg',
   'showcase_svg.cpp',
   dependencies : nisaba_dep

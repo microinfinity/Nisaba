@@ -52,6 +52,11 @@ nisaba_sources = files(
   'src/effects/color_matrix.cpp',
   'src/effects/drop_shadow.cpp',
   'src/effects/glass.cpp',
+  'src/effects/image_filter.cpp',
+  'src/effects/mask_filter.cpp',
+  'src/effects/runtime_filter.cpp',
+  'src/effects/path_effect.cpp',
+  'src/effects/blender.cpp',
   'src/svg/path_parser.cpp',
   'src/svg/svg_document.cpp',
   'src/svg/baked_svg.cpp',
@@ -329,7 +334,7 @@ pkg = import('pkgconfig')
 pkg.generate(
   nisaba_lib,
   name : 'nisaba',
-  description : 'Nisaba 2D Software CPU Rendering Engine for vaxp',
+  description : 'Nisaba — Full-Stack Graphics Engine for vaxp',
   version : meson.project_version(),
   subdirs : 'nisaba'
 )
