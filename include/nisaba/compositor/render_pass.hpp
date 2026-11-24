@@ -224,7 +224,8 @@ public:
         const RectI& destBox,
         const RectI& srcBox = RectI{0, 0, 0, 0},
         const DualKawaseConfig& config = {},
-        const Texture* maskTexture = nullptr);
+        const Texture* maskTexture = nullptr,
+        const Region* clip = nullptr);
 
     void renderBlurMaterial(
         IBlurProvider& provider,
@@ -232,7 +233,8 @@ public:
         const Texture& source,
         const RectI& destBox,
         const RectI& srcBox = RectI{0, 0, 0, 0},
-        const BlurContext& ctx = {});
+        const BlurContext& ctx = {},
+        const Region* clip = nullptr);
 
     bool submit() override;
 
@@ -251,6 +253,7 @@ public:
     [[nodiscard]] const std::shared_ptr<RenderTarget>& target() const noexcept { return m_target; }
     [[nodiscard]] const std::shared_ptr<ShaderManager>& shaders() const noexcept { return m_shaders; }
     [[nodiscard]] const Matrix3& projection() const noexcept { return m_projection; }
+    [[nodiscard]] wl_output_transform outputTransform() const noexcept { return m_outputTransform; }
 
 private:
     struct QueuedEntry {
@@ -267,6 +270,7 @@ private:
     std::shared_ptr<RenderTarget> m_target;
     std::shared_ptr<ShaderManager> m_shaders;
     Matrix3 m_projection;
+    wl_output_transform m_outputTransform{WL_OUTPUT_TRANSFORM_FLIPPED_180};
     std::vector<QueuedEntry> m_queue;
     mutable std::vector<float> m_quadScratch;
     bool m_submitted{false};

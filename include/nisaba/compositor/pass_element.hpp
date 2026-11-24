@@ -100,6 +100,7 @@ public:
     [[nodiscard]] virtual Region opaqueRegion() const noexcept { return Region{}; }
 
     [[nodiscard]] virtual bool needsLiveBlur() const noexcept { return false; }
+    [[nodiscard]] virtual int liveBlurPadding() const noexcept { return 0; }
     [[nodiscard]] virtual bool needsPrecomputedBlur() const noexcept { return false; }
     [[nodiscard]] virtual bool undiscardable() const noexcept { return false; }
 
@@ -165,6 +166,7 @@ public:
     [[nodiscard]] std::optional<RectI> boundingBox() const noexcept override;
     [[nodiscard]] Region opaqueRegion() const noexcept override;
     [[nodiscard]] bool needsLiveBlur() const noexcept override { return m_params.requiresLiveBlur; }
+    [[nodiscard]] int liveBlurPadding() const noexcept override { return m_params.requiresLiveBlur ? 48 : 0; }
     [[nodiscard]] bool needsPrecomputedBlur() const noexcept override { return m_params.blurredBackdrop != nullptr; }
 
     void draw(RenderPass& pass, const Region& visibleDamage) override;
@@ -282,6 +284,7 @@ public:
     [[nodiscard]] bool needsLiveBlur() const noexcept override {
         return !m_data.context.xray && (!m_data.provider || m_data.provider->requiresLiveBlur());
     }
+    [[nodiscard]] int liveBlurPadding() const noexcept override;
     [[nodiscard]] bool needsPrecomputedBlur() const noexcept override {
         return m_data.context.xray;
     }

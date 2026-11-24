@@ -1,10 +1,118 @@
 #include "nisaba/compositor/render_pass.hpp"
 #include "nisaba/compositor/log.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <vector>
 
 namespace nisaba::compositor {
+
+namespace {
+
+/**
+ * @brief Maps a target-space integer rectangle to an OpenGL scissor box with exact
+ * single-valued edge rounding so adjacent Region slices never overlap or gap by 1px.
+ */
+RectI mapTargetRectToGlScissor(
+    const RectI& r,
+    int fbW,
+    int fbH,
+    wl_output_transform transform) noexcept {
+    if (r.isEmpty() || fbW <= 0 || fbH <= 0) {
+        return RectI{0, 0, 0, 0};
+    }
+
+    const int x0 = std::clamp(r.x, 0, fbW);
+    const int y0 = std::clamp(r.y, 0, fbH);
+    const int x1 = std::clamp(r.x + r.width, 0, fbW);
+    const int y1 = std::clamp(r.y + r.height, 0, fbH);
+    if (x1 <= x0 || y1 <= y0) {
+        return RectI{0, 0, 0, 0};
+    }
+
+    int sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0;
+    switch (transform) {
+        case WL_OUTPUT_TRANSFORM_NORMAL:
+            sx0 = x0; sx1 = x1;
+            sy0 = fbH - y1; sy1 = fbH - y0;
+            break;
+        case WL_OUTPUT_TRANSFORM_FLIPPED_180:
+            sx0 = x0; sx1 = x1;
+            sy0 = y0; sy1 = y1;
+            break;
+        case WL_OUTPUT_TRANSFORM_180:
+            sx0 = fbW - x1; sx1 = fbW - x0;
+            sy0 = y0; sy1 = y1;
+            break;
+        case WL_OUTPUT_TRANSFORM_FLIPPED:
+            sx0 = fbW - x1; sx1 = fbW - x0;
+            sy0 = fbH - y1; sy1 = fbH - y0;
+            break;
+        case WL_OUTPUT_TRANSFORM_90:
+            sx0 = y0; sx1 = y1;
+            sy0 = x0; sy1 = x1;
+            break;
+        case WL_OUTPUT_TRANSFORM_270:
+            sx0 = fbW - y1; sx1 = fbW - y0;
+            sy0 = fbH - x1; sy1 = fbH - x0;
+            break;
+        case WL_OUTPUT_TRANSFORM_FLIPPED_90:
+            sx0 = y0; sx1 = y1;
+            sy0 = fbH - x1; sy1 = fbH - x0;
+            break;
+        case WL_OUTPUT_TRANSFORM_FLIPPED_270:
+            sx0 = fbW - y1; sx1 = fbW - y0;
+            sy0 = x0; sy1 = x1;
+            break;
+        default: {
+            const Matrix3 proj = Matrix3::project(fbW, fbH, transform);
+            const double nx0 = static_cast<double>(x0) * proj[0] + static_cast<double>(y0) * proj[1] + proj[2];
+            const double ny0 = static_cast<double>(x0) * proj[3] + static_cast<double>(y0) * proj[4] + proj[5];
+            const double nx1 = static_cast<double>(x1) * proj[0] + static_cast<double>(y1) * proj[1] + proj[2];
+            const double ny1 = static_cast<double>(x1) * proj[3] + static_cast<double>(y1) * proj[4] + proj[5];
+            sx0 = static_cast<int>(std::lround((std::min(nx0, nx1) * 0.5 + 0.5) * static_cast<double>(fbW)));
+            sx1 = static_cast<int>(std::lround((std::max(nx0, nx1) * 0.5 + 0.5) * static_cast<double>(fbW)));
+            sy0 = static_cast<int>(std::lround((std::min(ny0, ny1) * 0.5 + 0.5) * static_cast<double>(fbH)));
+            sy1 = static_cast<int>(std::lround((std::max(ny0, ny1) * 0.5 + 0.5) * static_cast<double>(fbH)));
+            break;
+        }
+    }
+
+    sx0 = std::clamp(sx0, 0, fbW);
+    sx1 = std::clamp(sx1, 0, fbW);
+    sy0 = std::clamp(sy0, 0, fbH);
+    sy1 = std::clamp(sy1, 0, fbH);
+    if (sx1 <= sx0 || sy1 <= sy0) {
+        return RectI{0, 0, 0, 0};
+    }
+    return RectI{sx0, sy0, sx1 - sx0, sy1 - sy0};
+}
+
+Region expandRegionClamped(const Region& reg, int pad, const RectI& bounds) {
+    if (reg.isEmpty()) return Region{};
+    if (pad <= 0) {
+        Region out = reg;
+        out.intersect(bounds);
+        return out;
+    }
+    Region expanded;
+    for (const auto& r : reg.rects()) {
+        if (r.isEmpty()) continue;
+        const RectI padded = RectI{
+            r.x - pad,
+            r.y - pad,
+            r.width + pad * 2,
+            r.height + pad * 2
+        }.intersection(bounds);
+        if (!padded.isEmpty()) {
+            expanded.add(padded);
+        }
+    }
+    return expanded;
+}
+
+} // namespace
 
 std::unique_ptr<RenderPass> RenderPass::begin(
     std::shared_ptr<RenderTarget> target,
@@ -23,7 +131,8 @@ RenderPass::RenderPass(
     std::shared_ptr<ShaderManager> shaders,
     wl_output_transform outputTransform)
     : m_target(std::move(target)),
-      m_shaders(std::move(shaders)) {
+      m_shaders(std::move(shaders)),
+      m_outputTransform(outputTransform) {
     m_target->bind();
     m_projection = Matrix3::project(m_target->width(), m_target->height(), outputTransform);
 
@@ -91,7 +200,15 @@ PassExecutionStats RenderPass::optimizeAndExecute(const Region& initialDamage) {
         }
 
         if (entry.element->needsLiveBlur() && !entry.visibleDamage.isEmpty()) {
-            stats.liveBlurRegion.unite(entry.visibleDamage);
+            const RectI targetBounds = m_target
+                ? RectI{0, 0, m_target->width(), m_target->height()}
+                : entry.visibleDamage.extents();
+            const int pad = std::max(0, entry.element->liveBlurPadding());
+            const Region blurSampleRegion = expandRegionClamped(entry.visibleDamage, pad, targetBounds);
+            stats.liveBlurRegion.unite(blurSampleRegion);
+            // Elements behind this live-blur element must render the full kernel halo,
+            // even if an opaque element above subtracted part of that area earlier.
+            remainingDamage.unite(blurSampleRegion);
         }
 
         Region opaque = entry.element->opaqueRegion();
@@ -538,9 +655,56 @@ void RenderPass::renderBlur(
     const RectI& destBox,
     const RectI& srcBox,
     const DualKawaseConfig& config,
-    const Texture* maskTexture) {
+    const Texture* maskTexture,
+    const Region* clip) {
     if (destBox.isEmpty() || !source.id() || !m_target) return;
-    blurEngine.renderBlurSubRegion(source, srcBox, *m_target, destBox, config, maskTexture);
+    if (!clip) {
+        blurEngine.renderBlurSubRegion(
+            source, srcBox, *m_target, destBox, config, maskTexture, m_outputTransform);
+        return;
+    }
+    if (clip->isEmpty() || !clip->intersects(destBox)) return;
+
+    const int fbW = m_target->width();
+    const int fbH = m_target->height();
+    const GLboolean prevScissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLint prevBox[4] = {0, 0, fbW, fbH};
+    if (prevScissor) {
+        glGetIntegerv(GL_SCISSOR_BOX, prevBox);
+    }
+
+    auto blurred = blurEngine.blur(source, config);
+    if (!blurred) {
+        return;
+    }
+
+    const RectI effectiveSrc = srcBox.isEmpty() ? destBox : srcBox;
+    const RectF normSrc{
+        static_cast<double>(effectiveSrc.x) / static_cast<double>(std::max(1u, source.width())),
+        static_cast<double>(effectiveSrc.y) / static_cast<double>(std::max(1u, source.height())),
+        static_cast<double>(effectiveSrc.width) / static_cast<double>(std::max(1u, source.width())),
+        static_cast<double>(effectiveSrc.height) / static_cast<double>(std::max(1u, source.height()))
+    };
+
+    glEnable(GL_SCISSOR_TEST);
+    for (const auto& c : clip->rects()) {
+        const RectI sub = destBox.intersection(c);
+        if (sub.isEmpty()) continue;
+        RectI sc = mapTargetRectToGlScissor(sub, fbW, fbH, m_outputTransform);
+        if (prevScissor) {
+            sc = sc.intersection(RectI{prevBox[0], prevBox[1], prevBox[2], prevBox[3]});
+        }
+        if (sc.isEmpty()) continue;
+        glScissor(sc.x, sc.y, sc.width, sc.height);
+        blurEngine.renderBlurredBackdrop(
+            *blurred, destBox, normSrc, *m_target, config, maskTexture, m_outputTransform);
+    }
+
+    if (prevScissor) {
+        glScissor(prevBox[0], prevBox[1], prevBox[2], prevBox[3]);
+    } else {
+        glDisable(GL_SCISSOR_TEST);
+    }
 }
 
 void RenderPass::renderBlurMaterial(
@@ -549,9 +713,50 @@ void RenderPass::renderBlurMaterial(
     const Texture& source,
     const RectI& destBox,
     const RectI& srcBox,
-    const BlurContext& ctx) {
+    const BlurContext& ctx,
+    const Region* clip) {
     if (destBox.isEmpty() || !source.id() || !m_target) return;
-    provider.renderMaterial(kawase, source, srcBox, *m_target, destBox, ctx);
+    BlurContext effectiveCtx = ctx;
+    effectiveCtx.transform = m_outputTransform;
+
+    if (!clip) {
+        provider.renderMaterial(kawase, source, srcBox, *m_target, destBox, effectiveCtx);
+        return;
+    }
+    if (clip->isEmpty() || !clip->intersects(destBox)) return;
+
+    const auto& rects = clip->rects();
+    if (rects.size() == 1 && destBox.intersection(rects[0]) == destBox) {
+        provider.renderMaterial(kawase, source, srcBox, *m_target, destBox, effectiveCtx);
+        return;
+    }
+
+    const int fbW = m_target->width();
+    const int fbH = m_target->height();
+    const GLboolean prevScissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLint prevBox[4] = {0, 0, fbW, fbH};
+    if (prevScissor) {
+        glGetIntegerv(GL_SCISSOR_BOX, prevBox);
+    }
+
+    glEnable(GL_SCISSOR_TEST);
+    for (const auto& c : rects) {
+        const RectI sub = destBox.intersection(c);
+        if (sub.isEmpty()) continue;
+        RectI sc = mapTargetRectToGlScissor(sub, fbW, fbH, m_outputTransform);
+        if (prevScissor) {
+            sc = sc.intersection(RectI{prevBox[0], prevBox[1], prevBox[2], prevBox[3]});
+        }
+        if (sc.isEmpty()) continue;
+        glScissor(sc.x, sc.y, sc.width, sc.height);
+        provider.renderMaterial(kawase, source, srcBox, *m_target, destBox, effectiveCtx);
+    }
+
+    if (prevScissor) {
+        glScissor(prevBox[0], prevBox[1], prevBox[2], prevBox[3]);
+    } else {
+        glDisable(GL_SCISSOR_TEST);
+    }
 }
 
 void RenderPass::renderQuads(
@@ -560,16 +765,17 @@ void RenderPass::renderQuads(
     GLint posAttrib) const {
     if (posAttrib < 0 || box.isEmpty()) return;
 
+    static constexpr float kFallbackUnitQuad[12] = {
+        0.0f, 0.0f,
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+        1.0f, 0.0f,
+        1.0f, 1.0f,
+        0.0f, 1.0f,
+    };
+
     auto drawUnit = [this, posAttrib]() {
         const GLuint vbo = m_shaders ? m_shaders->bindUnitQuadVbo() : 0;
-        static constexpr float kFallbackUnitQuad[12] = {
-            0.0f, 0.0f,
-            1.0f, 0.0f,
-            0.0f, 1.0f,
-            1.0f, 0.0f,
-            1.0f, 1.0f,
-            0.0f, 1.0f,
-        };
         glEnableVertexAttribArray(static_cast<GLuint>(posAttrib));
         glVertexAttribPointer(
             static_cast<GLuint>(posAttrib),
@@ -588,69 +794,29 @@ void RenderPass::renderQuads(
         return;
     }
 
-    if (clip->isEmpty() || !clip->intersects(box)) {
+    if (clip->isEmpty() || !clip->intersects(box) || !m_target) {
         return;
     }
 
-    const float invW = 1.0f / static_cast<float>(box.width);
-    const float invH = 1.0f / static_cast<float>(box.height);
+    const int fbW = m_target->width();
+    const int fbH = m_target->height();
+    if (fbW <= 0 || fbH <= 0) {
+        return;
+    }
+
     const auto& clipRects = clip->rects();
-
-    if (clipRects.size() == 1) {
-        const RectI r = box.intersection(clipRects[0]);
-        if (r.isEmpty()) return;
-        if (r == box) {
-            drawUnit();
-            return;
-        }
-        const float x1 = static_cast<float>(r.x - box.x) * invW;
-        const float y1 = static_cast<float>(r.y - box.y) * invH;
-        const float x2 = static_cast<float>(r.x + r.width - box.x) * invW;
-        const float y2 = static_cast<float>(r.y + r.height - box.y) * invH;
-        const float verts[12] = {
-            x1, y1,  x2, y1,  x1, y2,
-            x2, y1,  x2, y2,  x1, y2,
-        };
-        const GLuint vbo = m_shaders ? m_shaders->bindQuadStreamingVbo(verts, sizeof(verts)) : 0;
-        glEnableVertexAttribArray(static_cast<GLuint>(posAttrib));
-        glVertexAttribPointer(
-            static_cast<GLuint>(posAttrib),
-            2,
-            GL_FLOAT,
-            GL_FALSE,
-            0,
-            vbo ? nullptr : static_cast<const void*>(verts));
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-        glDisableVertexAttribArray(static_cast<GLuint>(posAttrib));
-        if (vbo) glBindBuffer(GL_ARRAY_BUFFER, 0);
+    if (clipRects.size() == 1 && box.intersection(clipRects[0]) == box) {
+        drawUnit();
         return;
     }
 
-    m_quadScratch.clear();
-    m_quadScratch.reserve(clipRects.size() * 12);
-    for (const auto& c : clipRects) {
-        if (!c.intersects(box)) continue;
-        const RectI r = box.intersection(c);
-        const float x1 = static_cast<float>(r.x - box.x) * invW;
-        const float y1 = static_cast<float>(r.y - box.y) * invH;
-        const float x2 = static_cast<float>(r.x + r.width - box.x) * invW;
-        const float y2 = static_cast<float>(r.y + r.height - box.y) * invH;
-
-        m_quadScratch.push_back(x1); m_quadScratch.push_back(y1);
-        m_quadScratch.push_back(x2); m_quadScratch.push_back(y1);
-        m_quadScratch.push_back(x1); m_quadScratch.push_back(y2);
-        m_quadScratch.push_back(x2); m_quadScratch.push_back(y1);
-        m_quadScratch.push_back(x2); m_quadScratch.push_back(y2);
-        m_quadScratch.push_back(x1); m_quadScratch.push_back(y2);
+    const GLboolean prevScissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLint prevBox[4] = {0, 0, fbW, fbH};
+    if (prevScissor) {
+        glGetIntegerv(GL_SCISSOR_BOX, prevBox);
     }
 
-    if (m_quadScratch.empty()) return;
-
-    const GLuint vbo = m_shaders
-        ? m_shaders->bindQuadStreamingVbo(
-              m_quadScratch.data(),
-              static_cast<GLsizeiptr>(m_quadScratch.size() * sizeof(float)))
-        : 0;
+    const GLuint vbo = m_shaders ? m_shaders->bindUnitQuadVbo() : 0;
     glEnableVertexAttribArray(static_cast<GLuint>(posAttrib));
     glVertexAttribPointer(
         static_cast<GLuint>(posAttrib),
@@ -658,8 +824,27 @@ void RenderPass::renderQuads(
         GL_FLOAT,
         GL_FALSE,
         0,
-        vbo ? nullptr : static_cast<const void*>(m_quadScratch.data()));
-    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_quadScratch.size() / 2));
+        vbo ? nullptr : static_cast<const void*>(kFallbackUnitQuad));
+
+    glEnable(GL_SCISSOR_TEST);
+    for (const auto& c : clipRects) {
+        if (!c.intersects(box)) continue;
+        const RectI r = box.intersection(c);
+        RectI sc = mapTargetRectToGlScissor(r, fbW, fbH, m_outputTransform);
+        if (prevScissor) {
+            sc = sc.intersection(RectI{prevBox[0], prevBox[1], prevBox[2], prevBox[3]});
+        }
+        if (sc.isEmpty()) continue;
+        glScissor(sc.x, sc.y, sc.width, sc.height);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+
+    if (prevScissor) {
+        glScissor(prevBox[0], prevBox[1], prevBox[2], prevBox[3]);
+    } else {
+        glDisable(GL_SCISSOR_TEST);
+    }
+
     glDisableVertexAttribArray(static_cast<GLuint>(posAttrib));
     if (vbo) glBindBuffer(GL_ARRAY_BUFFER, 0);
 }

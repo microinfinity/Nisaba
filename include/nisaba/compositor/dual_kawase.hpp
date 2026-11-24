@@ -68,7 +68,9 @@ public:
         RenderTarget& target,
         const RectI& destRect,
         const DualKawaseConfig& config = {},
-        const Texture* maskTexture = nullptr);
+        const Texture* maskTexture = nullptr,
+        wl_output_transform transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
+        const RectF& maskSrcBox = RectF{0.0f, 0.0f, 1.0f, 1.0f});
 
     /**
      * @brief Blurs full input texture directly into target RenderTarget at destRect.
@@ -78,8 +80,10 @@ public:
         RenderTarget& target,
         const RectI& destRect,
         const DualKawaseConfig& config = {},
-        const Texture* maskTexture = nullptr) {
-        return renderBlurSubRegion(source, RectI{0, 0, 0, 0}, target, destRect, config, maskTexture);
+        const Texture* maskTexture = nullptr,
+        wl_output_transform transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
+        const RectF& maskSrcBox = RectF{0.0f, 0.0f, 1.0f, 1.0f}) {
+        return renderBlurSubRegion(source, RectI{0, 0, 0, 0}, target, destRect, config, maskTexture, transform, maskSrcBox);
     }
 
     /**

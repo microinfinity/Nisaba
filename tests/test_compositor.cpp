@@ -422,6 +422,113 @@ void test_compositor_fusion() {
     std::cout << "  -> Fusion tests passed!" << std::endl;
 }
 
+void test_translucent_clipping_and_live_blur_occlusion() {
+    std::cout << "[Test] Translucent Scissor Seams, DamageRing Spike Reuse & Live-Blur Occlusion..." << std::endl;
+
+    // 1. Non-round-robin Swapchain slot reuse (B1, B2, B3, then B1/B2 ping-pong, then B3 spike)
+    {
+        DamageRing ring;
+        (void)ring.rotate(1, 800, 600);
+        (void)ring.rotate(2, 800, 600);
+        (void)ring.rotate(3, 800, 600);
+
+        ring.addRect(RectI{10, 10, 20, 20}); // Frame 4 -> B1
+        (void)ring.rotate(1, 800, 600);
+
+        ring.addRect(RectI{50, 50, 20, 20}); // Frame 5 -> B2
+        (void)ring.rotate(2, 800, 600);
+
+        ring.addRect(RectI{90, 90, 20, 20}); // Frame 6 -> B1
+        (void)ring.rotate(1, 800, 600);
+
+        ring.addRect(RectI{130, 130, 20, 20}); // Frame 7 -> B2
+        (void)ring.rotate(2, 800, 600);
+
+        // Frame 8 acquires B3: must still include Frame 4 ({10,10,20,20}) & Frame 5 ({50,50,20,20})!
+        Region d3 = ring.rotate(3, 800, 600);
+        assert(d3.intersects(RectI{15, 15, 4, 4}));
+        assert(d3.intersects(RectI{55, 55, 4, 4}));
+        assert(d3.intersects(RectI{95, 95, 4, 4}));
+        assert(d3.intersects(RectI{135, 135, 4, 4}));
+    }
+
+    auto egl = EglContext::createAuto();
+    if (egl && egl->makeCurrent()) {
+        auto renderer = Renderer::create(egl);
+        if (renderer && renderer->blur()) {
+            // 2. Verify zero 1px dark seam / gap across multi-slice Region on prime-sized translucent rect
+            auto target = RenderTarget::createOffscreen(800, 300, false);
+            assert(target != nullptr);
+
+            Region slicedDmg(RectI{0, 0, 800, 300});
+            slicedDmg.subtract(RectI{250, 80, 110, 70}); // Splits into 4 adjacent disjoint slices!
+
+            auto pass = renderer->beginPass(target, WL_OUTPUT_TRANSFORM_FLIPPED_180);
+            assert(pass != nullptr);
+            pass->clear(Color{0.80f, 0.80f, 0.80f, 1.0f});
+            // Draw whole translucent dark rect only in slicedDmg
+            pass->renderRect(RectI{17, 19, 733, 211}, Color{0.0f, 0.0f, 0.0f, 0.50f}, &slicedDmg);
+            pass->submit();
+
+            target->bind();
+            std::vector<uint8_t> px(800 * 300 * 4, 0);
+            glReadPixels(0, 0, 800, 300, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+            RenderTarget::unbind();
+
+            const int refR = px[(50 * 800 + 100) * 4];
+            // Check across slice boundaries y=79/80 and y=149/150 outside the hole (x=120)
+            for (int y : {78, 79, 80, 81, 148, 149, 150, 151}) {
+                const int r = px[(y * 800 + 120) * 4];
+                assert(std::abs(r - refR) <= 2);
+            }
+
+            // 3. Verify Kawase BlurMaterialPassElement behind an upper opaque rect does NOT sample black holes
+            auto srcRt = RenderTarget::createOffscreen(320, 240, false);
+            assert(srcRt != nullptr && srcRt->texture() != nullptr);
+            {
+                // Clear srcRt to black first to expose any unrendered occluded holes!
+                auto clearPass = renderer->beginPass(srcRt, WL_OUTPUT_TRANSFORM_FLIPPED_180);
+                clearPass->clear(Color{0.0f, 0.0f, 0.0f, 1.0f});
+                clearPass->submit();
+
+                auto culledPass = renderer->beginPass(srcRt, WL_OUTPUT_TRANSFORM_FLIPPED_180);
+                // Back-to-front: bright white background -> Kawase blur window -> upper opaque green window
+                culledPass->enqueue(std::make_unique<RectPassElement>(
+                    RectPassElement::Data{RectI{0, 0, 320, 240}, Color{1.0f, 1.0f, 1.0f, 1.0f}, 0.0f, 2.0f}));
+
+                BlurMaterialPassElement::Data blurData;
+                blurData.provider = BlurProviderFactory::create(BlurMaterialType::Kawase);
+                blurData.kawase = renderer->blur().get();
+                blurData.source = srcRt->texture().get();
+                blurData.destBox = RectI{40, 40, 200, 160};
+                blurData.srcBox = RectI{40, 40, 200, 160};
+                blurData.context.kawase.passes = 3;
+                blurData.context.kawase.radius = 3.0f;
+                culledPass->enqueue(std::make_unique<BlurMaterialPassElement>(std::move(blurData)));
+
+                culledPass->enqueue(std::make_unique<RectPassElement>(
+                    RectPassElement::Data{RectI{100, 60, 120, 120}, Color{0.0f, 0.9f, 0.0f, 1.0f}, 0.0f, 2.0f}));
+
+                culledPass->optimizeAndExecute(Region(RectI{0, 0, 320, 240}));
+                culledPass->submit();
+
+                srcRt->bind();
+                std::vector<uint8_t> blurOut(320 * 240 * 4, 0);
+                glReadPixels(0, 0, 320, 240, GL_RGBA, GL_UNSIGNED_BYTE, blurOut.data());
+                RenderTarget::unbind();
+
+                // Pixel in blurred window right next to upper opaque rect (x=96, y=120) must stay bright white (>235),
+                // NOT darkened by an occluded black hole under {100, 60, 120, 120}!
+                const uint8_t adjR = blurOut[(120 * 320 + 96) * 4 + 0];
+                const uint8_t adjB = blurOut[(120 * 320 + 96) * 4 + 2];
+                assert(adjR > 235 && adjB > 235);
+            }
+        }
+    }
+
+    std::cout << "  -> Translucent Scissor Seams & Live-Blur Occlusion verified!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Nisaba Sovereign Compositor Unit Tests ===" << std::endl;
 
@@ -435,6 +542,7 @@ int main() {
     test_deformable_mesh_and_transformers();
     test_deferred_pass_and_occlusion_culling();
     test_compositor_fusion();
+    test_translucent_clipping_and_live_blur_occlusion();
 
     std::cout << "=== All Compositor Tests Succeeded 100%! ===" << std::endl;
     std::cout << std::flush;

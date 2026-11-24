@@ -19,37 +19,41 @@ void DamageRing::addWhole(int width, int height) noexcept {
 }
 
 Region DamageRing::rotate(uintptr_t bufferId, int width, int height) {
+    // Accumulate pending frame damage into every previously rendered buffer's history
+    if (!m_current.isEmpty()) {
+        for (auto& entry : m_entries) {
+            entry.damage.unite(m_current);
+            if (entry.damage.rects().size() > kMaxRects) {
+                entry.damage = Region(entry.damage.extents());
+            }
+        }
+    }
+
     auto it = std::find_if(m_entries.begin(), m_entries.end(), [bufferId](const BufferEntry& e) {
         return e.bufferId == bufferId;
     });
 
     if (it != m_entries.end()) {
-        Region damage = m_current;
-
-        for (const auto& entry : m_entries) {
-            if (entry.bufferId != bufferId) {
-                damage.unite(entry.damage);
-            }
-        }
+        Region damage = std::move(it->damage);
+        it->damage.clear();
+        m_current.clear();
 
         damage.intersect(Region(RectI{0, 0, width, height}));
-
-        auto rects = damage.rects();
-        if (rects.size() > kMaxRects) {
+        if (damage.rects().size() > kMaxRects) {
             damage = Region(damage.extents());
         }
-
-        it->damage = m_current;
-        m_current.clear();
         return damage;
     }
 
     // New buffer seen for the first time: full redraw required
     Region fullDamage(RectI{0, 0, width, height});
 
+    if (m_entries.size() >= kMaxTrackedBuffers) {
+        m_entries.erase(m_entries.begin());
+    }
+
     BufferEntry newEntry;
     newEntry.bufferId = bufferId;
-    newEntry.damage = m_current;
     m_entries.push_back(std::move(newEntry));
 
     m_current.clear();
@@ -58,15 +62,21 @@ Region DamageRing::rotate(uintptr_t bufferId, int width, int height) {
 
 void DamageRing::Transaction::rollback() noexcept {
     if (!m_ring || m_rolledBack) return;
-    m_ring->add(m_savedCurrent);
+    Region extraPending = std::move(m_ring->m_current);
+    m_ring->m_entries = std::move(m_savedEntries);
+    m_ring->m_current = std::move(m_savedCurrent);
+    if (!extraPending.isEmpty()) {
+        m_ring->m_current.unite(extraPending);
+    }
     m_rolledBack = true;
     m_committed = false;
 }
 
 DamageRing::Transaction DamageRing::beginTransaction(uintptr_t bufferId, int width, int height) {
-    Region saved = m_current;
+    Region savedCurrent = m_current;
+    std::vector<BufferEntry> savedEntries = m_entries;
     Region rotated = rotate(bufferId, width, height);
-    return Transaction(*this, bufferId, std::move(rotated), std::move(saved));
+    return Transaction(*this, bufferId, std::move(rotated), std::move(savedCurrent), std::move(savedEntries));
 }
 
 void DamageRing::expandPending(int radiusPixels) noexcept {

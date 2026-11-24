@@ -198,9 +198,22 @@ void InnerGlowPassElement::draw(RenderPass& pass, const Region& visibleDamage) {
 // BlurMaterialPassElement
 // ==========================================
 
+int BlurMaterialPassElement::liveBlurPadding() const noexcept {
+    if (!needsLiveBlur()) return 0;
+    if (m_data.provider) {
+        return m_data.provider->damageExpansionRadius(m_data.context);
+    }
+    const int passes = std::clamp(m_data.context.kawase.passes, 1, 6);
+    const float radius = std::max(m_data.context.kawase.radius, 1.0f) * std::max(m_data.context.strength, 0.1f);
+    return static_cast<int>(std::ceil(radius * static_cast<float>(1 << passes)));
+}
+
 void BlurMaterialPassElement::draw(RenderPass& pass, const Region& visibleDamage) {
     if (!m_data.kawase || !m_data.source || m_data.destBox.isEmpty()) return;
     if (!visibleDamage.intersects(m_data.destBox)) return;
+
+    BlurContext ctx = m_data.context;
+    ctx.transform = pass.outputTransform();
 
     if (m_data.provider) {
         pass.renderBlurMaterial(
@@ -209,15 +222,17 @@ void BlurMaterialPassElement::draw(RenderPass& pass, const Region& visibleDamage
             *m_data.source,
             m_data.destBox,
             m_data.srcBox,
-            m_data.context);
+            ctx,
+            &visibleDamage);
     } else {
         pass.renderBlur(
             *m_data.kawase,
             *m_data.source,
             m_data.destBox,
             m_data.srcBox,
-            m_data.context.kawase,
-            m_data.context.maskTexture);
+            ctx.kawase,
+            ctx.maskTexture,
+            &visibleDamage);
     }
 }
 

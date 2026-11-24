@@ -186,6 +186,8 @@ void main() {
         color.rgb += dither;
     }
 
+    color.rgb = clamp(color.rgb, 0.0, 1.0);
+
     // Mask modulation (e.g. rounded corners, window shape, dock pill shape)
     if (u_has_mask == 1) {
         float maskAlpha = texture2D(u_mask, v_mask_uv).a;
@@ -561,7 +563,9 @@ bool DualKawaseBlur::renderBlurSubRegion(
     RenderTarget& target,
     const RectI& destRect,
     const DualKawaseConfig& config,
-    const Texture* maskTexture) {
+    const Texture* maskTexture,
+    wl_output_transform transform,
+    const RectF& maskSrcBox) {
     if (!source.id() || source.width() == 0 || source.height() == 0 || destRect.isEmpty()) {
         return false;
     }
@@ -678,6 +682,9 @@ bool DualKawaseBlur::renderBlurSubRegion(
     // 3. Final Composite pass onto destination target
     // ==========================================
     target.bind();
+    if (prevScissor) {
+        glEnable(GL_SCISSOR_TEST);
+    }
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -699,13 +706,13 @@ bool DualKawaseBlur::renderBlurSubRegion(
         glUniform2f(m_shaders->compMaskHalfpixel, 0.0f, 0.0f);
     }
 
-    Matrix3 proj = Matrix3::project(target.width(), target.height(), WL_OUTPUT_TRANSFORM_NORMAL);
+    Matrix3 proj = Matrix3::project(target.width(), target.height(), transform);
     Matrix3 mvp = Matrix3::projectBox(destRect, WL_OUTPUT_TRANSFORM_NORMAL, proj);
     glUniformMatrix3fv(m_shaders->compProj, 1, GL_FALSE, mvp.data());
     glUniform2f(m_shaders->compUvScale, 1.0f, 1.0f);
     glUniform2f(m_shaders->compUvOffset, 0.0f, 0.0f);
-    glUniform2f(m_shaders->compMaskUvScale, 1.0f, 1.0f);
-    glUniform2f(m_shaders->compMaskUvOffset, 0.0f, 0.0f);
+    glUniform2f(m_shaders->compMaskUvScale, static_cast<float>(maskSrcBox.width), static_cast<float>(maskSrcBox.height));
+    glUniform2f(m_shaders->compMaskUvOffset, static_cast<float>(maskSrcBox.x), static_cast<float>(maskSrcBox.y));
 
     const auto& finest = m_pyramid[0];
     glActiveTexture(GL_TEXTURE0);

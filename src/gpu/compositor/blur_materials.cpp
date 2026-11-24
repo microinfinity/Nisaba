@@ -13,14 +13,17 @@ constexpr std::string_view kMaterialVert = R"glsl(
 attribute vec2 pos;
 uniform mat3 u_proj;
 uniform vec4 u_uv_rect; // x, y, width, height
+uniform vec4 u_mask_rect; // x, y, width, height
 varying vec2 v_local;
 varying vec2 v_uv;
+varying vec2 v_mask_uv;
 
 void main() {
     vec3 p3 = vec3(pos, 1.0);
     gl_Position = vec4(p3 * u_proj, 1.0);
     v_local = pos;
     v_uv = u_uv_rect.xy + pos * u_uv_rect.zw;
+    v_mask_uv = u_mask_rect.xy + pos * u_mask_rect.zw;
 }
 )glsl";
 
@@ -33,7 +36,10 @@ precision mediump float;
 
 varying vec2 v_local;
 varying vec2 v_uv;
+varying vec2 v_mask_uv;
 uniform sampler2D u_tex;
+uniform sampler2D u_mask;
+uniform int u_has_mask;
 uniform vec4 u_tint;
 uniform vec4 u_params; // x=brightness, y=contrast, z=noise, w=cornerRadius
 uniform vec2 u_box_size;
@@ -54,6 +60,9 @@ float squircleMask(vec2 localPos, vec2 size, float radius, float power) {
 
 void main() {
     float mask = squircleMask(v_local, u_box_size, u_params.w, u_power);
+    if (u_has_mask == 1) {
+        mask *= smoothstep(0.0, 0.02, texture2D(u_mask, v_mask_uv).a);
+    }
     if (mask <= 0.001) discard;
 
     vec3 c = texture2D(u_tex, v_uv).rgb;
@@ -80,7 +89,10 @@ precision mediump float;
 
 varying vec2 v_local;
 varying vec2 v_uv;
+varying vec2 v_mask_uv;
 uniform sampler2D u_tex;
+uniform sampler2D u_mask;
+uniform int u_has_mask;
 uniform vec4 u_tint;
 uniform vec4 u_glass; // x=refraction, y=dispersion, z=specular, w=cornerRadius
 uniform vec2 u_box_size;
@@ -102,6 +114,9 @@ void main() {
     }
 
     float mask = 1.0 - smoothstep(-0.65, 0.65, dist);
+    if (u_has_mask == 1) {
+        mask *= smoothstep(0.0, 0.02, texture2D(u_mask, v_mask_uv).a);
+    }
     if (mask <= 0.001) discard;
 
     // Edge bevel normal for optical lens refraction
@@ -134,7 +149,10 @@ precision mediump float;
 
 varying vec2 v_local;
 varying vec2 v_uv;
+varying vec2 v_mask_uv;
 uniform sampler2D u_tex;
+uniform sampler2D u_mask;
+uniform int u_has_mask;
 uniform vec4 u_tint;
 uniform vec4 u_wave; // x=time, y=cursorX, z=cursorY, w=strength
 uniform vec2 u_box_size;
@@ -151,6 +169,9 @@ void main() {
             float d = pow(pow(p.x, pwr) + pow(p.y, pwr), 1.0 / pwr);
             mask = 1.0 - smoothstep(u_radius - 0.65, u_radius + 0.65, d);
         }
+    }
+    if (u_has_mask == 1) {
+        mask *= smoothstep(0.0, 0.02, texture2D(u_mask, v_mask_uv).a);
     }
     if (mask <= 0.001) discard;
 
@@ -181,7 +202,10 @@ precision mediump float;
 
 varying vec2 v_local;
 varying vec2 v_uv;
+varying vec2 v_mask_uv;
 uniform sampler2D u_tex;
+uniform sampler2D u_mask;
+uniform int u_has_mask;
 uniform vec4 u_tint;
 uniform vec4 u_fluid; // x=time, y=velX, z=velY, w=strength
 uniform vec2 u_box_size;
@@ -198,6 +222,9 @@ void main() {
             float d = pow(pow(p.x, pwr) + pow(p.y, pwr), 1.0 / pwr);
             mask = 1.0 - smoothstep(u_radius - 0.65, u_radius + 0.65, d);
         }
+    }
+    if (u_has_mask == 1) {
+        mask *= smoothstep(0.0, 0.02, texture2D(u_mask, v_mask_uv).a);
     }
     if (mask <= 0.001) discard;
 
@@ -226,7 +253,10 @@ precision mediump float;
 
 varying vec2 v_local;
 varying vec2 v_uv;
+varying vec2 v_mask_uv;
 uniform sampler2D u_tex;
+uniform sampler2D u_mask;
+uniform int u_has_mask;
 uniform vec4 u_tint;
 uniform vec4 u_atmos; // x=time, y=strength, z=cornerRadius, w=power
 uniform vec2 u_box_size;
@@ -242,6 +272,9 @@ void main() {
             float d = pow(pow(p.x, pwr) + pow(p.y, pwr), 1.0 / pwr);
             mask = 1.0 - smoothstep(radius - 0.65, radius + 0.65, d);
         }
+    }
+    if (u_has_mask == 1) {
+        mask *= smoothstep(0.0, 0.02, texture2D(u_mask, v_mask_uv).a);
     }
     if (mask <= 0.001) discard;
 
@@ -260,6 +293,41 @@ void main() {
     gl_FragColor = vec4(clamp(col, 0.0, 1.0) * mask, mask);
 }
 )glsl";
+
+bool bindMaterialMaskUniforms(ShaderProgram& prog, const BlurContext& ctx) {
+    const bool hasValidMask =
+        ctx.maskTexture &&
+        ctx.maskTexture->id() != 0 &&
+        ctx.maskTexture->target() == GL_TEXTURE_2D &&
+        ctx.maskTexture->width() > 0 &&
+        ctx.maskTexture->height() > 0;
+    glUniform4f(
+        prog.getUniformLocation("u_mask_rect"),
+        static_cast<float>(ctx.maskSrcBox.x),
+        static_cast<float>(ctx.maskSrcBox.y),
+        static_cast<float>(ctx.maskSrcBox.width),
+        static_cast<float>(ctx.maskSrcBox.height));
+    if (hasValidMask) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, ctx.maskTexture->id());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glUniform1i(prog.getUniformLocation("u_mask"), 1);
+        glUniform1i(prog.getUniformLocation("u_has_mask"), 1);
+        glActiveTexture(GL_TEXTURE0);
+    } else {
+        glUniform1i(prog.getUniformLocation("u_has_mask"), 0);
+    }
+    return hasValidMask;
+}
+
+void unbindMaterialMask(bool hasValidMask) noexcept {
+    if (hasValidMask) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+    }
+}
 
 RectF computeNormalizedUvRect(const Texture& source, const RectI& srcRect, const RectI& destRect) {
     const float texW = static_cast<float>(std::max(source.width(), 1u));
@@ -313,7 +381,8 @@ bool KawaseBlurProvider::renderMaterial(
     RenderTarget& target,
     const RectI& destRect,
     const BlurContext& ctx) {
-    return kawase.renderBlurSubRegion(source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture);
+    return kawase.renderBlurSubRegion(
+        source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture, ctx.transform, ctx.maskSrcBox);
 }
 
 // ==========================================
@@ -333,7 +402,8 @@ bool AcrylicBlurProvider::renderMaterial(
     const BlurContext& ctx) {
     auto blurred = kawase.blur(source, ctx.kawase);
     if (!blurred || !m_program) {
-        return kawase.renderBlurSubRegion(source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture);
+        return kawase.renderBlurSubRegion(
+            source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture, ctx.transform, ctx.maskSrcBox);
     }
 
     target.bind();
@@ -341,12 +411,13 @@ bool AcrylicBlurProvider::renderMaterial(
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
     m_program->use();
-    const Matrix3 proj = Matrix3::project(target.width(), target.height(), WL_OUTPUT_TRANSFORM_FLIPPED_180);
+    const Matrix3 proj = Matrix3::project(target.width(), target.height(), ctx.transform);
     const Matrix3 mvp = Matrix3::projectBox(destRect, WL_OUTPUT_TRANSFORM_NORMAL, proj);
     const RectF uv = computeNormalizedUvRect(source, srcRect, destRect);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, blurred->id());
+    const bool hasMask = bindMaterialMaskUniforms(*m_program, ctx);
 
     glUniformMatrix3fv(m_program->getUniformLocation("u_proj"), 1, GL_FALSE, mvp.data());
     glUniform4f(
@@ -375,6 +446,7 @@ bool AcrylicBlurProvider::renderMaterial(
     glUniform1f(m_program->getUniformLocation("u_power"), ctx.roundingPower);
 
     kawase.drawUnitQuad(m_program->getAttribLocation("pos"));
+    unbindMaterialMask(hasMask);
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
@@ -396,7 +468,8 @@ bool OpticalGlassProvider::renderMaterial(
     const BlurContext& ctx) {
     auto blurred = kawase.blur(source, ctx.kawase);
     if (!blurred || !m_program) {
-        return kawase.renderBlurSubRegion(source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture);
+        return kawase.renderBlurSubRegion(
+            source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture, ctx.transform, ctx.maskSrcBox);
     }
 
     target.bind();
@@ -404,12 +477,13 @@ bool OpticalGlassProvider::renderMaterial(
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
     m_program->use();
-    const Matrix3 proj = Matrix3::project(target.width(), target.height(), WL_OUTPUT_TRANSFORM_FLIPPED_180);
+    const Matrix3 proj = Matrix3::project(target.width(), target.height(), ctx.transform);
     const Matrix3 mvp = Matrix3::projectBox(destRect, WL_OUTPUT_TRANSFORM_NORMAL, proj);
     const RectF uv = computeNormalizedUvRect(source, srcRect, destRect);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, blurred->id());
+    const bool hasMask = bindMaterialMaskUniforms(*m_program, ctx);
 
     glUniformMatrix3fv(m_program->getUniformLocation("u_proj"), 1, GL_FALSE, mvp.data());
     glUniform4f(
@@ -438,6 +512,7 @@ bool OpticalGlassProvider::renderMaterial(
     glUniform1f(m_program->getUniformLocation("u_power"), ctx.roundingPower);
 
     kawase.drawUnitQuad(m_program->getAttribLocation("pos"));
+    unbindMaterialMask(hasMask);
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
@@ -459,7 +534,8 @@ bool WaterRippleProvider::renderMaterial(
     const BlurContext& ctx) {
     auto blurred = kawase.blur(source, ctx.kawase);
     if (!blurred || !m_program) {
-        return kawase.renderBlurSubRegion(source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture);
+        return kawase.renderBlurSubRegion(
+            source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture, ctx.transform, ctx.maskSrcBox);
     }
 
     target.bind();
@@ -467,12 +543,13 @@ bool WaterRippleProvider::renderMaterial(
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
     m_program->use();
-    const Matrix3 proj = Matrix3::project(target.width(), target.height(), WL_OUTPUT_TRANSFORM_FLIPPED_180);
+    const Matrix3 proj = Matrix3::project(target.width(), target.height(), ctx.transform);
     const Matrix3 mvp = Matrix3::projectBox(destRect, WL_OUTPUT_TRANSFORM_NORMAL, proj);
     const RectF uv = computeNormalizedUvRect(source, srcRect, destRect);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, blurred->id());
+    const bool hasMask = bindMaterialMaskUniforms(*m_program, ctx);
 
     glUniformMatrix3fv(m_program->getUniformLocation("u_proj"), 1, GL_FALSE, mvp.data());
     glUniform4f(
@@ -502,6 +579,7 @@ bool WaterRippleProvider::renderMaterial(
     glUniform1f(m_program->getUniformLocation("u_power"), ctx.roundingPower);
 
     kawase.drawUnitQuad(m_program->getAttribLocation("pos"));
+    unbindMaterialMask(hasMask);
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
@@ -523,7 +601,8 @@ bool FluidFieldProvider::renderMaterial(
     const BlurContext& ctx) {
     auto blurred = kawase.blur(source, ctx.kawase);
     if (!blurred || !m_program) {
-        return kawase.renderBlurSubRegion(source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture);
+        return kawase.renderBlurSubRegion(
+            source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture, ctx.transform, ctx.maskSrcBox);
     }
 
     target.bind();
@@ -531,12 +610,13 @@ bool FluidFieldProvider::renderMaterial(
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
     m_program->use();
-    const Matrix3 proj = Matrix3::project(target.width(), target.height(), WL_OUTPUT_TRANSFORM_FLIPPED_180);
+    const Matrix3 proj = Matrix3::project(target.width(), target.height(), ctx.transform);
     const Matrix3 mvp = Matrix3::projectBox(destRect, WL_OUTPUT_TRANSFORM_NORMAL, proj);
     const RectF uv = computeNormalizedUvRect(source, srcRect, destRect);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, blurred->id());
+    const bool hasMask = bindMaterialMaskUniforms(*m_program, ctx);
 
     glUniformMatrix3fv(m_program->getUniformLocation("u_proj"), 1, GL_FALSE, mvp.data());
     glUniform4f(
@@ -566,6 +646,7 @@ bool FluidFieldProvider::renderMaterial(
     glUniform1f(m_program->getUniformLocation("u_power"), ctx.roundingPower);
 
     kawase.drawUnitQuad(m_program->getAttribLocation("pos"));
+    unbindMaterialMask(hasMask);
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
@@ -587,7 +668,8 @@ bool AtmosphericBlurProvider::renderMaterial(
     const BlurContext& ctx) {
     auto blurred = kawase.blur(source, ctx.kawase);
     if (!blurred || !m_program) {
-        return kawase.renderBlurSubRegion(source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture);
+        return kawase.renderBlurSubRegion(
+            source, srcRect, target, destRect, ctx.kawase, ctx.maskTexture, ctx.transform, ctx.maskSrcBox);
     }
 
     target.bind();
@@ -595,12 +677,13 @@ bool AtmosphericBlurProvider::renderMaterial(
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
     m_program->use();
-    const Matrix3 proj = Matrix3::project(target.width(), target.height(), WL_OUTPUT_TRANSFORM_FLIPPED_180);
+    const Matrix3 proj = Matrix3::project(target.width(), target.height(), ctx.transform);
     const Matrix3 mvp = Matrix3::projectBox(destRect, WL_OUTPUT_TRANSFORM_NORMAL, proj);
     const RectF uv = computeNormalizedUvRect(source, srcRect, destRect);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, blurred->id());
+    const bool hasMask = bindMaterialMaskUniforms(*m_program, ctx);
 
     glUniformMatrix3fv(m_program->getUniformLocation("u_proj"), 1, GL_FALSE, mvp.data());
     glUniform4f(
@@ -628,6 +711,7 @@ bool AtmosphericBlurProvider::renderMaterial(
         static_cast<float>(destRect.height));
 
     kawase.drawUnitQuad(m_program->getAttribLocation("pos"));
+    unbindMaterialMask(hasMask);
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }

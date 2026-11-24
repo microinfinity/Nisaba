@@ -41,6 +41,8 @@ struct BlurContext {
     float roundingPower{2.0f};
     bool xray{false}; ///< When true, samples from pre-blurred wallpaper backdrop instead of live scene
     const Texture* maskTexture{nullptr};
+    RectF maskSrcBox{0.0, 0.0, 1.0, 1.0};
+    wl_output_transform transform{WL_OUTPUT_TRANSFORM_FLIPPED_180};
 };
 
 /**
@@ -90,7 +92,7 @@ public:
 
     [[nodiscard]] BlurMaterialType materialType() const noexcept override { return BlurMaterialType::Kawase; }
     [[nodiscard]] bool isAnimated() const noexcept override { return false; }
-    [[nodiscard]] bool requiresLiveBlur() const noexcept override { return false; }
+    [[nodiscard]] bool requiresLiveBlur() const noexcept override { return true; }
 
     bool renderMaterial(
         DualKawaseBlur& kawase,
@@ -111,7 +113,7 @@ public:
 
     [[nodiscard]] BlurMaterialType materialType() const noexcept override { return BlurMaterialType::Acrylic; }
     [[nodiscard]] bool isAnimated() const noexcept override { return false; }
-    [[nodiscard]] bool requiresLiveBlur() const noexcept override { return false; }
+    [[nodiscard]] bool requiresLiveBlur() const noexcept override { return true; }
 
     bool renderMaterial(
         DualKawaseBlur& kawase,
@@ -207,7 +209,7 @@ public:
 
     [[nodiscard]] BlurMaterialType materialType() const noexcept override { return BlurMaterialType::AtmosphericAurora; }
     [[nodiscard]] bool isAnimated() const noexcept override { return true; }
-    [[nodiscard]] bool requiresLiveBlur() const noexcept override { return false; }
+    [[nodiscard]] bool requiresLiveBlur() const noexcept override { return true; }
 
     bool renderMaterial(
         DualKawaseBlur& kawase,
