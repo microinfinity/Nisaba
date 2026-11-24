@@ -6,7 +6,12 @@
 namespace nisaba::pdf {
 
 PdfCanvas::PdfCanvas(float page_width, float page_height)
-    : width_(page_width), height_(page_height) {
+    : width_(page_width),
+      height_(page_height),
+      clip_bounds_(ScreenIntRect::from_xywh(
+          0, 0,
+          static_cast<uint32_t>(std::max(1.0f, std::ceil(page_width))),
+          static_cast<uint32_t>(std::max(1.0f, std::ceil(page_height))))) {
     // Establish Nisaba top-down coordinate space:
     // CTM = [1 0 0 -1 0 page_height]
     char buf[64];
@@ -14,31 +19,161 @@ PdfCanvas::PdfCanvas(float page_width, float page_height)
     stream_ += buf;
 }
 
-void PdfCanvas::save() {
+int PdfCanvas::save() {
+    const int prev = save_count();
+    state_stack_.push_back(PdfState{current_transform_, current_transform_4x4_, clip_bounds_});
     stream_ += "q\n";
+    return prev;
+}
+
+int PdfCanvas::save_count() const noexcept {
+    return static_cast<int>(state_stack_.size()) + 1;
+}
+
+void PdfCanvas::restore_to_count(int count) {
+    const int target = std::max(1, count);
+    while (save_count() > target) {
+        restore();
+    }
 }
 
 void PdfCanvas::restore() {
+    if (state_stack_.empty()) return;
+    current_transform_ = state_stack_.back().transform;
+    current_transform_4x4_ = state_stack_.back().transform_4x4;
+    clip_bounds_ = state_stack_.back().clip_bounds;
+    state_stack_.pop_back();
     stream_ += "Q\n";
 }
 
 void PdfCanvas::translate(float dx, float dy) {
+    current_transform_4x4_ = current_transform_4x4_.pre_translate(dx, dy);
+    current_transform_ = current_transform_4x4_.to_transform_2d();
     char buf[64];
     snprintf(buf, sizeof(buf), "1 0 0 1 %.2f %.2f cm\n", dx, dy);
     stream_ += buf;
 }
 
 void PdfCanvas::scale(float sx, float sy) {
+    current_transform_4x4_ = current_transform_4x4_.pre_scale(sx, sy);
+    current_transform_ = current_transform_4x4_.to_transform_2d();
     char buf[64];
     snprintf(buf, sizeof(buf), "%.4f 0 0 %.4f 0 0 cm\n", sx, sy);
     stream_ += buf;
 }
 
+void PdfCanvas::rotate(float degrees) {
+    concat(Transform::from_rotate(degrees));
+}
+
 void PdfCanvas::concat(const Transform& ts) {
+    current_transform_4x4_ = current_transform_4x4_ * Transform4x4(ts);
+    current_transform_ = current_transform_4x4_.to_transform_2d();
     char buf[96];
     snprintf(buf, sizeof(buf), "%.4f %.4f %.4f %.4f %.2f %.2f cm\n",
              ts.sx, ts.ky, ts.kx, ts.sy, ts.tx, ts.ty);
     stream_ += buf;
+}
+
+void PdfCanvas::concat(const Transform4x4& ts) {
+    current_transform_4x4_ = current_transform_4x4_ * ts;
+    current_transform_ = current_transform_4x4_.to_transform_2d();
+    const Transform t2 = ts.to_transform_2d();
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%.4f %.4f %.4f %.4f %.2f %.2f cm\n",
+             t2.sx, t2.ky, t2.kx, t2.sy, t2.tx, t2.ty);
+    stream_ += buf;
+}
+
+void PdfCanvas::set_transform_4x4(const Transform4x4& ts) {
+    if (auto inv = current_transform_.invert()) {
+        concat(*inv);
+    }
+    current_transform_4x4_ = ts;
+    current_transform_ = ts.to_transform_2d();
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%.4f %.4f %.4f %.4f %.2f %.2f cm\n",
+             current_transform_.sx, current_transform_.ky, current_transform_.kx,
+             current_transform_.sy, current_transform_.tx, current_transform_.ty);
+    stream_ += buf;
+}
+
+void PdfCanvas::clip_rect(const Rect& rect, ClipOp op) {
+    if (op == ClipOp::Difference) {
+        if (!clip_bounds_.has_value()) return;
+        // Emit outer page contour + cutout rect using even-odd clip
+        char buf[160];
+        snprintf(buf, sizeof(buf), "0 0 %.2f %.2f re %.2f %.2f %.2f %.2f re W* n\n",
+                 width_, height_, rect.left(), rect.top(), rect.width(), rect.height());
+        stream_ += buf;
+        return;
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.2f %.2f %.2f %.2f re W n\n",
+             rect.left(), rect.top(), rect.width(), rect.height());
+    stream_ += buf;
+
+    if (!clip_bounds_.has_value()) return;
+    auto tr = rect.transform(current_transform_);
+    if (!tr.has_value() || tr->is_empty()) {
+        clip_bounds_ = std::nullopt;
+        return;
+    }
+    const int32_t pw = static_cast<int32_t>(std::max(1.0f, std::ceil(width_)));
+    const int32_t ph = static_cast<int32_t>(std::max(1.0f, std::ceil(height_)));
+    const int32_t x0 = std::clamp(static_cast<int32_t>(std::floor(tr->left())), 0, pw);
+    const int32_t y0 = std::clamp(static_cast<int32_t>(std::floor(tr->top())), 0, ph);
+    const int32_t x1 = std::clamp(static_cast<int32_t>(std::ceil(tr->right())), 0, pw);
+    const int32_t y1 = std::clamp(static_cast<int32_t>(std::ceil(tr->bottom())), 0, ph);
+    if (x1 > x0 && y1 > y0) {
+        if (auto br = ScreenIntRect::from_xywh(
+                static_cast<uint32_t>(x0), static_cast<uint32_t>(y0),
+                static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0))) {
+            clip_bounds_ = clip_bounds_->intersect(*br);
+            return;
+        }
+    }
+    clip_bounds_ = std::nullopt;
+}
+
+void PdfCanvas::clip_path(const Path& path, FillRule fill_rule, ClipOp op) {
+    if (op == ClipOp::Difference) {
+        if (path.is_empty() || !clip_bounds_.has_value()) return;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "0 0 %.2f %.2f re\n", width_, height_);
+        stream_ += buf;
+        emit_path_commands(path);
+        stream_ += "W* n\n";
+        return;
+    }
+    if (path.is_empty()) {
+        clip_bounds_ = std::nullopt;
+        stream_ += "0 0 0 0 re W n\n";
+        return;
+    }
+    emit_path_commands(path);
+    stream_ += (fill_rule == FillRule::EvenOdd) ? "W* n\n" : "W n\n";
+
+    if (!clip_bounds_.has_value()) return;
+    Rect b = path.bounds();
+    if (!current_transform_.is_identity()) {
+        if (auto tr = path.transform(current_transform_)) b = tr->bounds();
+    }
+    const int32_t pw = static_cast<int32_t>(std::max(1.0f, std::ceil(width_)));
+    const int32_t ph = static_cast<int32_t>(std::max(1.0f, std::ceil(height_)));
+    const int32_t x0 = std::clamp(static_cast<int32_t>(std::floor(b.left())), 0, pw);
+    const int32_t y0 = std::clamp(static_cast<int32_t>(std::floor(b.top())), 0, ph);
+    const int32_t x1 = std::clamp(static_cast<int32_t>(std::ceil(b.right())), 0, pw);
+    const int32_t y1 = std::clamp(static_cast<int32_t>(std::ceil(b.bottom())), 0, ph);
+    if (x1 > x0 && y1 > y0) {
+        if (auto br = ScreenIntRect::from_xywh(
+                static_cast<uint32_t>(x0), static_cast<uint32_t>(y0),
+                static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0))) {
+            clip_bounds_ = clip_bounds_->intersect(*br);
+            return;
+        }
+    }
+    clip_bounds_ = std::nullopt;
 }
 
 void PdfCanvas::apply_fill_paint(const Paint& paint) {
@@ -284,6 +419,126 @@ void PdfCanvas::draw_pixmap(const Pixmap& pixmap, const Rect& dest_rect) {
              dest_rect.left(), dest_rect.bottom(),
              res_name.c_str());
     stream_ += buf;
+}
+
+void PdfCanvas::draw_pixmap(int32_t x, int32_t y, const PixmapRef& src, const PixmapPaint& paint) {
+    if (src.width() == 0 || src.height() == 0 || !src.data()) return;
+    auto sr = Rect::from_xywh(0.0f, 0.0f, static_cast<float>(src.width()), static_cast<float>(src.height()));
+    auto dr = Rect::from_xywh(static_cast<float>(x), static_cast<float>(y),
+                              static_cast<float>(src.width()), static_cast<float>(src.height()));
+    if (sr && dr) {
+        draw_pixmap_rect(src, *sr, *dr, paint);
+    }
+}
+
+void PdfCanvas::draw_pixmap_rect(
+    const PixmapRef& src,
+    const Rect& src_rect,
+    const Rect& dst_rect,
+    const PixmapPaint& paint
+) {
+    if (src.width() == 0 || src.height() == 0 || !src.data() ||
+        src_rect.is_empty() || dst_rect.is_empty()) {
+        return;
+    }
+
+    const int32_t sw = static_cast<int32_t>(src.width());
+    const int32_t sh = static_cast<int32_t>(src.height());
+    const int32_t ix0 = std::clamp(static_cast<int32_t>(std::floor(src_rect.left())), 0, sw - 1);
+    const int32_t iy0 = std::clamp(static_cast<int32_t>(std::floor(src_rect.top())), 0, sh - 1);
+    const int32_t ix1 = std::clamp(static_cast<int32_t>(std::ceil(src_rect.right())), ix0 + 1, sw);
+    const int32_t iy1 = std::clamp(static_cast<int32_t>(std::ceil(src_rect.bottom())), iy0 + 1, sh);
+    const uint32_t cw = static_cast<uint32_t>(ix1 - ix0);
+    const uint32_t ch = static_cast<uint32_t>(iy1 - iy0);
+
+    auto cropped = Pixmap::allocate(cw, ch, PixelFormat::RGBA8888);
+    if (!cropped) return;
+
+    const float op = std::clamp(paint.opacity, 0.0f, 1.0f);
+    const float tr = paint.tint.red();
+    const float tg = paint.tint.green();
+    const float tb = paint.tint.blue();
+    const float ta = paint.tint.alpha() * op;
+
+    auto dst_mut = cropped->as_mut();
+    for (uint32_t y = 0; y < ch; ++y) {
+        for (uint32_t x = 0; x < cw; ++x) {
+            auto px_opt = src.pixel(static_cast<uint32_t>(ix0) + x, static_cast<uint32_t>(iy0) + y);
+            if (!px_opt) {
+                dst_mut.set_pixel(x, y, PremultipliedColorU8::TRANSPARENT);
+                continue;
+            }
+            const ColorU8 straight = px_opt->demultiply();
+            const uint8_t r = static_cast<uint8_t>(std::clamp(static_cast<float>(straight.red()) * tr, 0.0f, 255.0f) + 0.5f);
+            const uint8_t g = static_cast<uint8_t>(std::clamp(static_cast<float>(straight.green()) * tg, 0.0f, 255.0f) + 0.5f);
+            const uint8_t b = static_cast<uint8_t>(std::clamp(static_cast<float>(straight.blue()) * tb, 0.0f, 255.0f) + 0.5f);
+            const uint8_t a = static_cast<uint8_t>(std::clamp(static_cast<float>(straight.alpha()) * ta, 0.0f, 255.0f) + 0.5f);
+            dst_mut.set_pixel(x, y, PremultipliedColorU8::from_rgba_unchecked(r, g, b, a));
+        }
+    }
+
+    draw_pixmap(*cropped, dst_rect);
+}
+
+void PdfCanvas::draw_vertices(const Vertices& vertices, BlendMode blend_mode, float opacity) {
+    (void)blend_mode;
+    if (!vertices.is_valid()) return;
+    const size_t tri_count = vertices.triangle_count();
+    if (tri_count == 0) return;
+
+    const auto& pos = vertices.positions;
+    const auto& cols = vertices.colors;
+    const size_t npos = pos.size();
+    const float alpha = std::clamp(opacity, 0.0f, 1.0f);
+
+    Stroke seam_stroke(0.35f);
+    seam_stroke.line_join = LineJoin::Round;
+    char buf[160];
+
+    for (size_t t = 0; t < tri_count; ++t) {
+        auto [i0, i1, i2] = vertices.get_triangle_indices(t);
+        if (i0 >= npos || i1 >= npos || i2 >= npos) continue;
+
+        Color c = Color::WHITE;
+        if (!cols.empty() && i0 < cols.size() && i1 < cols.size() && i2 < cols.size()) {
+            c = Color::from_rgba_unchecked(
+                (cols[i0].red() + cols[i1].red() + cols[i2].red()) / 3.0f,
+                (cols[i0].green() + cols[i1].green() + cols[i2].green()) / 3.0f,
+                (cols[i0].blue() + cols[i1].blue() + cols[i2].blue()) / 3.0f,
+                std::clamp(((cols[i0].alpha() + cols[i1].alpha() + cols[i2].alpha()) / 3.0f) * alpha, 0.0f, 1.0f)
+            );
+        } else {
+            c = Color::from_rgba_unchecked(1.0f, 1.0f, 1.0f, alpha);
+        }
+
+        Paint p(c);
+        apply_fill_paint(p);
+        apply_stroke_paint(p, seam_stroke);
+        snprintf(buf, sizeof(buf), "%.2f %.2f m %.2f %.2f l %.2f %.2f l h B\n",
+                 pos[i0].x, pos[i0].y, pos[i1].x, pos[i1].y, pos[i2].x, pos[i2].y);
+        stream_ += buf;
+    }
+}
+
+void PdfCanvas::draw_annotation(
+    const Rect& rect,
+    std::string_view key,
+    std::span<const uint8_t> data
+) {
+    if (key.empty()) return;
+    Rect page_rect = rect;
+    if (current_transform_4x4_.is_planar_perspective()) {
+        if (auto mapped = current_transform_4x4_.map_rect(rect)) {
+            page_rect = *mapped;
+        }
+    } else if (auto mapped = rect.transform(current_transform_)) {
+        page_rect = *mapped;
+    }
+    annotations_.push_back(PdfAnnotation{
+        .rect = page_rect,
+        .key = std::string(key),
+        .data = std::vector<uint8_t>(data.begin(), data.end())
+    });
 }
 
 } // namespace nisaba::pdf

@@ -376,4 +376,58 @@ inline std::optional<NonZeroRect> NonZeroRect::transform(const Transform& ts) co
     }
 }
 
+/// Compact 2D similarity transform (uniform scale, rotation, and translation).
+/// Maps a local point (x, y) to:
+///   x' = scos * x - ssin * y + tx
+///   y' = ssin * x + scos * y + ty
+struct RSXform {
+    float scos{1.0f};
+    float ssin{0.0f};
+    float tx{0.0f};
+    float ty{0.0f};
+
+    constexpr RSXform() noexcept = default;
+    constexpr RSXform(float scos_, float ssin_, float tx_, float ty_) noexcept
+        : scos(scos_), ssin(ssin_), tx(tx_), ty(ty_) {}
+
+    static RSXform from_radians(
+        float scale,
+        float radians,
+        float tx,
+        float ty,
+        float ax = 0.0f,
+        float ay = 0.0f
+    ) noexcept {
+        const float s = std::sin(radians) * scale;
+        const float c = std::cos(radians) * scale;
+        return RSXform(c, s, tx - c * ax + s * ay, ty - s * ax - c * ay);
+    }
+
+    static RSXform from_degrees(
+        float scale,
+        float degrees,
+        float tx,
+        float ty,
+        float ax = 0.0f,
+        float ay = 0.0f
+    ) noexcept {
+        return from_radians(scale, scalar::to_radians(degrees), tx, ty, ax, ay);
+    }
+
+    [[nodiscard]] constexpr Transform to_transform() const noexcept {
+        return Transform::from_row(scos, ssin, -ssin, scos, tx, ty);
+    }
+
+    void to_quad(float width, float height, Point quad[4]) const noexcept {
+        const float dx_w = scos * width;
+        const float dy_w = ssin * width;
+        const float dx_h = -ssin * height;
+        const float dy_h = scos * height;
+        quad[0] = Point(tx, ty);
+        quad[1] = Point(tx + dx_w, ty + dy_w);
+        quad[2] = Point(tx + dx_w + dx_h, ty + dy_w + dy_h);
+        quad[3] = Point(tx + dx_h, ty + dy_h);
+    }
+};
+
 } // namespace nisaba

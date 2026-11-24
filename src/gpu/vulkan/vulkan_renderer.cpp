@@ -48,6 +48,7 @@ enum class VkStencilMode : uint8_t {
     FillAntiAlias,      // EQUAL (clipDepth<<4) mask 0xff, write 0x00, KEEP, RGBA writes enabled
     FillCover,          // NOTEQUAL 0 mask 0x0f, write 0x0f, ZERO, RGBA writes enabled
     ClipCover,          // NOTEQUAL (newDepth<<4) mask 0x0f, write 0xff, REPLACE, colorMask = 0
+    ClipMarkPrev,       // EQUAL (prevDepth<<4) mask 0xf0, write 0x0f, REPLACE (0x01), colorMask = 0
     RestoreClip         // LESS (targetDepth<<4) mask 0xf0, write 0xff, REPLACE, colorMask = 0
 };
 
@@ -250,6 +251,7 @@ struct Call {
     int uniformOffset{0};
     int clipDepth{0};
     int layerIndex{-1};
+    bool isDifference{false};
     bool evenOdd{false};
     bool isPerlinNoise{false};
     Winding winding{Winding::CounterClockwise};
@@ -898,6 +900,7 @@ struct VulkanRenderer::Impl {
             (stencilMode == VkStencilMode::FillStencilOdd ||
              stencilMode == VkStencilMode::FillStencilNonZero ||
              stencilMode == VkStencilMode::ClipCover ||
+             stencilMode == VkStencilMode::ClipMarkPrev ||
              stencilMode == VkStencilMode::RestoreClip);
 
         VkPipelineColorBlendAttachmentState colorBlendAttachment{};
@@ -962,6 +965,10 @@ struct VulkanRenderer::Impl {
                 break;
             case VkStencilMode::ClipCover:
                 depthStencil.front = makeStencilOp(VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_NOT_EQUAL, 0x0fu, 0xffu);
+                depthStencil.back = depthStencil.front;
+                break;
+            case VkStencilMode::ClipMarkPrev:
+                depthStencil.front = makeStencilOp(VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_EQUAL, 0xf0u, 0x0fu);
                 depthStencil.back = depthStencil.front;
                 break;
             case VkStencilMode::RestoreClip:
@@ -3407,7 +3414,7 @@ void VulkanRenderer::renderTriangles(const Paint& paint, const CompositeOperatio
 }
 
 void VulkanRenderer::renderClip(const RenderPath* paths, int npaths, Winding winding, int targetDepth,
-                                const Scissor& scissor, const float* bounds) {
+                                const Scissor& scissor, const float* bounds, bool isDifference) {
     if (npaths <= 0 || paths == nullptr || m_impl->fragSize == 0) return;
 
     int hwScissor[4]{-1, -1, -1, -1};
@@ -3416,6 +3423,7 @@ void VulkanRenderer::renderClip(const RenderPath* paths, int npaths, Winding win
     Call call;
     call.type = CallType::Clip;
     call.clipDepth = targetDepth;
+    call.isDifference = isDifference;
     call.winding = winding;
     if (hasHwScissor) std::memcpy(call.scissorRect, hwScissor, sizeof(hwScissor));
 
@@ -3423,7 +3431,8 @@ void VulkanRenderer::renderClip(const RenderPath* paths, int npaths, Winding win
     call.pathCount = npaths;
     m_impl->paths.resize(call.pathOffset + npaths);
 
-    int maxverts = 4;
+    const int quadVerts = isDifference ? 8 : 4;
+    int maxverts = quadVerts;
     for (int i = 0; i < npaths; ++i) maxverts += paths[i].fillCount;
 
     const int offset = static_cast<int>(m_impl->verts.size());
@@ -3443,17 +3452,29 @@ void VulkanRenderer::renderClip(const RenderPath* paths, int npaths, Winding win
     }
 
     call.triangleOffset = curOffset;
-    call.triangleCount = 4;
+    call.triangleCount = quadVerts;
     const float minX = bounds ? bounds[0] : 0.0f;
     const float minY = bounds ? bounds[1] : 0.0f;
     const float maxX = bounds ? bounds[2] : m_impl->view[0];
     const float maxY = bounds ? bounds[3] : m_impl->view[1];
     Vertex* quad = &m_impl->verts[curOffset];
-    quad[0] = Vertex(maxX, maxY, 0.5f, 1.0f);
-    quad[1] = Vertex(maxX, minY, 0.5f, 1.0f);
-    quad[2] = Vertex(minX, maxY, 0.5f, 1.0f);
-    quad[3] = Vertex(minX, minY, 0.5f, 1.0f);
-    curOffset += 4;
+    if (isDifference) {
+        quad[0] = Vertex(m_impl->view[0], m_impl->view[1], 0.5f, 1.0f);
+        quad[1] = Vertex(m_impl->view[0], 0.0f, 0.5f, 1.0f);
+        quad[2] = Vertex(0.0f, m_impl->view[1], 0.5f, 1.0f);
+        quad[3] = Vertex(0.0f, 0.0f, 0.5f, 1.0f);
+        quad[4] = Vertex(maxX, maxY, 0.5f, 1.0f);
+        quad[5] = Vertex(maxX, minY, 0.5f, 1.0f);
+        quad[6] = Vertex(minX, maxY, 0.5f, 1.0f);
+        quad[7] = Vertex(minX, minY, 0.5f, 1.0f);
+        curOffset += 8;
+    } else {
+        quad[0] = Vertex(maxX, maxY, 0.5f, 1.0f);
+        quad[1] = Vertex(maxX, minY, 0.5f, 1.0f);
+        quad[2] = Vertex(minX, maxY, 0.5f, 1.0f);
+        quad[3] = Vertex(minX, minY, 0.5f, 1.0f);
+        curOffset += 4;
+    }
     m_impl->verts.resize(curOffset);
 
     FragUniforms tempFrag{};
@@ -4158,17 +4179,39 @@ void VulkanRenderer::flush() {
             const VkStencilMode clipFillMode = (call.winding == Winding::Clockwise)
                 ? VkStencilMode::FillStencilOdd
                 : VkStencilMode::FillStencilNonZero;
-            VkPipeline pClip = m_impl->getOrCreatePipeline(VkTopologyKind::Fan, clipFillMode, VkBlendState{}, inOffscreen);
-            if (bindAndSetStencil(pClip, prevDepthVal, true)) {
-                for (int i = 0; i < call.pathCount; ++i) {
-                    const auto& path = m_impl->paths[call.pathOffset + i];
-                    if (path.fillCount > 0) vkCmdDraw(cmd, path.fillCount, 1, path.fillOffset, 0);
+            if (call.isDifference && call.triangleCount >= 8) {
+                VkPipeline pMark = m_impl->getOrCreatePipeline(VkTopologyKind::Strip, VkStencilMode::ClipMarkPrev, VkBlendState{}, inOffscreen);
+                if (bindAndSetStencil(pMark, prevDepthVal | 0x01u, true)) {
+                    vkCmdDraw(cmd, 4, 1, call.triangleOffset, 0);
                 }
-            }
-            if (call.triangleCount > 0) {
-                VkPipeline pCover = m_impl->getOrCreatePipeline(VkTopologyKind::Strip, VkStencilMode::ClipCover, VkBlendState{}, inOffscreen);
-                if (bindAndSetStencil(pCover, newDepthVal, true)) {
-                    vkCmdDraw(cmd, call.triangleCount, 1, call.triangleOffset, 0);
+                VkPipeline pPromote = m_impl->getOrCreatePipeline(VkTopologyKind::Strip, VkStencilMode::ClipCover, VkBlendState{}, inOffscreen);
+                if (bindAndSetStencil(pPromote, newDepthVal, true)) {
+                    vkCmdDraw(cmd, 4, 1, call.triangleOffset, 0);
+                }
+                VkPipeline pClip = m_impl->getOrCreatePipeline(VkTopologyKind::Fan, clipFillMode, VkBlendState{}, inOffscreen);
+                if (bindAndSetStencil(pClip, newDepthVal, true)) {
+                    for (int i = 0; i < call.pathCount; ++i) {
+                        const auto& path = m_impl->paths[call.pathOffset + i];
+                        if (path.fillCount > 0) vkCmdDraw(cmd, path.fillCount, 1, path.fillOffset, 0);
+                    }
+                }
+                VkPipeline pDemote = m_impl->getOrCreatePipeline(VkTopologyKind::Strip, VkStencilMode::ClipCover, VkBlendState{}, inOffscreen);
+                if (bindAndSetStencil(pDemote, prevDepthVal, true)) {
+                    vkCmdDraw(cmd, 4, 1, call.triangleOffset + 4, 0);
+                }
+            } else {
+                VkPipeline pClip = m_impl->getOrCreatePipeline(VkTopologyKind::Fan, clipFillMode, VkBlendState{}, inOffscreen);
+                if (bindAndSetStencil(pClip, prevDepthVal, true)) {
+                    for (int i = 0; i < call.pathCount; ++i) {
+                        const auto& path = m_impl->paths[call.pathOffset + i];
+                        if (path.fillCount > 0) vkCmdDraw(cmd, path.fillCount, 1, path.fillOffset, 0);
+                    }
+                }
+                if (call.triangleCount > 0) {
+                    VkPipeline pCover = m_impl->getOrCreatePipeline(VkTopologyKind::Strip, VkStencilMode::ClipCover, VkBlendState{}, inOffscreen);
+                    if (bindAndSetStencil(pCover, newDepthVal, true)) {
+                        vkCmdDraw(cmd, call.triangleCount, 1, call.triangleOffset, 0);
+                    }
                 }
             }
             activeClipDepth = call.clipDepth;

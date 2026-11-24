@@ -1453,7 +1453,7 @@ void test_canvas_icanvas_pdf_parity() {
     public:
         uint32_t canvas_width() const noexcept override { return 800; }
         uint32_t canvas_height() const noexcept override { return 1200; }
-        void save() override {}
+        int save() override { return 1; }
         void restore() override {}
         void translate(float, float) override {}
         void scale(float, float) override {}

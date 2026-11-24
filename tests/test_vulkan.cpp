@@ -824,6 +824,346 @@ void test_vulkan_phase3_and_phase4_2_parity() {
     std::cout << "  -> Vulkan Phase 3.1, Phase 3.2 & Phase 4.2 Parity OK" << std::endl;
 }
 
+void test_vulkan_canvas_phase1_parity() {
+    std::cout << "[Test 12] Vulkan Canvas Phase 1 (Clip Queries, Save Stack, draw_color/draw_paint, 9-Slice & Lattice) Parity..." << std::endl;
+    auto device = VulkanDevice::create();
+    assert(device != nullptr && device->is_valid());
+
+    auto make_nine_src = [](uint32_t w, uint32_t h, uint32_t b) {
+        auto pm = Pixmap::create(w, h).value();
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                bool l = x < b, r = x >= (w - b), t = y < b, bo = y >= (h - b);
+                Color c = Color::from_rgba8(40, 210, 125, 255);
+                if ((l || r) && (t || bo)) c = Color::from_rgba8(240, 65, 55, 255);
+                else if (t || bo)          c = Color::from_rgba8(55, 125, 245, 255);
+                else if (l || r)           c = Color::from_rgba8(245, 200, 45, 255);
+                pm.set_pixel(x, y, c.premultiply().to_color_u8());
+            }
+        }
+        return pm;
+    };
+    Pixmap nine_src = make_nine_src(16, 16, 4);
+    Pixmap nine_1px = make_nine_src(9, 9, 4);
+
+    verify_vulkan_parity(device, 280, 220, Color::from_rgba8(18, 24, 38, 255),
+        "VK Canvas Phase 1 Ergonomics & Lattice",
+        [&](ICanvas& c, bool) {
+            assert(c.save_count() == 1);
+            const int s0 = c.save();
+            assert(s0 == 1 && c.save_count() == 2);
+            c.clip_rect(*Rect::from_xywh(12.0f, 12.0f, 80.0f, 56.0f));
+            assert(!c.quick_reject(*Rect::from_xywh(20.0f, 20.0f, 10.0f, 10.0f)));
+            assert(c.quick_reject(*Rect::from_xywh(120.0f, 120.0f, 10.0f, 10.0f)));
+            c.draw_color(Color::from_rgba8(220, 95, 45, 255), BlendMode::SourceOver);
+            c.save();
+            c.clip_rect(*Rect::from_xywh(28.0f, 24.0f, 24.0f, 24.0f));
+            c.draw_color(Color::TRANSPARENT, BlendMode::Clear);
+            c.restore_to_count(s0);
+            assert(c.save_count() == 1);
+
+            c.save();
+            c.clip_path(*PathBuilder::from_circle(145.0f, 45.0f, 32.0f));
+            c.translate(145.0f, 45.0f);
+            c.rotate(30.0f);
+            auto grad = LinearGradient::create(
+                Point::from_xy(-32.0f, 0.0f), Point::from_xy(32.0f, 0.0f),
+                {GradientStop::create(0.0f, Color::from_rgba8(255, 60, 80, 255)),
+                 GradientStop::create(1.0f, Color::from_rgba8(50, 140, 255, 255))});
+            c.draw_paint(Paint(Shader(*grad)));
+            c.restore();
+
+            const int s_piv = c.save();
+            c.save_layer_alpha(std::optional<Rect>(Rect::from_xywh(195.0f, 10.0f, 75.0f, 75.0f)), 0.6f);
+            c.rotate(45.0f, 232.0f, 48.0f);
+            c.fill_rect(*Rect::from_xywh(212.0f, 36.0f, 40.0f, 24.0f), Paint(Color::from_rgba8(240, 220, 60, 255)));
+            c.restore_to_count(s_piv);
+
+            PixmapPaint pp;
+            pp.quality = FilterQuality::Bilinear;
+            c.draw_image_nine(nine_src.as_ref(), *IntRect::from_ltrb(4, 4, 12, 12),
+                              *Rect::from_xywh(12.0f, 95.0f, 84.0f, 64.0f), pp);
+            c.draw_image_nine(nine_1px.as_ref(), *IntRect::from_ltrb(4, 4, 5, 5),
+                              *Rect::from_xywh(108.0f, 95.0f, 64.0f, 36.0f), pp);
+
+            std::array<int32_t, 2> xdivs{4, 12};
+            std::array<int32_t, 2> ydivs{4, 12};
+            std::array<Lattice::RectType, 9> rtypes{
+                Lattice::RectType::FixedColor, Lattice::RectType::Default,     Lattice::RectType::Default,
+                Lattice::RectType::Default,    Lattice::RectType::Transparent, Lattice::RectType::Default,
+                Lattice::RectType::Default,    Lattice::RectType::Default,     Lattice::RectType::FixedColor
+            };
+            std::array<Color, 9> rcolors{};
+            rcolors[0] = Color::from_rgba8(240, 50, 230, 255);
+            rcolors[8] = Color::from_rgba8(50, 235, 245, 255);
+            Lattice lat;
+            lat.x_divs = xdivs;
+            lat.y_divs = ydivs;
+            lat.rect_types = rtypes;
+            lat.colors = rcolors;
+            PixmapPaint lp;
+            lp.opacity = 0.85f;
+            c.draw_image_lattice(nine_src.as_ref(), lat, *Rect::from_xywh(186.0f, 95.0f, 80.0f, 64.0f), lp);
+        },
+        {{70, 40}, {40, 36}, {145, 45}, {232, 48}, {50, 125}, {114, 113}, {188, 97}, {226, 127}}, 6, 2.0f);
+
+    std::cout << "  -> Vulkan Canvas Phase 1 Parity OK" << std::endl;
+}
+
+void test_vulkan_canvas_phase2_parity() {
+    std::cout << "[Test 13] Vulkan Canvas Phase 2 (Difference Clip, clip_shader, draw_atlas & Coons/GradientMesh) Parity..." << std::endl;
+    auto device = VulkanDevice::create();
+    assert(device != nullptr && device->is_valid());
+
+    auto atlas = Pixmap::create(32, 32).value();
+    for (uint32_t y = 0; y < 32; ++y) {
+        for (uint32_t x = 0; x < 32; ++x) {
+            Color c = Color::WHITE;
+            if (x < 16 && y < 16)       c = Color::from_rgba8(240, 60, 50, 255);
+            else if (x >= 16 && y < 16) c = Color::from_rgba8(50, 220, 90, 255);
+            else if (x < 16 && y >= 16) c = Color::from_rgba8(55, 130, 245, 255);
+            else                        c = Color::from_rgba8(245, 215, 50, 255);
+            atlas.set_pixel(x, y, c.premultiply().to_color_u8());
+        }
+    }
+
+    CoonsPatch patch;
+    patch.top[0] = {15, 115};    patch.top[1] = {55, 98};     patch.top[2] = {95, 132};    patch.top[3] = {135, 115};
+    patch.right[0] = {135, 115}; patch.right[1] = {150, 145}; patch.right[2] = {120, 175}; patch.right[3] = {135, 205};
+    patch.bottom[0] = {15, 205}; patch.bottom[1] = {55, 216}; patch.bottom[2] = {95, 192}; patch.bottom[3] = {135, 205};
+    patch.left[0] = {15, 115};   patch.left[1] = {4, 145};    patch.left[2] = {28, 175};   patch.left[3] = {15, 205};
+    patch.color_top_left = Color::from_rgba8(255, 55, 55, 255);
+    patch.color_top_right = Color::from_rgba8(50, 245, 95, 255);
+    patch.color_bottom_right = Color::from_rgba8(55, 110, 255, 255);
+    patch.color_bottom_left = Color::from_rgba8(255, 225, 45, 255);
+
+    GradientMesh mesh;
+    CoonsPatch p2 = patch;
+    for (int i = 0; i < 4; ++i) {
+        p2.top[i].x += 145.0f;
+        p2.right[i].x += 145.0f;
+        p2.bottom[i].x += 145.0f;
+        p2.left[i].x += 145.0f;
+    }
+    p2.color_top_left = Color::from_rgba8(230, 50, 240, 255);
+    p2.color_bottom_right = Color::from_rgba8(40, 240, 230, 255);
+    mesh.add_patch(p2);
+
+    verify_vulkan_parity(device, 300, 220, Color::from_rgba8(16, 22, 34, 255),
+        "VK Canvas Phase 2 Clip/Atlas/Coons",
+        [&](ICanvas& c, bool) {
+            c.save();
+            c.clip_rect(*Rect::from_xywh(10.0f, 10.0f, 80.0f, 80.0f), ClipOp::Intersect);
+            c.clip_oval(*Rect::from_xywh(30.0f, 30.0f, 40.0f, 40.0f), ClipOp::Difference);
+            c.save();
+            c.clip_rrect(RRect::from_rect_and_radius(*Rect::from_xywh(14.0f, 14.0f, 20.0f, 20.0f), 4.0f), ClipOp::Difference);
+            c.fill_rect(*Rect::from_xywh(0.0f, 0.0f, 100.0f, 100.0f), Paint(Color::from_rgba8(230, 90, 50, 255)));
+            c.restore();
+            c.fill_rect(*Rect::from_xywh(14.0f, 14.0f, 20.0f, 20.0f), Paint(Color::from_rgba8(60, 210, 140, 255)));
+            c.restore();
+
+            auto fade_grad = LinearGradient::create(
+                Point::from_xy(100.0f, 0.0f), Point::from_xy(185.0f, 0.0f),
+                {GradientStop::create(0.0f, Color::from_rgba8(255, 255, 255, 0)),
+                 GradientStop::create(1.0f, Color::from_rgba8(255, 255, 255, 255))});
+            c.save();
+            c.clip_rect(*Rect::from_xywh(100.0f, 10.0f, 85.0f, 36.0f));
+            c.clip_shader(Shader(*fade_grad), ClipOp::Intersect);
+            c.fill_rect(*Rect::from_xywh(100.0f, 10.0f, 85.0f, 36.0f), Paint(Color::from_rgba8(245, 245, 245, 255)));
+            c.restore();
+
+            auto rad_grad = RadialGradient::create(
+                Point::from_xy(142.0f, 72.0f), 24.0f,
+                {GradientStop::create(0.0f, Color::from_rgba8(255, 255, 255, 255)),
+                 GradientStop::create(1.0f, Color::from_rgba8(255, 255, 255, 0))});
+            c.save();
+            c.clip_rect(*Rect::from_xywh(100.0f, 52.0f, 85.0f, 38.0f));
+            c.clip_shader(Shader(*rad_grad), ClipOp::Difference);
+            c.fill_rect(*Rect::from_xywh(100.0f, 52.0f, 85.0f, 38.0f), Paint(Color::from_rgba8(70, 190, 255, 255)));
+            c.restore();
+
+            std::array<RSXform, 4> xforms{
+                RSXform::from_degrees(1.5f, 0.0f, 196.0f, 12.0f),
+                RSXform::from_degrees(1.4f, 35.0f, 258.0f, 26.0f, 8.0f, 8.0f),
+                RSXform::from_degrees(1.5f, 0.0f, 196.0f, 54.0f),
+                RSXform::from_degrees(1.5f, -20.0f, 258.0f, 68.0f, 8.0f, 8.0f)
+            };
+            std::array<Rect, 4> tex_rects{
+                *Rect::from_xywh(0.0f, 0.0f, 16.0f, 16.0f),
+                *Rect::from_xywh(16.0f, 0.0f, 16.0f, 16.0f),
+                *Rect::from_xywh(0.0f, 16.0f, 16.0f, 16.0f),
+                *Rect::from_xywh(16.0f, 16.0f, 16.0f, 16.0f)
+            };
+            std::array<Color, 4> cols{
+                Color::WHITE,
+                Color::from_rgba8(255, 255, 255, 200),
+                Color::from_rgba8(200, 255, 255, 255),
+                Color::from_rgba8(255, 140, 255, 255)
+            };
+            c.draw_atlas(atlas.as_ref(), xforms, tex_rects, cols, BlendMode::Modulate);
+
+            c.save();
+            c.clip_oval(*Rect::from_xywh(58.0f, 145.0f, 34.0f, 34.0f), ClipOp::Difference);
+            c.draw_coons_patch(patch);
+            c.restore();
+
+            c.draw_gradient_mesh(mesh);
+        },
+        {{50, 50}, {22, 22}, {80, 80}, {140, 28}, {142, 72}, {208, 24}, {75, 162}, {220, 160}}, 8, 2.5f);
+
+    std::cout << "  -> Vulkan Canvas Phase 2 Parity OK" << std::endl;
+}
+
+void test_vulkan_canvas_phase3_parity() {
+    std::cout << "[Test 14] Vulkan Canvas Phase 3 (Picture/Drawable, 4x4 Projective Stack & Region) Parity..." << std::endl;
+    auto device = VulkanDevice::create();
+    assert(device != nullptr && device->is_valid());
+
+    struct VkPhase3Badge final : public Drawable {
+        Color col{Color::from_rgba8(245, 190, 45, 255)};
+        Rect on_get_bounds() const override { return *Rect::from_xywh(0.0f, 0.0f, 22.0f, 22.0f); }
+        void on_draw(ICanvas& c) override {
+            c.fill_rrect(RRect::from_rect_and_radius(*Rect::from_xywh(0.0f, 0.0f, 22.0f, 22.0f), 6.0f), Paint(col));
+        }
+    };
+
+    auto badge = std::make_shared<VkPhase3Badge>();
+    std::shared_ptr<Picture> pic;
+    {
+        auto icon = Pixmap::create(16, 16).value();
+        icon.fill(Color::from_rgba8(55, 230, 185, 255));
+        PictureRecorder rec;
+        ICanvas& rc = rec.begin_recording(*Rect::from_xywh(0.0f, 0.0f, 84.0f, 62.0f));
+        rc.fill_rrect(RRect::from_rect_and_radius(*Rect::from_xywh(0.0f, 0.0f, 84.0f, 62.0f), 8.0f),
+                      Paint(Color::from_rgba8(42, 88, 205, 255)));
+        rc.draw_pixmap(10, 10, icon.as_ref());
+        const Transform bt = Transform::from_translate(50.0f, 18.0f);
+        rc.draw_drawable(badge, &bt);
+        pic = rec.finish_recording();
+    }
+
+    Region clip_rgn(*IntRect::from_xywh(215, 12, 72, 72));
+    clip_rgn.difference_with(*IntRect::from_xywh(237, 34, 28, 28));
+
+    Region xor_rgn(*IntRect::from_xywh(120, 132, 72, 48));
+    xor_rgn.xor_with(*IntRect::from_xywh(156, 152, 72, 48));
+
+    verify_vulkan_parity(device, 300, 220, Color::from_rgba8(14, 20, 32, 255),
+        "VK Canvas Phase 3 Picture/4x4/Region",
+        [&](ICanvas& c, bool) {
+            badge->col = Color::from_rgba8(245, 190, 45, 255);
+            const Transform t1 = Transform::from_translate(10.0f, 12.0f);
+            c.draw_picture(pic, &t1);
+
+            badge->col = Color::from_rgba8(240, 65, 135, 255);
+            const Transform t2 = Transform::from_translate(10.0f, 86.0f);
+            Paint alpha_p(Color::from_rgba_unchecked(1.0f, 1.0f, 1.0f, 0.65f));
+            c.draw_picture(pic, &t2, &alpha_p);
+
+            c.save();
+            c.concat(Transform4x4::from_camera_orbit(155.0f, 62.0f, 10.0f, 28.0f, 0.0f, 360.0f));
+            auto grad = LinearGradient::create(
+                Point::from_xy(115.0f, 22.0f), Point::from_xy(195.0f, 102.0f),
+                {GradientStop::create(0.0f, Color::from_rgba8(245, 80, 70, 255)),
+                 GradientStop::create(1.0f, Color::from_rgba8(70, 145, 250, 255))});
+            c.fill_rrect(RRect::from_rect_and_radius(*Rect::from_xywh(115.0f, 22.0f, 80.0f, 80.0f), 10.0f),
+                         Paint(Shader(*grad)));
+            Stroke st; st.width = 3.5f;
+            c.stroke_rect(*Rect::from_xywh(115.0f, 22.0f, 80.0f, 80.0f), Paint(Color::WHITE), st);
+            c.restore();
+
+            c.save();
+            c.translate(40.0f, 40.0f);
+            c.clip_region(clip_rgn, ClipOp::Intersect);
+            c.draw_color(Color::from_rgba8(55, 215, 145, 255));
+            c.restore();
+
+            c.draw_region(xor_rgn, Paint(Color::from_rgba8(175, 95, 245, 255)));
+        },
+        {{28, 28}, {70, 40}, {70, 114}, {155, 62}, {222, 20}, {250, 48}, {135, 145}, {170, 165}}, 8, 2.5f);
+
+    std::cout << "  -> Vulkan Canvas Phase 3 Parity OK" << std::endl;
+}
+
+static void test_vulkan_canvas_phase4_parity() {
+    std::cout << "Testing Vulkan Canvas Phase 4 (draw_glyphs pos/RSXform, TextBlob, discard)..." << std::endl;
+    auto device = VulkanDevice::create();
+    assert(device && device->is_valid());
+
+    auto font = text::TtfFont::from_file(resolve_vk_test_font("NotoSans-Regular.ttf"));
+    assert(font && font->is_valid());
+
+    std::vector<uint16_t> pos_gids;
+    std::vector<Point> pos_pts;
+    float px = 18.0f;
+    for (char ch : std::string_view("VULKAN TEXT")) {
+        uint16_t gid = font->glyph_index(static_cast<char32_t>(ch));
+        pos_gids.push_back(gid);
+        pos_pts.emplace_back(px, 44.0f);
+        px += font->glyph_advance(gid, 24.0f) + 1.0f;
+    }
+
+    std::vector<uint16_t> arc_gids;
+    std::vector<RSXform> arc_xforms;
+    const float cx = 150.0f, cy = 205.0f, rad = 74.0f;
+    for (size_t i = 0; i < 8; ++i) {
+        const char ch = "ARCFLOW!"[i];
+        arc_gids.push_back(font->glyph_index(static_cast<char32_t>(ch)));
+        const float ang = -2.20f + static_cast<float>(i) * 0.18f;
+        arc_xforms.push_back(RSXform::from_radians(
+            1.0f, ang + 1.5707963f, cx + std::cos(ang) * rad, cy + std::sin(ang) * rad, 0.0f, 0.0f
+        ));
+    }
+
+    auto blob = TextBlob::from_text("Immutable Blob", *font, 20.0f);
+    assert(blob && !blob->is_empty());
+
+    auto draw_scene = [&](ICanvas& c) {
+        c.draw_color(Color::from_rgba8(14, 18, 28, 255));
+        c.draw_glyphs(pos_gids, pos_pts, *font, 24.0f, Paint(Color::from_rgba8(248, 250, 252, 255)));
+
+        std::vector<GradientStop> stops = {
+            GradientStop::create(0.0f, Color::from_rgba8(250, 204, 21, 255)),
+            GradientStop::create(1.0f, Color::from_rgba8(244, 63, 94, 255))
+        };
+        auto lg = LinearGradient::create(Point(18.0f, 92.0f), Point(250.0f, 92.0f), stops, SpreadMode::Pad);
+        assert(lg.has_value());
+        Paint gp;
+        gp.shader = Shader(*lg);
+        c.draw_text_blob(blob, 18.0f, 92.0f, gp);
+        c.draw_glyphs(arc_gids, arc_xforms, *font, 18.0f, Paint(Color::from_rgba8(56, 189, 248, 255)));
+    };
+
+    verify_vulkan_parity(
+        device, 300, 220, Color::from_rgba8(14, 18, 28, 255),
+        "Canvas Phase 4 (draw_glyphs pos/RSXform + TextBlob)",
+        [&](auto& c, bool) { draw_scene(c); },
+        {{20, 20}, {150, 110}},
+        40,
+        2.5f
+    );
+
+    // Verify VulkanSurface::discard() (DONT_CARE color loadOp + clean stencil-and-cover)
+    auto vk_surf = VulkanSurface::create(device, 160, 120, 4);
+    assert(vk_surf != nullptr);
+    GpuCanvas vk_canvas(vk_surf);
+    vk_canvas.clear(Color::from_rgba8(255, 0, 0, 255));
+    vk_canvas.fill_rect(*Rect::from_xywh(10.0f, 10.0f, 60.0f, 60.0f), Paint(Color::from_rgba8(255, 255, 0, 255)));
+    vk_canvas.discard();
+    vk_canvas.fill_rect(*Rect::from_xywh(0.0f, 0.0f, 160.0f, 120.0f), Paint(Color::from_rgba8(16, 36, 98, 255)));
+    vk_canvas.fill_oval(*Rect::from_xywh(40.0f, 20.0f, 80.0f, 80.0f), Paint(Color::from_rgba8(34, 211, 153, 255)));
+    vk_canvas.flush();
+
+    auto pm = vk_surf->to_pixmap();
+    assert(pm.has_value());
+    auto bg = pm->pixel(10, 10);
+    auto fg = pm->pixel(80, 60);
+    assert(bg && bg->red() < 30 && bg->blue() > 85);
+    assert(fg && fg->green() > 195 && fg->red() < 50);
+
+    std::cout << "  -> Vulkan Canvas Phase 4 Parity & Discard OK" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "Running Nisaba Vulkan GPU Backend Test Suite" << std::endl;
@@ -840,9 +1180,13 @@ int main() {
     test_vulkan_runtime_shader_image_filter_parity();
     test_vulkan_phase2_and_lighting_parity();
     test_vulkan_phase3_and_phase4_2_parity();
+    test_vulkan_canvas_phase1_parity();
+    test_vulkan_canvas_phase2_parity();
+    test_vulkan_canvas_phase3_parity();
+    test_vulkan_canvas_phase4_parity();
 
     std::cout << "========================================" << std::endl;
-    std::cout << "All Nisaba Vulkan GPU tests PASSED (11/11)!" << std::endl;
+    std::cout << "All Nisaba Vulkan GPU tests PASSED (15/15)!" << std::endl;
     std::cout << "========================================" << std::endl;
 
     return 0;

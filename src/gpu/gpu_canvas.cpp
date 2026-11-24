@@ -61,19 +61,20 @@ void draw_image_rect_internal(
 
     Paint p;
     p.image = img;
-    Color tint = paint.tint;
-    float alpha = std::clamp(paint.opacity, 0.0f, 1.0f);
-    p.innerColor = tint.withAlpha(tint.a * alpha);
+    p.radius = 1.0f;
+    p.innerColor = Color(1.0f, 1.0f, 1.0f, 1.0f);
     p.outerColor = p.innerColor;
 
-    constexpr uint32_t kWhite = 0xffffffffu;
+    Color tint = paint.tint;
+    float alpha = std::clamp(paint.opacity, 0.0f, 1.0f);
+    const uint32_t kPacked = tint.withAlpha(tint.a * alpha).premultiplied().toRGBA8();
     Vertex quad[6] = {
-        Vertex(x0, y0, u0, v0, kWhite),
-        Vertex(x0, y1, u0, v1, kWhite),
-        Vertex(x1, y1, u1, v1, kWhite),
-        Vertex(x0, y0, u0, v0, kWhite),
-        Vertex(x1, y1, u1, v1, kWhite),
-        Vertex(x1, y0, u1, v0, kWhite)
+        Vertex(x0, y0, u0, v0, kPacked),
+        Vertex(x0, y1, u0, v1, kPacked),
+        Vertex(x1, y1, u1, v1, kPacked),
+        Vertex(x0, y0, u0, v0, kPacked),
+        Vertex(x1, y1, u1, v1, kPacked),
+        Vertex(x1, y0, u1, v0, kPacked)
     };
 
     ScopedBlendMode scopedBlend(ctx, paint.blend_mode);
@@ -275,15 +276,28 @@ int GpuCanvas::get_or_upload_pixmap(const PixmapRef& src, int flags) {
     const uint32_t h = src.height();
     const uint32_t stride = static_cast<uint32_t>(src.stride_bytes());
     const PixelFormat fmt = src.format();
-    const uint64_t hash = hash_pixmap_content(src);
 
-    for (auto& entry : pixmap_tex_cache_) {
+    for (size_t i = 0; i < pixmap_tex_cache_.size(); ++i) {
+        auto& entry = pixmap_tex_cache_[i];
         if (entry.data_ptr == ptr && entry.width == w && entry.height == h &&
             entry.stride == stride && entry.format == fmt && entry.flags == flags) {
+            if (entry.img_id > 0 && entry.last_used_frame == frame_counter_) {
+                entry.last_use_seq = ++pixmap_use_seq_;
+                const int hit_id = entry.img_id;
+                if (i != 0) {
+                    std::swap(pixmap_tex_cache_[0], pixmap_tex_cache_[i]);
+                }
+                return hit_id;
+            }
+            const uint64_t hash = hash_pixmap_content(src);
             if (entry.content_hash == hash && entry.img_id > 0) {
                 entry.last_used_frame = frame_counter_;
                 entry.last_use_seq = ++pixmap_use_seq_;
-                return entry.img_id;
+                const int hit_id = entry.img_id;
+                if (i != 0) {
+                    std::swap(pixmap_tex_cache_[0], pixmap_tex_cache_[i]);
+                }
+                return hit_id;
             }
             // Same address, mutated pixels: replace safely
             if (entry.img_id > 0) {
@@ -300,9 +314,14 @@ int GpuCanvas::get_or_upload_pixmap(const PixmapRef& src, int flags) {
             entry.content_hash = hash;
             entry.last_used_frame = frame_counter_;
             entry.last_use_seq = ++pixmap_use_seq_;
+            if (i != 0) {
+                std::swap(pixmap_tex_cache_[0], pixmap_tex_cache_[i]);
+            }
             return new_img;
         }
     }
+
+    const uint64_t hash = hash_pixmap_content(src);
 
     const size_t byte_size = static_cast<size_t>(w) * static_cast<size_t>(h) * bytes_per_pixel(fmt);
     constexpr size_t kMaxEntries = 128;
@@ -362,6 +381,22 @@ void GpuCanvas::ensure_frame() {
     if (!in_frame_) {
         surface_->bind();
         context_->beginFrame(static_cast<float>(surface_->width()), static_cast<float>(surface_->height()), 1.0f);
+        if (!current_transform_.is_identity()) {
+            context_->transform(
+                current_transform_.sx, current_transform_.ky,
+                current_transform_.kx, current_transform_.sy,
+                current_transform_.tx, current_transform_.ty
+            );
+        }
+        if (scissor_clip_.has_value()) {
+            const auto& sc = *scissor_clip_;
+            if (sc.x() != 0 || sc.y() != 0 || sc.width() != surface_->width() || sc.height() != surface_->height()) {
+                context_->scissor(
+                    static_cast<float>(sc.x()), static_cast<float>(sc.y()),
+                    static_cast<float>(sc.width()), static_cast<float>(sc.height())
+                );
+            }
+        }
         in_frame_ = true;
         needs_surface_bind_ = false;
     } else if (needs_surface_bind_) {
@@ -372,6 +407,7 @@ void GpuCanvas::ensure_frame() {
 
 void GpuCanvas::clear(nisaba::Color color) {
     invalidate_backdrop_cache();
+    clip_shader_stack_.clear();
     if (context_ && in_frame_) {
         context_->cancelFrame();
         in_frame_ = false;
@@ -390,6 +426,25 @@ void GpuCanvas::clear(nisaba::Color color) {
     ensure_frame();
 }
 
+void GpuCanvas::discard() {
+    invalidate_backdrop_cache();
+    clip_shader_stack_.clear();
+    if (context_ && in_frame_) {
+        context_->cancelFrame();
+        in_frame_ = false;
+        for (int img : temp_images_) {
+            context_->deleteImage(img);
+        }
+        temp_images_.clear();
+        ++frame_counter_;
+    }
+    current_stencil_depth_ = 0;
+    if (surface_) {
+        surface_->discard();
+    }
+    needs_surface_bind_ = true;
+}
+
 bool GpuCanvas::resize(uint32_t width, uint32_t height) {
     if (!surface_ || !surface_->resize_screen(width, height)) {
         return false;
@@ -399,26 +454,50 @@ bool GpuCanvas::resize(uint32_t width, uint32_t height) {
     return true;
 }
 
-void GpuCanvas::save() {
+int GpuCanvas::save() {
+    if (has_unpushed_clip_shader()) {
+        materialize_pending_clip_shader_layers();
+    }
+    const int prev = save_count();
     if (context_) context_->save();
     state_stack_.push_back(GpuCanvasState{
         .transform = current_transform_,
+        .transform_4x4 = current_transform_4x4_,
+        .has_perspective_4x4 = has_perspective_4x4_,
         .scissor_clip = scissor_clip_,
         .stencil_clip_depth = current_stencil_depth_,
         .is_layer = false
     });
+    return prev;
 }
 
-void GpuCanvas::save_layer(const nisaba::Paint& paint) {
+int GpuCanvas::save_count() const noexcept {
+    return static_cast<int>(state_stack_.size()) + 1;
+}
+
+void GpuCanvas::restore_to_count(int count) {
+    const int target = std::max(1, count);
+    while (save_count() > target) {
+        restore();
+    }
+}
+
+int GpuCanvas::save_layer(const nisaba::Paint& paint) {
+    const int prev = save_count();
     push_layer_internal(std::nullopt, paint, false, 0.0f);
+    return prev;
 }
 
-void GpuCanvas::save_layer_bounds(const nisaba::Rect& bounds, const nisaba::Paint& paint) {
+int GpuCanvas::save_layer_bounds(const nisaba::Rect& bounds, const nisaba::Paint& paint) {
+    const int prev = save_count();
     push_layer_internal(bounds, paint, false, 0.0f);
+    return prev;
 }
 
-void GpuCanvas::save_layer_backdrop(std::optional<nisaba::Rect> bounds, const nisaba::Paint& paint, float blur_sigma) {
+int GpuCanvas::save_layer_backdrop(std::optional<nisaba::Rect> bounds, const nisaba::Paint& paint, float blur_sigma) {
+    const int prev = save_count();
     push_layer_internal(bounds, paint, true, blur_sigma);
+    return prev;
 }
 
 void GpuCanvas::push_layer_internal(
@@ -430,10 +509,15 @@ void GpuCanvas::push_layer_internal(
     nisaba::Color mask_tint
 ) {
     if (!context_ || !surface_) return;
+    if (has_unpushed_clip_shader()) {
+        materialize_pending_clip_shader_layers();
+    }
     ensure_frame();
 
     state_stack_.push_back(GpuCanvasState{
         .transform = current_transform_,
+        .transform_4x4 = current_transform_4x4_,
+        .has_perspective_4x4 = has_perspective_4x4_,
         .scissor_clip = scissor_clip_,
         .stencil_clip_depth = current_stencil_depth_,
         .is_layer = true
@@ -511,10 +595,201 @@ void GpuCanvas::push_layer_internal(
     }
 }
 
+std::optional<nisaba::Paint> GpuCanvas::try_fold_clip_shader(const nisaba::Paint& paint) const {
+    if (clip_shader_stack_.size() != 1 || clip_shader_stack_.back().layer_pushed) {
+        return std::nullopt;
+    }
+    if (paint.custom_shader || paint.has_layer_filter() || paint.has_custom_blender()) {
+        return std::nullopt;
+    }
+
+    switch (paint.blend_mode) {
+        case nisaba::BlendMode::Clear:
+        case nisaba::BlendMode::Source:
+        case nisaba::BlendMode::Destination:
+        case nisaba::BlendMode::SourceIn:
+        case nisaba::BlendMode::DestinationIn:
+        case nisaba::BlendMode::SourceOut:
+        case nisaba::BlendMode::DestinationAtop:
+            return std::nullopt;
+        default:
+            break;
+    }
+
+    nisaba::Color base_col = nisaba::Color::TRANSPARENT;
+    if (!paint.has_color_filter() && paint.shader.is_solid_color()) {
+        base_col = paint.shader.solid_color();
+    } else if (auto fc = try_fold_solid_color_filter(paint)) {
+        base_col = *fc;
+    } else {
+        return std::nullopt;
+    }
+
+    const auto& entry = clip_shader_stack_.back();
+    nisaba::Transform rel_ts = nisaba::Transform::identity();
+    if (!(current_transform_ == entry.captured_transform)) {
+        auto inv_cur = current_transform_.invert();
+        if (!inv_cur.has_value()) return std::nullopt;
+        rel_ts = entry.captured_transform.post_concat(*inv_cur);
+    }
+
+    auto modulate_stops = [&](const std::vector<nisaba::GradientStop>& src_stops) {
+        std::vector<nisaba::GradientStop> dst;
+        dst.reserve(src_stops.size());
+        for (const auto& s : src_stops) {
+            const float ca = (entry.op == nisaba::ClipOp::Difference)
+                ? (1.0f - s.color.alpha())
+                : s.color.alpha();
+            dst.emplace_back(
+                s.position,
+                nisaba::Color::from_rgba_unchecked(
+                    base_col.red(), base_col.green(), base_col.blue(),
+                    std::clamp(base_col.alpha() * ca, 0.0f, 1.0f)
+                )
+            );
+        }
+        return dst;
+    };
+
+    nisaba::Shader folded_shader;
+    switch (entry.shader.type()) {
+        case nisaba::Shader::Type::SolidColor: {
+            const float ca = (entry.op == nisaba::ClipOp::Difference)
+                ? (1.0f - entry.shader.solid_color().alpha())
+                : entry.shader.solid_color().alpha();
+            folded_shader = nisaba::Shader(nisaba::Color::from_rgba_unchecked(
+                base_col.red(), base_col.green(), base_col.blue(),
+                std::clamp(base_col.alpha() * ca, 0.0f, 1.0f)
+            ));
+            break;
+        }
+        case nisaba::Shader::Type::LinearGradient: {
+            const auto& lg = entry.shader.linear_gradient();
+            auto mod = nisaba::LinearGradient::create(
+                lg.start(), lg.end(), modulate_stops(lg.stops()),
+                lg.spread_mode(), lg.transform().post_concat(rel_ts)
+            );
+            if (!mod.has_value()) return std::nullopt;
+            folded_shader = nisaba::Shader(*mod);
+            break;
+        }
+        case nisaba::Shader::Type::RadialGradient: {
+            const auto& rg = entry.shader.radial_gradient();
+            std::optional<nisaba::RadialGradient> mod;
+            if (!rg.is_2point()) {
+                mod = nisaba::RadialGradient::create(
+                    rg.center(), rg.radius(), modulate_stops(rg.stops()),
+                    rg.spread_mode(), rg.transform().post_concat(rel_ts)
+                );
+            } else {
+                mod = nisaba::RadialGradient::create_2point(
+                    rg.start(), rg.start_radius(), rg.end(), rg.end_radius(),
+                    modulate_stops(rg.stops()), rg.spread_mode(), rg.transform().post_concat(rel_ts)
+                );
+            }
+            if (!mod.has_value()) return std::nullopt;
+            folded_shader = nisaba::Shader(*mod);
+            break;
+        }
+        case nisaba::Shader::Type::TwoPointConicalGradient: {
+            const auto& cg = entry.shader.conical_gradient();
+            auto mod = nisaba::TwoPointConicalGradient::create(
+                cg.start_center(), cg.start_radius(), cg.end_center(), cg.end_radius(),
+                modulate_stops(cg.stops()), cg.spread_mode(), cg.transform().post_concat(rel_ts)
+            );
+            if (!mod.has_value()) return std::nullopt;
+            folded_shader = nisaba::Shader(*mod);
+            break;
+        }
+        default:
+            return std::nullopt;
+    }
+
+    nisaba::Paint out = paint;
+    out.shader = std::move(folded_shader);
+    out.clear_color_filter();
+    return out;
+}
+
+void GpuCanvas::materialize_pending_clip_shader_layers() {
+    if (!context_ || !surface_) return;
+    for (auto& entry : clip_shader_stack_) {
+        if (entry.layer_pushed) continue;
+        ensure_frame();
+
+        std::optional<ScreenIntRect> eff_bounds = entry.layer_bounds;
+        if (eff_bounds.has_value() && scissor_clip_.has_value()) {
+            const uint32_t x0 = std::max(eff_bounds->x(), scissor_clip_->x());
+            const uint32_t y0 = std::max(eff_bounds->y(), scissor_clip_->y());
+            const uint32_t x1 = std::min(eff_bounds->right(), scissor_clip_->right());
+            const uint32_t y1 = std::min(eff_bounds->bottom(), scissor_clip_->bottom());
+            eff_bounds = (x1 > x0 && y1 > y0)
+                ? ScreenIntRect::from_xywh(x0, y0, x1 - x0, y1 - y0)
+                : std::nullopt;
+        }
+        entry.layer_bounds = eff_bounds;
+
+        LayerDesc desc;
+        desc.hasBounds = eff_bounds.has_value();
+        if (eff_bounds.has_value()) {
+            desc.bounds[0] = static_cast<float>(eff_bounds->x());
+            desc.bounds[1] = static_cast<float>(eff_bounds->y());
+            desc.bounds[2] = static_cast<float>(eff_bounds->right());
+            desc.bounds[3] = static_cast<float>(eff_bounds->bottom());
+        }
+        desc.opacity = 1.0f;
+        desc.compOp = CompositeOperationState::fromBlendMode(nisaba::BlendMode::SourceOver);
+        desc.layerTransform = Transform2D(entry.captured_transform);
+
+        current_stencil_depth_ = 0;
+        context_->pushLayer(desc);
+        entry.layer_pushed = true;
+    }
+}
+
+void GpuCanvas::finalize_clip_shader_layers_for_depth(size_t target_save_depth) {
+    while (!clip_shader_stack_.empty() && clip_shader_stack_.back().owner_save_depth >= target_save_depth) {
+        ClipShaderEntry entry = std::move(clip_shader_stack_.back());
+        clip_shader_stack_.pop_back();
+        if (!context_ || !entry.layer_pushed) continue;
+
+        if (current_stencil_depth_ > 0) {
+            context_->resetClip();
+            current_stencil_depth_ = 0;
+        }
+        scissor_clip_ = entry.layer_bounds;
+        if (entry.layer_bounds.has_value()) {
+            context_->scissorScreen(
+                static_cast<float>(entry.layer_bounds->x()),
+                static_cast<float>(entry.layer_bounds->y()),
+                static_cast<float>(entry.layer_bounds->width()),
+                static_cast<float>(entry.layer_bounds->height())
+            );
+        }
+
+        current_transform_ = entry.captured_transform;
+        context_->resetTransform();
+        context_->transform(entry.captured_transform);
+
+        nisaba::Paint mask_paint(entry.shader);
+        mask_paint.blend_mode = (entry.op == nisaba::ClipOp::Difference)
+            ? nisaba::BlendMode::DestinationOut
+            : nisaba::BlendMode::DestinationIn;
+        draw_paint(mask_paint);
+
+        context_->restore();
+    }
+}
+
 void GpuCanvas::restore() {
+    if (!state_stack_.empty()) {
+        finalize_clip_shader_layers_for_depth(state_stack_.size());
+    }
     if (context_) context_->restore();
     if (!state_stack_.empty()) {
         current_transform_ = state_stack_.back().transform;
+        current_transform_4x4_ = state_stack_.back().transform_4x4;
+        has_perspective_4x4_ = state_stack_.back().has_perspective_4x4;
         scissor_clip_ = state_stack_.back().scissor_clip;
         current_stencil_depth_ = state_stack_.back().stencil_clip_depth;
         state_stack_.pop_back();
@@ -530,30 +805,74 @@ void GpuCanvas::reset_state() noexcept {
 
 void GpuCanvas::reset_transform() noexcept {
     current_transform_ = nisaba::Transform();
+    current_transform_4x4_ = nisaba::Transform4x4::identity();
+    has_perspective_4x4_ = false;
     if (context_) context_->resetTransform();
 }
 
 void GpuCanvas::set_transform(const nisaba::Transform& ts) noexcept {
     current_transform_ = ts;
+    current_transform_4x4_ = nisaba::Transform4x4(ts);
+    has_perspective_4x4_ = false;
     if (context_) {
         context_->resetTransform();
         context_->transform(ts);
     }
 }
 
+void GpuCanvas::set_transform_4x4(const nisaba::Transform4x4& ts) noexcept {
+    current_transform_4x4_ = ts;
+    has_perspective_4x4_ = ts.is_planar_perspective();
+    current_transform_ = ts.to_transform_2d();
+    if (context_) {
+        context_->resetTransform();
+        context_->transform(current_transform_);
+    }
+}
+
 void GpuCanvas::translate(float dx, float dy) noexcept {
-    current_transform_ = current_transform_.pre_translate(dx, dy);
-    if (context_) context_->translate(dx, dy);
+    current_transform_4x4_ = current_transform_4x4_.pre_translate(dx, dy);
+    if (!has_perspective_4x4_) {
+        current_transform_ = current_transform_.pre_translate(dx, dy);
+        if (context_) context_->translate(dx, dy);
+    } else {
+        has_perspective_4x4_ = current_transform_4x4_.is_planar_perspective();
+        current_transform_ = current_transform_4x4_.to_transform_2d();
+        if (context_) {
+            context_->resetTransform();
+            context_->transform(current_transform_);
+        }
+    }
 }
 
 void GpuCanvas::scale(float sx, float sy) noexcept {
-    current_transform_ = current_transform_.pre_scale(sx, sy);
-    if (context_) context_->scale(sx, sy);
+    current_transform_4x4_ = current_transform_4x4_.pre_scale(sx, sy);
+    if (!has_perspective_4x4_) {
+        current_transform_ = current_transform_.pre_scale(sx, sy);
+        if (context_) context_->scale(sx, sy);
+    } else {
+        has_perspective_4x4_ = current_transform_4x4_.is_planar_perspective();
+        current_transform_ = current_transform_4x4_.to_transform_2d();
+        if (context_) {
+            context_->resetTransform();
+            context_->transform(current_transform_);
+        }
+    }
 }
 
 void GpuCanvas::rotate(float degrees) noexcept {
-    current_transform_ = current_transform_.pre_rotate(degrees);
-    if (context_) context_->rotate(degrees / 180.0f * nisaba::gpu::PI);
+    current_transform_4x4_ = current_transform_4x4_.pre_rotate_z(degrees);
+    if (!has_perspective_4x4_) {
+        current_transform_ = current_transform_.pre_rotate(degrees);
+        if (context_) context_->rotate(degrees / 180.0f * nisaba::gpu::PI);
+    } else {
+        has_perspective_4x4_ = current_transform_4x4_.is_planar_perspective();
+        current_transform_ = current_transform_4x4_.to_transform_2d();
+        if (context_) {
+            context_->resetTransform();
+            context_->transform(current_transform_);
+        }
+    }
 }
 
 void GpuCanvas::skew(float kx, float ky) noexcept {
@@ -561,14 +880,63 @@ void GpuCanvas::skew(float kx, float ky) noexcept {
 }
 
 void GpuCanvas::concat(const nisaba::Transform& ts) noexcept {
-    current_transform_ = current_transform_.pre_concat(ts);
-    if (context_) context_->transform(ts);
+    current_transform_4x4_ = current_transform_4x4_ * nisaba::Transform4x4(ts);
+    if (!has_perspective_4x4_) {
+        current_transform_ = current_transform_.pre_concat(ts);
+        if (context_) context_->transform(ts);
+    } else {
+        has_perspective_4x4_ = current_transform_4x4_.is_planar_perspective();
+        current_transform_ = current_transform_4x4_.to_transform_2d();
+        if (context_) {
+            context_->resetTransform();
+            context_->transform(current_transform_);
+        }
+    }
 }
 
-void GpuCanvas::clip_rect(const nisaba::Rect& rect) {
-    if (context_) {
-        context_->scissor(rect.x(), rect.y(), rect.width(), rect.height());
+void GpuCanvas::concat(const nisaba::Transform4x4& ts) noexcept {
+    set_transform_4x4(current_transform_4x4_ * ts);
+}
+
+void GpuCanvas::clip_rect(const nisaba::Rect& rect, nisaba::ClipOp op) {
+    if (has_perspective_4x4_) {
+        clip_path(PathBuilder::from_rect(rect), nisaba::FillRule::Winding, op);
+        return;
     }
+    if (op == nisaba::ClipOp::Difference) {
+        if (!scissor_clip_.has_value() || rect.is_empty()) return;
+        if (std::abs(current_transform_.kx) < 1e-5f && std::abs(current_transform_.ky) < 1e-5f) {
+            float x0 = rect.left() * current_transform_.sx + current_transform_.tx;
+            float x1 = rect.right() * current_transform_.sx + current_transform_.tx;
+            float y0 = rect.top() * current_transform_.sy + current_transform_.ty;
+            float y1 = rect.bottom() * current_transform_.sy + current_transform_.ty;
+            if (x0 > x1) std::swap(x0, x1);
+            if (y0 > y1) std::swap(y0, y1);
+            if (x0 <= static_cast<float>(scissor_clip_->left()) &&
+                y0 <= static_cast<float>(scissor_clip_->top()) &&
+                x1 >= static_cast<float>(scissor_clip_->right()) &&
+                y1 >= static_cast<float>(scissor_clip_->bottom())) {
+                scissor_clip_ = std::nullopt;
+                if (context_) context_->scissorScreen(0.0f, 0.0f, 0.0f, 0.0f);
+                return;
+            }
+        }
+        auto p = PathBuilder::from_rect(rect);
+        clip_path(p, nisaba::FillRule::Winding, nisaba::ClipOp::Difference);
+        return;
+    }
+
+    if (std::abs(current_transform_.kx) >= 1e-5f || std::abs(current_transform_.ky) >= 1e-5f) {
+        auto p = PathBuilder::from_rect(rect);
+        clip_path(p, nisaba::FillRule::Winding, nisaba::ClipOp::Intersect);
+        return;
+    }
+
+    if (!scissor_clip_.has_value()) {
+        if (context_) context_->scissorScreen(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
     float x0 = rect.left() * current_transform_.sx + current_transform_.tx;
     float x1 = rect.right() * current_transform_.sx + current_transform_.tx;
     float y0 = rect.top() * current_transform_.sy + current_transform_.ty;
@@ -587,24 +955,36 @@ void GpuCanvas::clip_rect(const nisaba::Rect& rect) {
             static_cast<uint32_t>(ix1 - ix0), static_cast<uint32_t>(iy1 - iy0)
         );
         if (new_clip) {
-            scissor_clip_ = scissor_clip_.has_value() ? scissor_clip_->intersect(*new_clip) : new_clip;
-            return;
+            scissor_clip_ = scissor_clip_->intersect(*new_clip);
+            if (scissor_clip_.has_value()) {
+                if (context_) {
+                    context_->intersectScissor(rect.x(), rect.y(), rect.width(), rect.height());
+                }
+                return;
+            }
         }
     }
     scissor_clip_ = std::nullopt;
+    if (context_) {
+        context_->scissorScreen(0.0f, 0.0f, 0.0f, 0.0f);
+    }
 }
 
 void GpuCanvas::clip_rect(const nisaba::ScreenIntRect& rect) {
-    if (context_) {
-        context_->scissorScreen(static_cast<float>(rect.x()),
-                                static_cast<float>(rect.y()),
-                                static_cast<float>(rect.width()),
-                                static_cast<float>(rect.height()));
-    }
     if (scissor_clip_.has_value()) {
         scissor_clip_ = scissor_clip_->intersect(rect);
     } else {
-        scissor_clip_ = rect;
+        scissor_clip_ = std::nullopt;
+    }
+    if (context_) {
+        if (scissor_clip_.has_value()) {
+            context_->scissorScreen(static_cast<float>(scissor_clip_->x()),
+                                    static_cast<float>(scissor_clip_->y()),
+                                    static_cast<float>(scissor_clip_->width()),
+                                    static_cast<float>(scissor_clip_->height()));
+        } else {
+            context_->scissorScreen(0.0f, 0.0f, 0.0f, 0.0f);
+        }
     }
 }
 
@@ -622,14 +1002,167 @@ void GpuCanvas::clear_rect(const nisaba::ScreenIntRect& rect, nisaba::Color colo
     restore();
 }
 
-void GpuCanvas::clip_path(const nisaba::Path& path, nisaba::FillRule fill_rule) {
+void GpuCanvas::clip_path(const nisaba::Path& path, nisaba::FillRule fill_rule, nisaba::ClipOp op) {
+    if (has_perspective_4x4_) {
+        const nisaba::Path projected = current_transform_4x4_.project_path(path);
+        const nisaba::Transform4x4 saved_m = current_transform_4x4_;
+        set_transform_4x4(nisaba::Transform4x4::identity());
+        clip_path(projected, fill_rule, op);
+        set_transform_4x4(saved_m);
+        return;
+    }
+    if (op == nisaba::ClipOp::Difference) {
+        if (!context_ || !scissor_clip_.has_value() || path.is_empty()) return;
+        ensure_frame();
+        current_stencil_depth_++;
+        context_->clipPath(path, fill_rule == FillRule::EvenOdd ? Winding::Clockwise : Winding::CounterClockwise, true);
+        return;
+    }
+
+    if (path.is_empty()) {
+        scissor_clip_ = std::nullopt;
+        if (context_) context_->scissorScreen(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    nisaba::Rect path_b = path.bounds();
+    if (!current_transform_.is_identity()) {
+        if (auto tr = path.transform(current_transform_)) {
+            path_b = tr->bounds();
+        }
+    }
+    if (path_b.width() <= 0.0f || path_b.height() <= 0.0f) {
+        scissor_clip_ = std::nullopt;
+        if (context_) context_->scissorScreen(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    if (scissor_clip_.has_value()) {
+        const int32_t bx0 = std::max(0, static_cast<int32_t>(std::floor(path_b.left())));
+        const int32_t by0 = std::max(0, static_cast<int32_t>(std::floor(path_b.top())));
+        const int32_t bx1 = std::min(static_cast<int32_t>(width()), static_cast<int32_t>(std::ceil(path_b.right())));
+        const int32_t by1 = std::min(static_cast<int32_t>(height()), static_cast<int32_t>(std::ceil(path_b.bottom())));
+        if (bx1 > bx0 && by1 > by0) {
+            if (auto br = ScreenIntRect::from_xywh(
+                    static_cast<uint32_t>(bx0), static_cast<uint32_t>(by0),
+                    static_cast<uint32_t>(bx1 - bx0), static_cast<uint32_t>(by1 - by0))) {
+                scissor_clip_ = scissor_clip_->intersect(*br);
+            } else {
+                scissor_clip_ = std::nullopt;
+            }
+        } else {
+            scissor_clip_ = std::nullopt;
+        }
+    }
+
     if (!context_) return;
+    if (!scissor_clip_.has_value()) {
+        context_->scissorScreen(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
     ensure_frame();
+    if (has_unpushed_clip_shader()) {
+        materialize_pending_clip_shader_layers();
+    }
     current_stencil_depth_++;
-    context_->clipPath(path, fill_rule == FillRule::EvenOdd ? Winding::Clockwise : Winding::CounterClockwise);
+    context_->clipPath(path, fill_rule == FillRule::EvenOdd ? Winding::Clockwise : Winding::CounterClockwise, false);
+}
+
+void GpuCanvas::clip_shader(const nisaba::Shader& shader, nisaba::ClipOp op) {
+    if (!context_ || !surface_ || !scissor_clip_.has_value()) return;
+    if (has_unpushed_clip_shader()) {
+        materialize_pending_clip_shader_layers();
+    }
+    clip_shader_stack_.push_back(ClipShaderEntry{
+        .owner_save_depth = state_stack_.size(),
+        .shader = shader,
+        .op = op,
+        .captured_transform = current_transform_,
+        .layer_bounds = scissor_clip_,
+        .layer_pushed = false
+    });
+}
+
+void GpuCanvas::clip_region(const nisaba::Region& region, nisaba::ClipOp op) {
+    if (region.is_empty()) {
+        if (op == nisaba::ClipOp::Intersect) {
+            scissor_clip_ = std::nullopt;
+            if (context_) context_->scissorScreen(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        return;
+    }
+    if (!scissor_clip_.has_value()) return;
+
+    auto clamp_to_canvas = [&](const nisaba::IntRect& r) -> std::optional<ScreenIntRect> {
+        const int32_t x0 = std::clamp(r.left(), 0, static_cast<int32_t>(width()));
+        const int32_t y0 = std::clamp(r.top(), 0, static_cast<int32_t>(height()));
+        const int32_t x1 = std::clamp(r.right(), 0, static_cast<int32_t>(width()));
+        const int32_t y1 = std::clamp(r.bottom(), 0, static_cast<int32_t>(height()));
+        if (x1 <= x0 || y1 <= y0) return std::nullopt;
+        return ScreenIntRect::from_xywh(
+            static_cast<uint32_t>(x0), static_cast<uint32_t>(y0),
+            static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)
+        );
+    };
+
+    if (op == nisaba::ClipOp::Intersect && region.is_rect()) {
+        if (auto sr = clamp_to_canvas(*region.bounds())) {
+            clip_rect(*sr);
+        } else {
+            scissor_clip_ = std::nullopt;
+            if (context_) context_->scissorScreen(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        return;
+    }
+
+    const nisaba::Transform4x4 saved_m = current_transform_4x4_;
+    set_transform_4x4(nisaba::Transform4x4::identity());
+    if (region.is_rect()) {
+        clip_rect(region.bounds()->to_rect(), op);
+    } else {
+        clip_path(region.to_path(), nisaba::FillRule::Winding, op);
+    }
+    set_transform_4x4(saved_m);
+}
+
+void GpuCanvas::draw_region(const nisaba::Region& region, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
+    if (!context_ || !scissor_clip_.has_value() || region.is_empty()) return;
+    if (paint.style == nisaba::PaintStyle::Fill &&
+        paint.is_solid_color() &&
+        !paint.has_layer_filter() &&
+        !paint.has_path_effect() &&
+        !paint.has_color_filter() &&
+        !has_perspective_4x4_ &&
+        !has_unpushed_clip_shader()) {
+        ensure_frame();
+        const uint32_t packed = Color(paint.shader.solid_color()).premultiplied().toRGBA8();
+        std::vector<Vertex> verts;
+        verts.reserve(region.rect_count() * 6);
+        for (const auto& r : region.rects()) {
+            const float x0 = static_cast<float>(r.left());
+            const float y0 = static_cast<float>(r.top());
+            const float x1 = static_cast<float>(r.right());
+            const float y1 = static_cast<float>(r.bottom());
+            verts.emplace_back(x0, y0, 0.5f, 1.0f, packed);
+            verts.emplace_back(x0, y1, 0.5f, 1.0f, packed);
+            verts.emplace_back(x1, y1, 0.5f, 1.0f, packed);
+            verts.emplace_back(x0, y0, 0.5f, 1.0f, packed);
+            verts.emplace_back(x1, y1, 0.5f, 1.0f, packed);
+            verts.emplace_back(x1, y0, 0.5f, 1.0f, packed);
+        }
+        if (verts.empty()) return;
+        Paint sp;
+        sp.innerColor = Color(1.0f, 1.0f, 1.0f, 1.0f);
+        sp.outerColor = sp.innerColor;
+        ScopedBlendMode scopedBlend(context_.get(), paint.blend_mode);
+        context_->drawTriangles(sp, verts.data(), static_cast<int>(verts.size()), 0.0f, 4 /* ShaderSolid */);
+        return;
+    }
+    nisaba::ICanvas::draw_region(region, paint, stroke);
 }
 
 void GpuCanvas::reset_clip() noexcept {
+    finalize_clip_shader_layers_for_depth(state_stack_.size());
     if (context_) {
         context_->resetScissor();
         context_->resetClip();
@@ -640,6 +1173,80 @@ void GpuCanvas::reset_clip() noexcept {
     } else {
         scissor_clip_ = std::nullopt;
     }
+}
+
+std::optional<ScreenIntRect> GpuCanvas::get_device_clip_bounds() const noexcept {
+    return scissor_clip_;
+}
+
+std::optional<nisaba::Rect> GpuCanvas::get_local_clip_bounds() const noexcept {
+    if (!scissor_clip_.has_value()) return std::nullopt;
+    if (has_perspective_4x4_) {
+        const auto inv = current_transform_4x4_.invert();
+        if (!inv.has_value()) return std::nullopt;
+        return inv->map_rect(scissor_clip_->to_rect());
+    }
+    const auto inv = current_transform_.invert();
+    if (!inv.has_value()) return std::nullopt;
+    return scissor_clip_->to_rect().transform(*inv);
+}
+
+bool GpuCanvas::quick_reject(const nisaba::Rect& rect) const noexcept {
+    if (!scissor_clip_.has_value()) return true;
+    std::optional<nisaba::Rect> dev_rect;
+    if (has_perspective_4x4_) {
+        dev_rect = current_transform_4x4_.map_rect(rect);
+    } else {
+        if (!current_transform_.is_valid()) return true;
+        dev_rect = rect.transform(current_transform_);
+    }
+    if (!dev_rect.has_value()) return true;
+    const nisaba::Rect dev_clip = scissor_clip_->to_rect();
+    return dev_rect->right() <= dev_clip.left() ||
+           dev_rect->left() >= dev_clip.right() ||
+           dev_rect->bottom() <= dev_clip.top() ||
+           dev_rect->top() >= dev_clip.bottom();
+}
+
+bool GpuCanvas::quick_reject(const nisaba::Path& path) const noexcept {
+    if (path.is_empty()) return true;
+    return quick_reject(path.bounds());
+}
+
+void GpuCanvas::draw_paint(const nisaba::Paint& paint) {
+    if (!context_ || !scissor_clip_.has_value()) return;
+    nisaba::Paint p = paint;
+    p.clear_path_effect();
+    if (p.is_solid_color() && !p.has_layer_filter() && !has_unpushed_clip_shader()) {
+        ensure_frame();
+        const nisaba::Rect dev_r = scissor_clip_->to_rect();
+        context_->save();
+        context_->resetTransform();
+        {
+            ScopedBlendMode scopedBlend(context_.get(), p.blend_mode);
+            context_->beginPath();
+            context_->rect(dev_r.x(), dev_r.y(), dev_r.width(), dev_r.height());
+            apply_fill_paint(p);
+            context_->fill();
+        }
+        context_->restore();
+        return;
+    }
+    const auto inv = current_transform_.invert();
+    if (!inv.has_value()) return;
+    const nisaba::Rect dev_r = scissor_clip_->to_rect();
+    auto outset = nisaba::Rect::from_ltrb(dev_r.left() - 1.0f, dev_r.top() - 1.0f,
+                                          dev_r.right() + 1.0f, dev_r.bottom() + 1.0f);
+    if (!outset.has_value()) return;
+    auto local = outset->transform(*inv);
+    if (!local.has_value()) return;
+    fill_rect(*local, p);
+}
+
+void GpuCanvas::draw_color(nisaba::Color color, nisaba::BlendMode mode) {
+    nisaba::Paint p(color);
+    p.blend_mode = mode;
+    draw_paint(p);
 }
 
 static SpreadKind to_gpu_spread(nisaba::SpreadMode mode) noexcept {
@@ -872,6 +1479,18 @@ Paint GpuCanvas::build_gpu_paint(const nisaba::Paint& paint) {
 void GpuCanvas::apply_fill_paint(const nisaba::Paint& paint) {
     if (!context_) return;
 
+    if (has_unpushed_clip_shader()) {
+        if (auto folded = try_fold_clip_shader(paint)) {
+            if (folded->shader.type() != nisaba::Shader::Type::SolidColor || folded->has_color_filter()) {
+                context_->fillPaint(build_gpu_paint(*folded));
+            } else {
+                context_->fillColor(folded->shader.solid_color());
+            }
+            return;
+        }
+        materialize_pending_clip_shader_layers();
+    }
+
     if (paint.custom_shader) {
         context_->fillShader(paint.custom_shader);
         return;
@@ -896,6 +1515,18 @@ void GpuCanvas::apply_stroke(const nisaba::Stroke& stroke, const nisaba::Paint& 
     context_->miterLimit(stroke.miter_limit);
     context_->lineCap(stroke.line_cap);
     context_->lineJoin(stroke.line_join);
+
+    if (has_unpushed_clip_shader()) {
+        if (auto folded = try_fold_clip_shader(paint)) {
+            if (folded->shader.type() != nisaba::Shader::Type::SolidColor || folded->has_color_filter()) {
+                context_->strokePaint(build_gpu_paint(*folded));
+            } else {
+                context_->strokeColor(folded->shader.solid_color());
+            }
+            return;
+        }
+        materialize_pending_clip_shader_layers();
+    }
 
     if (paint.custom_shader) {
         context_->strokeShader(paint.custom_shader);
@@ -1081,6 +1712,10 @@ void GpuCanvas::draw_with_image_filter(
 
 void GpuCanvas::fill_rect(const nisaba::Rect& rect, const nisaba::Paint& paint) {
     if (!context_) return;
+    if (has_perspective_4x4_) {
+        fill_path(PathBuilder::from_rect(rect), paint, nisaba::FillRule::Winding);
+        return;
+    }
     if (paint.has_path_effect()) {
         fill_path(PathBuilder::from_rect(rect), paint, nisaba::FillRule::Winding);
         return;
@@ -1101,6 +1736,10 @@ void GpuCanvas::fill_rect(const nisaba::Rect& rect, const nisaba::Paint& paint) 
 
 void GpuCanvas::stroke_rect(const nisaba::Rect& rect, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_) return;
+    if (has_perspective_4x4_) {
+        stroke_path(PathBuilder::from_rect(rect), paint, stroke);
+        return;
+    }
     if (paint.has_path_effect()) {
         stroke_path(PathBuilder::from_rect(rect), paint, stroke);
         return;
@@ -1125,6 +1764,10 @@ void GpuCanvas::stroke_rect(const nisaba::Rect& rect, const nisaba::Paint& paint
 
 void GpuCanvas::fill_round_rect(const nisaba::Rect& rect, float rx, float ry, const nisaba::Paint& paint) {
     if (!context_) return;
+    if (has_perspective_4x4_) {
+        if (auto p = PathBuilder::from_rounded_rect(rect, rx, ry)) fill_path(*p, paint);
+        return;
+    }
     if (paint.has_layer_filter()) {
         draw_with_image_filter(rect, paint, 0.0f, [&](const nisaba::Paint& inner) {
             fill_round_rect(rect, rx, ry, inner);
@@ -1147,6 +1790,10 @@ void GpuCanvas::fill_round_rect(const nisaba::Rect& rect, float rx, float ry, co
 
 void GpuCanvas::stroke_round_rect(const nisaba::Rect& rect, float rx, float ry, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_) return;
+    if (has_perspective_4x4_) {
+        if (auto p = PathBuilder::from_rounded_rect(rect, rx, ry)) stroke_path(*p, paint, stroke);
+        return;
+    }
     if (paint.has_layer_filter()) {
         draw_with_image_filter(rect, paint, stroke_filter_margin(stroke), [&](const nisaba::Paint& inner) {
             stroke_round_rect(rect, rx, ry, inner, stroke);
@@ -1169,6 +1816,10 @@ void GpuCanvas::stroke_round_rect(const nisaba::Rect& rect, float rx, float ry, 
 
 void GpuCanvas::fill_rrect(const nisaba::Rect& rect, const nisaba::BorderRadius& radii, const nisaba::Paint& paint) {
     if (!context_) return;
+    if (has_perspective_4x4_) {
+        if (auto p = PathBuilder::from_rounded_rect(rect, radii)) fill_path(*p, paint);
+        return;
+    }
     if (paint.has_layer_filter()) {
         draw_with_image_filter(rect, paint, 0.0f, [&](const nisaba::Paint& inner) {
             fill_rrect(rect, radii, inner);
@@ -1207,19 +1858,23 @@ void GpuCanvas::stroke_rrect(const nisaba::RRect& rrect, const nisaba::Paint& pa
     stroke_rrect(rrect.rect, rrect.radii, paint, stroke);
 }
 
-void GpuCanvas::clip_rrect(const nisaba::RRect& rrect) {
+void GpuCanvas::clip_rrect(const nisaba::RRect& rrect, nisaba::ClipOp op) {
     auto path_opt = PathBuilder::from_rrect(rrect);
     if (path_opt) {
-        clip_path(*path_opt, FillRule::Winding);
+        clip_path(*path_opt, FillRule::Winding, op);
     }
 }
 
-void GpuCanvas::clip_rrect(const nisaba::Rect& rect, const nisaba::BorderRadius& radii) {
-    clip_rrect(RRect(rect, radii));
+void GpuCanvas::clip_rrect(const nisaba::Rect& rect, const nisaba::BorderRadius& radii, nisaba::ClipOp op) {
+    clip_rrect(RRect(rect, radii), op);
 }
 
 void GpuCanvas::fill_circle(float cx, float cy, float radius, const nisaba::Paint& paint) {
     if (!context_) return;
+    if (has_perspective_4x4_) {
+        if (auto p = PathBuilder::from_circle(cx, cy, radius)) fill_path(*p, paint);
+        return;
+    }
     if (paint.has_layer_filter()) {
         auto lb = nisaba::Rect::from_xywh(cx - radius, cy - radius, radius * 2.0f, radius * 2.0f);
         draw_with_image_filter(lb, paint, 0.0f, [&](const nisaba::Paint& inner) {
@@ -1237,6 +1892,10 @@ void GpuCanvas::fill_circle(float cx, float cy, float radius, const nisaba::Pain
 
 void GpuCanvas::stroke_circle(float cx, float cy, float radius, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_) return;
+    if (has_perspective_4x4_) {
+        if (auto p = PathBuilder::from_circle(cx, cy, radius)) stroke_path(*p, paint, stroke);
+        return;
+    }
     if (paint.has_layer_filter()) {
         auto lb = nisaba::Rect::from_xywh(cx - radius, cy - radius, radius * 2.0f, radius * 2.0f);
         draw_with_image_filter(lb, paint, stroke_filter_margin(stroke), [&](const nisaba::Paint& inner) {
@@ -1295,6 +1954,10 @@ void GpuCanvas::stroke_line(float x0, float y0, float x1, float y1, const nisaba
 
 void GpuCanvas::fill_oval(const nisaba::Rect& oval, const nisaba::Paint& paint) {
     if (!context_ || oval.is_empty()) return;
+    if (has_perspective_4x4_) {
+        if (auto p = nisaba::PathBuilder::from_oval(oval)) fill_path(*p, paint);
+        return;
+    }
     if (paint.has_layer_filter()) {
         draw_with_image_filter(oval, paint, 0.0f, [&](const nisaba::Paint& inner) {
             fill_oval(oval, inner);
@@ -1315,6 +1978,10 @@ void GpuCanvas::fill_oval(const nisaba::Rect& oval, const nisaba::Paint& paint) 
 
 void GpuCanvas::stroke_oval(const nisaba::Rect& oval, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_ || oval.is_empty()) return;
+    if (has_perspective_4x4_) {
+        if (auto p = nisaba::PathBuilder::from_oval(oval)) stroke_path(*p, paint, stroke);
+        return;
+    }
     if (paint.has_layer_filter()) {
         draw_with_image_filter(oval, paint, stroke_filter_margin(stroke), [&](const nisaba::Paint& inner) {
             stroke_oval(oval, inner, stroke);
@@ -1339,9 +2006,9 @@ void GpuCanvas::stroke_oval(const nisaba::Rect& oval, const nisaba::Paint& paint
     context_->stroke();
 }
 
-void GpuCanvas::clip_oval(const nisaba::Rect& oval) {
+void GpuCanvas::clip_oval(const nisaba::Rect& oval, nisaba::ClipOp op) {
     if (auto p = nisaba::PathBuilder::from_oval(oval)) {
-        clip_path(*p, nisaba::FillRule::Winding);
+        clip_path(*p, nisaba::FillRule::Winding, op);
     }
 }
 
@@ -1463,6 +2130,31 @@ void GpuCanvas::draw_points(
 
 void GpuCanvas::fill_path(const nisaba::Path& path, const nisaba::Paint& paint, nisaba::FillRule fill_rule) {
     if (!context_) return;
+    if (has_perspective_4x4_) {
+        if (paint.has_path_effect()) {
+            const auto& pe = *paint.path_effect;
+            nisaba::Path mod = pe.apply(path);
+            nisaba::Paint p2 = paint;
+            p2.clear_path_effect();
+            if (pe.needs_source_clip()) {
+                save();
+                clip_path(path, fill_rule);
+                fill_path(mod, p2, fill_rule);
+                restore();
+            } else {
+                fill_path(mod, p2, fill_rule);
+            }
+            return;
+        }
+        const nisaba::Path projected = current_transform_4x4_.project_path(path);
+        if (projected.is_empty()) return;
+        const nisaba::Paint pp = nisaba::detail::project_paint_4x4(paint, current_transform_4x4_);
+        const nisaba::Transform4x4 saved_m = current_transform_4x4_;
+        set_transform_4x4(nisaba::Transform4x4::identity());
+        fill_path(projected, pp, fill_rule);
+        set_transform_4x4(saved_m);
+        return;
+    }
     if (paint.has_path_effect()) {
         const auto& pe = *paint.path_effect;
         nisaba::Path mod = pe.apply(path);
@@ -1494,6 +2186,24 @@ void GpuCanvas::fill_path(const nisaba::Path& path, const nisaba::Paint& paint, 
 
 void GpuCanvas::stroke_path(const nisaba::Path& path, const nisaba::Paint& paint, const nisaba::Stroke& stroke) {
     if (!context_) return;
+    if (has_perspective_4x4_) {
+        nisaba::Path src_path = path;
+        nisaba::Paint p2 = paint;
+        if (paint.has_path_effect()) {
+            const auto& pe = *paint.path_effect;
+            src_path = pe.apply(path);
+            p2.clear_path_effect();
+            if (pe.produces_fill_geometry()) {
+                fill_path(src_path, p2, nisaba::FillRule::Winding);
+                return;
+            }
+        }
+        nisaba::PathStroker stroker;
+        auto outlined = stroker.stroke(src_path, stroke, 1.0f);
+        if (!outlined || outlined->is_empty()) return;
+        fill_path(*outlined, p2, nisaba::FillRule::Winding);
+        return;
+    }
     if (paint.has_path_effect()) {
         const auto& pe = *paint.path_effect;
         nisaba::Path mod = pe.apply(path);
@@ -1559,11 +2269,7 @@ void GpuCanvas::draw_pixmap_3d(
     if (src_rect.width() <= 0.0f || src_rect.height() <= 0.0f || opacity <= 0.0f) return;
     ensure_frame();
 
-    Transform cur_xform = transform();
-    Transform4x4 final_t = transform3d;
-    if (!cur_xform.is_identity()) {
-        final_t = Transform4x4(cur_xform) * transform3d;
-    }
+    Transform4x4 final_t = current_transform_4x4_ * transform3d;
 
     auto p0_opt = final_t.map_point_checked(Point(src_rect.left(), src_rect.top()));
     auto p1_opt = final_t.map_point_checked(Point(src_rect.right(), src_rect.top()));
@@ -1652,6 +2358,18 @@ void GpuCanvas::draw_pixmap_rect(
     if (!context_ || src.width() == 0 || src.height() == 0 || !src.data()) return;
     if (src_rect.width() <= 0.0f || src_rect.height() <= 0.0f ||
         dst_rect.width() <= 0.0f || dst_rect.height() <= 0.0f) return;
+    if (has_perspective_4x4_) {
+        const float sx = dst_rect.width() / src_rect.width();
+        const float sy = dst_rect.height() / src_rect.height();
+        const float tx = dst_rect.left() - src_rect.left() * sx;
+        const float ty = dst_rect.top() - src_rect.top() * sy;
+        const Transform4x4 local_t(Transform::from_row(sx, 0.0f, 0.0f, sy, tx, ty));
+        draw_pixmap_3d(src, src_rect, local_t, paint.opacity, paint.blend_mode);
+        return;
+    }
+    if (has_unpushed_clip_shader()) {
+        materialize_pending_clip_shader_layers();
+    }
     ensure_frame();
 
     int flags = ImageFlags::ImagePremultiplied;
@@ -1674,6 +2392,272 @@ void GpuCanvas::draw_pixmap_rect(
             static_cast<float>(src.width()), static_cast<float>(src.height()),
             src_rect, dst_rect, paint
         );
+    }
+}
+
+void GpuCanvas::draw_image_lattice(
+    const PixmapRef& src,
+    const nisaba::Lattice& lattice,
+    const nisaba::Rect& dst_rect,
+    const PixmapPaint& paint
+) {
+    if (!context_ || !scissor_clip_.has_value() ||
+        src.width() == 0 || src.height() == 0 || !src.data() || dst_rect.is_empty()) {
+        return;
+    }
+    if (quick_reject(dst_rect)) return;
+    if (has_unpushed_clip_shader()) {
+        materialize_pending_clip_shader_layers();
+    }
+    ensure_frame();
+
+    const float tex_w = static_cast<float>(src.width());
+    const float tex_h = static_cast<float>(src.height());
+    const float alpha = std::clamp(paint.opacity, 0.0f, 1.0f);
+    const bool bilinear = (paint.quality != FilterQuality::Nearest);
+    const bool merge_fixed_in_img = (surface_ && surface_->backend_type() == GpuBackendType::OpenGL);
+
+    lattice_img_verts_.clear();
+    lattice_solid_verts_.clear();
+    const size_t approx_cells = (lattice.x_divs.size() + 1) * (lattice.y_divs.size() + 1);
+    lattice_img_verts_.reserve(approx_cells * 6);
+
+    const Color tint = paint.tint;
+    const uint32_t kImgPacked = tint.withAlpha(tint.a * alpha).premultiplied().toRGBA8();
+
+    nisaba::detail::for_each_lattice_cell(src.width(), src.height(), lattice, dst_rect,
+        [&](const nisaba::detail::LatticeCell& cell) {
+            const float x0 = cell.dst_rect.left();
+            const float y0 = cell.dst_rect.top();
+            const float x1 = cell.dst_rect.right();
+            const float y1 = cell.dst_rect.bottom();
+
+            if (cell.type == nisaba::Lattice::RectType::FixedColor) {
+                const Color vc(cell.color);
+                const uint32_t packed = vc.withAlpha(vc.a * alpha).premultiplied().toRGBA8();
+                if (merge_fixed_in_img) {
+                    lattice_img_verts_.emplace_back(x0, y0, -2048.0f, -2048.0f, packed);
+                    lattice_img_verts_.emplace_back(x0, y1, -2048.0f, -2048.0f, packed);
+                    lattice_img_verts_.emplace_back(x1, y1, -2048.0f, -2048.0f, packed);
+                    lattice_img_verts_.emplace_back(x0, y0, -2048.0f, -2048.0f, packed);
+                    lattice_img_verts_.emplace_back(x1, y1, -2048.0f, -2048.0f, packed);
+                    lattice_img_verts_.emplace_back(x1, y0, -2048.0f, -2048.0f, packed);
+                } else {
+                    lattice_solid_verts_.emplace_back(x0, y0, 0.5f, 1.0f, packed);
+                    lattice_solid_verts_.emplace_back(x0, y1, 0.5f, 1.0f, packed);
+                    lattice_solid_verts_.emplace_back(x1, y1, 0.5f, 1.0f, packed);
+                    lattice_solid_verts_.emplace_back(x0, y0, 0.5f, 1.0f, packed);
+                    lattice_solid_verts_.emplace_back(x1, y1, 0.5f, 1.0f, packed);
+                    lattice_solid_verts_.emplace_back(x1, y0, 0.5f, 1.0f, packed);
+                }
+                return;
+            }
+
+            float sx0 = cell.src_rect.left();
+            float sx1 = cell.src_rect.right();
+            float sy0 = cell.src_rect.top();
+            float sy1 = cell.src_rect.bottom();
+            const float sw = sx1 - sx0;
+            const float sh = sy1 - sy0;
+            const float dw = x1 - x0;
+            const float dh = y1 - y0;
+
+            if (bilinear) {
+                if (sw <= 1.0f || dw > sw + 1e-4f) {
+                    const float inset_x = std::min(0.5f, sw * 0.5f);
+                    sx0 += inset_x;
+                    sx1 -= inset_x;
+                }
+                if (sh <= 1.0f || dh > sh + 1e-4f) {
+                    const float inset_y = std::min(0.5f, sh * 0.5f);
+                    sy0 += inset_y;
+                    sy1 -= inset_y;
+                }
+            }
+
+            const float u0 = sx0 / tex_w;
+            const float v0 = sy0 / tex_h;
+            const float u1 = sx1 / tex_w;
+            const float v1 = sy1 / tex_h;
+
+            lattice_img_verts_.emplace_back(x0, y0, u0, v0, kImgPacked);
+            lattice_img_verts_.emplace_back(x0, y1, u0, v1, kImgPacked);
+            lattice_img_verts_.emplace_back(x1, y1, u1, v1, kImgPacked);
+            lattice_img_verts_.emplace_back(x0, y0, u0, v0, kImgPacked);
+            lattice_img_verts_.emplace_back(x1, y1, u1, v1, kImgPacked);
+            lattice_img_verts_.emplace_back(x1, y0, u1, v0, kImgPacked);
+        });
+
+    if (lattice_img_verts_.empty() && lattice_solid_verts_.empty()) return;
+
+    ScopedBlendMode scopedBlend(context_.get(), paint.blend_mode);
+
+    if (!lattice_img_verts_.empty()) {
+        int flags = ImageFlags::ImagePremultiplied;
+        if (!bilinear) {
+            flags |= ImageFlags::ImageNearest;
+        }
+        const int img = get_or_upload_pixmap(src, flags);
+        if (img > 0) {
+            Paint p;
+            p.image = img;
+            p.radius = 1.0f;
+            p.innerColor = Color(1.0f, 1.0f, 1.0f, 1.0f);
+            p.outerColor = p.innerColor;
+            context_->drawTriangles(p, lattice_img_verts_.data(), static_cast<int>(lattice_img_verts_.size()), 0.0f, 3 /* ShaderImg */);
+        }
+    }
+
+    if (!lattice_solid_verts_.empty()) {
+        Paint sp;
+        sp.innerColor = Color(1.0f, 1.0f, 1.0f, 1.0f);
+        sp.outerColor = sp.innerColor;
+        context_->drawTriangles(sp, lattice_solid_verts_.data(), static_cast<int>(lattice_solid_verts_.size()), 0.0f, 4 /* ShaderSolid */);
+    }
+}
+
+void GpuCanvas::draw_image_nine(
+    const PixmapRef& src,
+    const nisaba::IntRect& center,
+    const nisaba::Rect& dst_rect,
+    const PixmapPaint& paint
+) {
+    const std::array<int32_t, 2> x_divs{center.left(), center.right()};
+    const std::array<int32_t, 2> y_divs{center.top(), center.bottom()};
+    nisaba::Lattice lattice;
+    lattice.x_divs = x_divs;
+    lattice.y_divs = y_divs;
+    draw_image_lattice(src, lattice, dst_rect, paint);
+}
+
+void GpuCanvas::draw_atlas(
+    const PixmapRef& src,
+    std::span<const nisaba::RSXform> xforms,
+    std::span<const nisaba::Rect> tex_rects,
+    std::span<const nisaba::Color> colors,
+    BlendMode mode,
+    const PixmapPaint& paint
+) {
+    if (!context_ || !scissor_clip_.has_value() ||
+        src.width() == 0 || src.height() == 0 || !src.data()) {
+        return;
+    }
+    const size_t count = std::min(xforms.size(), tex_rects.size());
+    if (count == 0) return;
+    ensure_frame();
+
+    const bool has_colors = colors.size() >= count;
+    const float tex_w = static_cast<float>(src.width());
+    const float tex_h = static_cast<float>(src.height());
+    const float alpha = std::clamp(paint.opacity, 0.0f, 1.0f);
+    const bool bilinear = (paint.quality != FilterQuality::Nearest);
+    if (has_unpushed_clip_shader()) {
+        materialize_pending_clip_shader_layers();
+    }
+
+    if (!has_colors || mode == BlendMode::Modulate || mode == BlendMode::Destination) {
+        lattice_img_verts_.clear();
+        lattice_img_verts_.reserve(count * 6);
+        const Color raw_tint = paint.tint;
+        const Color base_tint = raw_tint.withAlpha(raw_tint.a * alpha);
+        const uint32_t kDefaultPacked = base_tint.premultiplied().toRGBA8();
+
+        for (size_t i = 0; i < count; ++i) {
+            const nisaba::Rect& sr = tex_rects[i];
+            if (sr.is_empty()) continue;
+
+            nisaba::Point q[4];
+            xforms[i].to_quad(sr.width(), sr.height(), q);
+
+            const float u0 = sr.left() / tex_w;
+            const float v0 = sr.top() / tex_h;
+            const float u1 = sr.right() / tex_w;
+            const float v1 = sr.bottom() / tex_h;
+
+            uint32_t packed = kDefaultPacked;
+            if (has_colors && mode == BlendMode::Modulate) {
+                const Color sc(colors[i]);
+                const Color mc(
+                    base_tint.r * sc.r,
+                    base_tint.g * sc.g,
+                    base_tint.b * sc.b,
+                    base_tint.a * sc.a
+                );
+                packed = mc.premultiplied().toRGBA8();
+            }
+
+            lattice_img_verts_.emplace_back(q[0].x, q[0].y, u0, v0, packed);
+            lattice_img_verts_.emplace_back(q[3].x, q[3].y, u0, v1, packed);
+            lattice_img_verts_.emplace_back(q[2].x, q[2].y, u1, v1, packed);
+            lattice_img_verts_.emplace_back(q[0].x, q[0].y, u0, v0, packed);
+            lattice_img_verts_.emplace_back(q[2].x, q[2].y, u1, v1, packed);
+            lattice_img_verts_.emplace_back(q[1].x, q[1].y, u1, v0, packed);
+        }
+
+        if (lattice_img_verts_.empty()) return;
+
+        int flags = ImageFlags::ImagePremultiplied;
+        if (!bilinear) flags |= ImageFlags::ImageNearest;
+        const int img = get_or_upload_pixmap(src, flags);
+        if (img <= 0) return;
+
+        Paint p;
+        p.image = img;
+        p.radius = 1.0f;
+        p.innerColor = Color(1.0f, 1.0f, 1.0f, 1.0f);
+        p.outerColor = p.innerColor;
+
+        ScopedBlendMode scopedBlend(context_.get(), paint.blend_mode);
+        context_->drawTriangles(p, lattice_img_verts_.data(), static_cast<int>(lattice_img_verts_.size()), 0.0f, 3 /* ShaderImg */);
+        return;
+    }
+
+    if (mode == BlendMode::Source) {
+        std::vector<Vertex> verts;
+        verts.reserve(count * 6);
+        for (size_t i = 0; i < count; ++i) {
+            const nisaba::Rect& sr = tex_rects[i];
+            if (sr.is_empty()) continue;
+            nisaba::Point q[4];
+            xforms[i].to_quad(sr.width(), sr.height(), q);
+            const Color vc(colors[i]);
+            const uint32_t packed = vc.withAlpha(vc.a * alpha).premultiplied().toRGBA8();
+            verts.emplace_back(q[0].x, q[0].y, 0.5f, 1.0f, packed);
+            verts.emplace_back(q[3].x, q[3].y, 0.5f, 1.0f, packed);
+            verts.emplace_back(q[2].x, q[2].y, 0.5f, 1.0f, packed);
+            verts.emplace_back(q[0].x, q[0].y, 0.5f, 1.0f, packed);
+            verts.emplace_back(q[2].x, q[2].y, 0.5f, 1.0f, packed);
+            verts.emplace_back(q[1].x, q[1].y, 0.5f, 1.0f, packed);
+        }
+        if (verts.empty()) return;
+        Paint p;
+        p.innerColor = Color(1.0f, 1.0f, 1.0f, 1.0f);
+        p.outerColor = p.innerColor;
+        ScopedBlendMode scopedBlend(context_.get(), paint.blend_mode);
+        context_->drawTriangles(p, verts.data(), static_cast<int>(verts.size()), 0.0f, 4 /* ShaderSolid */);
+        return;
+    }
+
+    // General BlendMode combining sprite texture (Dst) and per-sprite color (Src)
+    for (size_t i = 0; i < count; ++i) {
+        const nisaba::Rect& sr = tex_rects[i];
+        if (sr.is_empty()) continue;
+        auto dr_opt = nisaba::Rect::from_xywh(0.0f, 0.0f, sr.width(), sr.height());
+        if (!dr_opt) continue;
+        save();
+        concat(xforms[i].to_transform());
+        nisaba::Paint layer_p(nisaba::Color::from_rgba_unchecked(1.0f, 1.0f, 1.0f, alpha));
+        layer_p.blend_mode = paint.blend_mode;
+        save_layer_bounds(*dr_opt, layer_p);
+        PixmapPaint base_pp = paint;
+        base_pp.opacity = 1.0f;
+        base_pp.blend_mode = BlendMode::SourceOver;
+        draw_pixmap_rect(src, sr, *dr_opt, base_pp);
+        nisaba::Paint blend_p(colors[i]);
+        blend_p.blend_mode = mode;
+        fill_rect(*dr_opt, blend_p);
+        restore();
+        restore();
     }
 }
 
@@ -1737,6 +2721,19 @@ void GpuCanvas::draw_gpu_texture_rect(
 
 void GpuCanvas::draw_vertices(const nisaba::Vertices& vertices, BlendMode blend_mode, float opacity) {
     if (!context_ || !vertices.is_valid()) return;
+    if (has_unpushed_clip_shader()) {
+        materialize_pending_clip_shader_layers();
+    }
+    if (has_perspective_4x4_) {
+        nisaba::Vertices proj = vertices;
+        for (auto& pt : proj.positions) pt = current_transform_4x4_.map_point(pt);
+        ensure_frame();
+        context_->save();
+        context_->resetTransform();
+        draw_vertices_internal(context_.get(), proj, 0, 0.0f, 0.0f, blend_mode, opacity);
+        context_->restore();
+        return;
+    }
     ensure_frame();
     draw_vertices_internal(context_.get(), vertices, 0, 0.0f, 0.0f, blend_mode, opacity);
 }
@@ -1780,15 +2777,61 @@ void GpuCanvas::draw_textured_vertices(
         draw_vertices(vertices, blend_mode, opacity);
         return;
     }
+    if (has_unpushed_clip_shader()) {
+        materialize_pending_clip_shader_layers();
+    }
     ensure_frame();
     int img = get_or_upload_pixmap(texture, ImageFlags::ImagePremultiplied);
     if (img > 0) {
+        if (has_perspective_4x4_) {
+            nisaba::Vertices proj = vertices;
+            for (auto& pt : proj.positions) pt = current_transform_4x4_.map_point(pt);
+            context_->save();
+            context_->resetTransform();
+            draw_vertices_internal(
+                context_.get(), proj, img,
+                static_cast<float>(texture.width()), static_cast<float>(texture.height()),
+                blend_mode, opacity
+            );
+            context_->restore();
+            return;
+        }
         draw_vertices_internal(
             context_.get(), vertices, img,
             static_cast<float>(texture.width()), static_cast<float>(texture.height()),
             blend_mode, opacity
         );
     }
+}
+
+void GpuCanvas::draw_coons_patch(
+    const nisaba::CoonsPatch& patch,
+    BlendMode blend_mode,
+    float opacity,
+    uint32_t subdiv_u,
+    uint32_t subdiv_v
+) {
+    if (!context_ || !scissor_clip_.has_value()) return;
+    if (subdiv_u == 0 || subdiv_v == 0) {
+        const auto [au, av] = patch.compute_adaptive_subdivision(current_transform_);
+        if (subdiv_u == 0) subdiv_u = au;
+        if (subdiv_v == 0) subdiv_v = av;
+    }
+    const nisaba::Vertices v = patch.to_vertices(subdiv_u, subdiv_v);
+    draw_vertices(v, blend_mode, opacity);
+}
+
+void GpuCanvas::draw_gradient_mesh(
+    const nisaba::GradientMesh& mesh,
+    BlendMode blend_mode,
+    float opacity,
+    uint32_t subdivision
+) {
+    if (!context_ || !scissor_clip_.has_value() || mesh.patches.empty()) return;
+    const nisaba::Vertices v = (subdivision == 0)
+        ? mesh.to_vertices_adaptive(current_transform_)
+        : mesh.to_vertices(subdivision);
+    draw_vertices(v, blend_mode, opacity);
 }
 
 void GpuCanvas::draw_round_rect_shadow(const nisaba::Rect& rect, float rx, float ry, const effects::DropShadow& shadow) {
@@ -2086,6 +3129,9 @@ void GpuCanvas::draw_svg(const svg::SvgDocument& doc, const nisaba::Rect& dest_b
 }
 
 void GpuCanvas::flush_internal(const ScreenIntRect* damage_rect, const std::vector<ScreenIntRect>* damage_rects) {
+    if (state_stack_.empty() && !clip_shader_stack_.empty()) {
+        finalize_clip_shader_layers_for_depth(0);
+    }
     invalidate_backdrop_cache();
     if (context_ && in_frame_) {
         // Keep in_frame_ active across mid-frame flushes so Context state & stencil clip depth persist.
@@ -2128,6 +3174,164 @@ void GpuCanvas::draw_text(std::string_view text, float x, float y, const text::F
     ScopedBlendMode scopedBlend(context_.get(), paint.blend_mode);
     apply_fill_paint(paint);
     context_->textWithFont(x, y, font, font_size, text.data(), text.data() + text.size());
+}
+
+void GpuCanvas::draw_glyphs(
+    std::span<const uint16_t> glyph_ids,
+    std::span<const nisaba::Point> positions,
+    const text::TtfFont& font,
+    float font_size,
+    const nisaba::Paint& paint
+) {
+    const size_t n = std::min(glyph_ids.size(), positions.size());
+    if (!context_ || n == 0 || !font.is_valid() || font_size <= 0.0f) return;
+
+    const float sx = std::hypot(current_transform_.sx, current_transform_.ky);
+    const float sy = std::hypot(current_transform_.kx, current_transform_.sy);
+    const float ctm_scale = std::max(sx, sy);
+    const float scaled_size = font_size * ctm_scale;
+    const bool near_isotropic = (ctm_scale > 1e-4f) &&
+                                (std::abs(sx - sy) <= ctm_scale * 0.05f) &&
+                                (std::abs(current_transform_.sx * current_transform_.kx + current_transform_.ky * current_transform_.sy) <= ctm_scale * ctm_scale * 0.05f);
+
+    const bool can_atlas_batch =
+        !has_perspective_4x4_ &&
+        !has_unpushed_clip_shader() &&
+        paint.is_solid_color() &&
+        !paint.custom_shader &&
+        paint.style == PaintStyle::Fill &&
+        paint.blend_mode == BlendMode::SourceOver &&
+        !paint.has_layer_filter() &&
+        !paint.has_path_effect() &&
+        !font.has_color_glyphs() &&
+        near_isotropic &&
+        scaled_size >= 1.0f &&
+        scaled_size <= 128.0f;
+
+    if (can_atlas_batch) {
+        ensure_frame();
+        ScopedBlendMode scopedBlend(context_.get(), paint.blend_mode);
+        apply_fill_paint(paint);
+        context_->drawGlyphsPos(glyph_ids, positions, font, font_size);
+        return;
+    }
+
+    ICanvas::draw_glyphs(glyph_ids, positions, font, font_size, paint);
+}
+
+void GpuCanvas::draw_glyphs(
+    std::span<const uint16_t> glyph_ids,
+    std::span<const nisaba::RSXform> xforms,
+    const text::TtfFont& font,
+    float font_size,
+    const nisaba::Paint& paint
+) {
+    const size_t n = std::min(glyph_ids.size(), xforms.size());
+    if (!context_ || n == 0 || !font.is_valid() || font_size <= 0.0f) return;
+
+    const float sx = std::hypot(current_transform_.sx, current_transform_.ky);
+    const float sy = std::hypot(current_transform_.kx, current_transform_.sy);
+    const float ctm_scale = std::max(sx, sy);
+    const bool near_isotropic = (ctm_scale > 1e-4f) &&
+                                (std::abs(sx - sy) <= ctm_scale * 0.05f) &&
+                                (std::abs(current_transform_.sx * current_transform_.kx + current_transform_.ky * current_transform_.sy) <= ctm_scale * ctm_scale * 0.05f);
+
+    bool can_atlas_batch =
+        !has_perspective_4x4_ &&
+        !has_unpushed_clip_shader() &&
+        paint.is_solid_color() &&
+        !paint.custom_shader &&
+        paint.style == PaintStyle::Fill &&
+        paint.blend_mode == BlendMode::SourceOver &&
+        !paint.has_layer_filter() &&
+        !paint.has_path_effect() &&
+        !font.has_color_glyphs() &&
+        near_isotropic;
+
+    if (can_atlas_batch) {
+        for (size_t i = 0; i < n; ++i) {
+            const float xs = std::hypot(xforms[i].scos, xforms[i].ssin);
+            const float rs = font_size * ctm_scale * xs;
+            if (!std::isfinite(rs) || rs > 128.0f) {
+                can_atlas_batch = false;
+                break;
+            }
+        }
+    }
+
+    if (can_atlas_batch) {
+        ensure_frame();
+        ScopedBlendMode scopedBlend(context_.get(), paint.blend_mode);
+        apply_fill_paint(paint);
+        context_->drawGlyphsRSXform(glyph_ids, xforms, font, font_size);
+        return;
+    }
+
+    ICanvas::draw_glyphs(glyph_ids, xforms, font, font_size, paint);
+}
+
+void GpuCanvas::draw_text_blob(
+    const nisaba::TextBlob& blob,
+    float x,
+    float y,
+    const nisaba::Paint& paint
+) {
+    if (!context_ || blob.is_empty()) return;
+
+    if (!paint.has_layer_filter() && !blob.bounds().is_empty()) {
+        const nisaba::Rect& b = blob.bounds();
+        if (auto moved = nisaba::Rect::from_ltrb(b.left() + x, b.top() + y, b.right() + x, b.bottom() + y)) {
+            if (quick_reject(*moved)) return;
+        }
+    }
+
+    const float sx = std::hypot(current_transform_.sx, current_transform_.ky);
+    const float sy = std::hypot(current_transform_.kx, current_transform_.sy);
+    const float ctm_scale = std::max(sx, sy);
+    const bool near_isotropic = (ctm_scale > 1e-4f) &&
+                                (std::abs(sx - sy) <= ctm_scale * 0.05f) &&
+                                (std::abs(current_transform_.sx * current_transform_.kx + current_transform_.ky * current_transform_.sy) <= ctm_scale * ctm_scale * 0.05f);
+
+    bool can_fast_blob =
+        !has_perspective_4x4_ &&
+        !has_unpushed_clip_shader() &&
+        paint.is_solid_color() &&
+        !paint.custom_shader &&
+        paint.style == PaintStyle::Fill &&
+        paint.blend_mode == BlendMode::SourceOver &&
+        !paint.has_layer_filter() &&
+        !paint.has_path_effect() &&
+        near_isotropic;
+
+    if (can_fast_blob) {
+        for (const auto& run : blob.runs()) {
+            if (!run.font) continue;
+            if (run.font->has_color_glyphs() || run.font_size * ctm_scale > 128.0f || run.font_size * ctm_scale < 1.0f) {
+                can_fast_blob = false;
+                break;
+            }
+            if (run.positioning == nisaba::TextBlob::RunPositioning::RSXform) {
+                for (const auto& xf : run.xforms) {
+                    const float rs = run.font_size * ctm_scale * std::hypot(xf.scos, xf.ssin);
+                    if (!std::isfinite(rs) || rs > 128.0f) {
+                        can_fast_blob = false;
+                        break;
+                    }
+                }
+                if (!can_fast_blob) break;
+            }
+        }
+    }
+
+    if (can_fast_blob) {
+        ensure_frame();
+        ScopedBlendMode scopedBlend(context_.get(), paint.blend_mode);
+        apply_fill_paint(paint);
+        context_->drawTextBlob(blob, x, y);
+        return;
+    }
+
+    ICanvas::draw_text_blob(blob, x, y, paint);
 }
 
 void GpuCanvas::draw_text(float x, float y, std::string_view text, const nisaba::Paint& paint, float font_size, const char* font_name) {

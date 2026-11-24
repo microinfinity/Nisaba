@@ -35,6 +35,7 @@ public:
     void bind() override;
     void resolve() override;
     void clear(nisaba::Color color) override;
+    void discard() override;
     void read_pixels(void* dst_rgba) override;
     void read_pixels(PixmapMut& dst) override;
     [[nodiscard]] std::optional<Pixmap> to_pixmap() override;
@@ -49,7 +50,7 @@ public:
     [[nodiscard]] VkImageView color_view() const noexcept { return color_view_; }
     [[nodiscard]] bool in_render_pass() const noexcept { return in_render_pass_; }
 
-    void begin_render_pass(nisaba::Color clear_color, bool load_previous = false);
+    void begin_render_pass(nisaba::Color clear_color, bool load_previous = false, bool dont_care = false);
     void end_render_pass();
 
 private:
@@ -70,10 +71,12 @@ private:
 
     VkRenderPass render_pass_{VK_NULL_HANDLE};
     VkRenderPass render_pass_load_{VK_NULL_HANDLE};
+    VkRenderPass render_pass_dont_care_{VK_NULL_HANDLE};
     VkFramebuffer framebuffer_{VK_NULL_HANDLE};
     VkCommandBuffer command_buffer_{VK_NULL_HANDLE};
 
     bool in_render_pass_{false};
+    bool discarded_{false};
 
     bool init_surface();
     void cleanup();

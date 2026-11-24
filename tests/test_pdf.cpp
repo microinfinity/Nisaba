@@ -1132,6 +1132,48 @@ static void test_pdf_gpu_and_navigation() {
     std::cout << "  -> PDF Hardware-Accelerated GPU Rendering & Interactive Navigation passed." << std::endl;
 }
 
+static void test_pdf_annotations_and_picture_replay() {
+    std::cout << "[TEST] PDF Annotations (URL, NamedDest, Metadata) & Picture Replay..." << std::endl;
+
+    PdfDocument doc;
+    PdfPage* page = doc.add_page(PageSize::A4, PageOrientation::Portrait);
+    assert(page != nullptr);
+    auto& cvs = page->canvas();
+
+    cvs.save();
+    cvs.translate(50.0f, 40.0f);
+    cvs.draw_annotation(*Rect::from_xywh(10.0f, 20.0f, 120.0f, 24.0f), "URL", "https://nisaba.engine/docs");
+    cvs.draw_annotation(*Rect::from_xywh(10.0f, 60.0f, 100.0f, 20.0f), "NamedDest", "section_intro");
+    cvs.draw_annotation(*Rect::from_xywh(10.0f, 90.0f, 80.0f, 18.0f), "AccessibilityRole", "Heading1");
+    cvs.restore();
+
+    // Also test Picture playback emitting an annotation onto PdfCanvas
+    PictureRecorder rec;
+    ICanvas& rc = rec.begin_recording(*Rect::from_xywh(0.0f, 0.0f, 595.0f, 842.0f));
+    rc.draw_annotation(*Rect::from_xywh(200.0f, 120.0f, 90.0f, 22.0f), "URI", "https://nisaba.engine/api");
+    auto pic = rec.finish_recording();
+    cvs.draw_picture(pic);
+
+    assert(cvs.annotations().size() == 4);
+    assert(std::abs(cvs.annotations()[0].rect.left() - 60.0f) < 0.01f);
+    assert(std::abs(cvs.annotations()[0].rect.top() - 60.0f) < 0.01f);
+
+    std::vector<uint8_t> bytes = doc.save_to_bytes();
+    assert(!bytes.empty());
+    std::string pdf_str(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+
+    assert(pdf_str.find("/Annots") != std::string::npos);
+    assert(pdf_str.find("/Subtype /Link") != std::string::npos);
+    assert(pdf_str.find("/S /URI") != std::string::npos);
+    assert(pdf_str.find("(https://nisaba.engine/docs)") != std::string::npos);
+    assert(pdf_str.find("(https://nisaba.engine/api)") != std::string::npos);
+    assert(pdf_str.find("/Dest (section_intro)") != std::string::npos);
+    assert(pdf_str.find("/T (AccessibilityRole)") != std::string::npos);
+    assert(pdf_str.find("/Contents (Heading1)") != std::string::npos);
+
+    std::cout << "  -> PDF Annotations & Picture Replay passed." << std::endl;
+}
+
 int main() {
     std::cout << "==========================================" << std::endl;
     std::cout << "    NISABA PDF ENGINE TEST SUITE          " << std::endl;
@@ -1147,6 +1189,7 @@ int main() {
     test_pdf_transparency_and_blend_modes();
     test_pdf_codecs_and_encryption();
     test_pdf_gpu_and_navigation();
+    test_pdf_annotations_and_picture_replay();
 
     std::cout << "==========================================" << std::endl;
     std::cout << "    ALL PDF ENGINE TESTS PASSED!          " << std::endl;

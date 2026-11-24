@@ -200,6 +200,29 @@ Color CoonsPatch::evaluate_color(float u, float v) const noexcept {
     );
 }
 
+std::pair<uint32_t, uint32_t> CoonsPatch::compute_adaptive_subdivision(
+    const Transform& transform,
+    float tolerance
+) const noexcept {
+    const float tol = std::max(0.05f, tolerance);
+    auto curve_steps = [&](const Point pts[4]) noexcept -> uint32_t {
+        Point p[4] = {pts[0], pts[1], pts[2], pts[3]};
+        if (!transform.is_identity()) {
+            transform.map_points(p, 4);
+        }
+        const float d1x = p[0].x - 2.0f * p[1].x + p[2].x;
+        const float d1y = p[0].y - 2.0f * p[1].y + p[2].y;
+        const float d2x = p[1].x - 2.0f * p[2].x + p[3].x;
+        const float d2y = p[1].y - 2.0f * p[2].y + p[3].y;
+        const float dev = std::max(std::hypot(d1x, d1y), std::hypot(d2x, d2y));
+        const uint32_t steps = static_cast<uint32_t>(std::ceil(std::sqrt((0.75f * dev) / tol)));
+        return std::clamp<uint32_t>(steps, 4u, 32u);
+    };
+    const uint32_t su = std::max(curve_steps(top), curve_steps(bottom));
+    const uint32_t sv = std::max(curve_steps(left), curve_steps(right));
+    return {su, sv};
+}
+
 Vertices CoonsPatch::to_vertices(uint32_t subdiv_u, uint32_t subdiv_v) const {
     subdiv_u = std::max(1u, subdiv_u);
     subdiv_v = std::max(1u, subdiv_v);
@@ -236,6 +259,27 @@ Vertices GradientMesh::to_vertices(uint32_t subdiv_per_patch) const {
     for (const auto& patch : patches) {
         Vertices patch_v = patch.to_vertices(subdiv_per_patch, subdiv_per_patch);
         uint32_t offset = static_cast<uint32_t>(combined.positions.size());
+
+        combined.positions.insert(combined.positions.end(), patch_v.positions.begin(), patch_v.positions.end());
+        combined.colors.insert(combined.colors.end(), patch_v.colors.begin(), patch_v.colors.end());
+        combined.tex_coords.insert(combined.tex_coords.end(), patch_v.tex_coords.begin(), patch_v.tex_coords.end());
+
+        for (uint32_t idx : patch_v.indices) {
+            combined.indices.push_back(offset + idx);
+        }
+    }
+
+    return combined;
+}
+
+Vertices GradientMesh::to_vertices_adaptive(const Transform& transform, float tolerance) const {
+    Vertices combined;
+    combined.mode = VertexMode::Triangles;
+
+    for (const auto& patch : patches) {
+        const auto [su, sv] = patch.compute_adaptive_subdivision(transform, tolerance);
+        Vertices patch_v = patch.to_vertices(su, sv);
+        const uint32_t offset = static_cast<uint32_t>(combined.positions.size());
 
         combined.positions.insert(combined.positions.end(), patch_v.positions.begin(), patch_v.positions.end());
         combined.colors.insert(combined.colors.end(), patch_v.colors.begin(), patch_v.colors.end());

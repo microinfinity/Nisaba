@@ -125,8 +125,8 @@ public:
 	                            float fringe, int shaderType = 3) = 0;
 
 	virtual void renderClip(const RenderPath* paths, int npaths, Winding winding, int targetDepth,
-	                       const Scissor& scissor, const float* bounds) {
-		(void)paths; (void)npaths; (void)winding; (void)targetDepth; (void)scissor; (void)bounds;
+	                       const Scissor& scissor, const float* bounds, bool isDifference = false) {
+		(void)paths; (void)npaths; (void)winding; (void)targetDepth; (void)scissor; (void)bounds; (void)isDifference;
 	}
 
 	virtual void restoreClip(int targetDepth) {

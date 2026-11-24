@@ -3,8 +3,10 @@
 #include <vector>
 #include <optional>
 #include <tuple>
+#include <utility>
 #include "nisaba/math/point.hpp"
 #include "nisaba/math/rect.hpp"
+#include "nisaba/math/transform.hpp"
 #include "nisaba/color/color.hpp"
 
 namespace nisaba {
@@ -118,6 +120,12 @@ struct CoonsPatch {
     /// Evaluates the interpolated color at (u, v) in [0, 1]^2.
     [[nodiscard]] Color evaluate_color(float u, float v) const noexcept;
 
+    /// Computes adaptive (u, v) tessellation subdivisions based on cubic boundary curvature in device space.
+    [[nodiscard]] std::pair<uint32_t, uint32_t> compute_adaptive_subdivision(
+        const Transform& transform = Transform(),
+        float tolerance = 0.5f
+    ) const noexcept;
+
     /// Tessellates this patch into a fine 2D triangle mesh (Vertices) with Gouraud vertex colors.
     [[nodiscard]] Vertices to_vertices(uint32_t subdiv_u = 8, uint32_t subdiv_v = 8) const;
 };
@@ -132,6 +140,12 @@ struct GradientMesh {
 
     /// Tessellates all patches in this mesh into an indexed Vertices object.
     [[nodiscard]] Vertices to_vertices(uint32_t subdiv_per_patch = 8) const;
+
+    /// Tessellates all patches adaptively according to their curvature under `transform`.
+    [[nodiscard]] Vertices to_vertices_adaptive(
+        const Transform& transform = Transform(),
+        float tolerance = 0.5f
+    ) const;
 };
 
 } // namespace nisaba

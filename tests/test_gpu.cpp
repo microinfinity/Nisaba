@@ -4084,6 +4084,565 @@ static void test_gpu_lottie_phase4_expressions_and_text_on_path_parity() {
     std::cout << "  -> Lottie Phase 4 Expressions, TextAnimator & Text-on-Path CPU-vs-GPU Parity OK (mean_diff=" << mean_diff << ")" << std::endl;
 }
 
+void test_gpu_canvas_phase1_parity() {
+    std::cout << "[Test] Canvas Phase 1 (Clip Queries, Save Stack, draw_color/draw_paint, 9-Slice & Lattice) CPU-vs-GPU Parity..." << std::endl;
+
+    auto dev = gpu::GpuDevice::create();
+    assert(dev != nullptr);
+    constexpr uint32_t W = 280, H = 220;
+    const Color bg = Color::from_rgba8(18, 24, 38, 255);
+
+    auto make_nine_src = [](uint32_t w, uint32_t h, uint32_t b) {
+        auto pm = Pixmap::create(w, h).value();
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                bool l = x < b, r = x >= (w - b), t = y < b, bo = y >= (h - b);
+                Color c = Color::from_rgba8(40, 210, 125, 255);
+                if ((l || r) && (t || bo)) c = Color::from_rgba8(240, 65, 55, 255);
+                else if (t || bo)          c = Color::from_rgba8(55, 125, 245, 255);
+                else if (l || r)           c = Color::from_rgba8(245, 200, 45, 255);
+                pm.set_pixel(x, y, c.premultiply().to_color_u8());
+            }
+        }
+        return pm;
+    };
+
+    Pixmap nine_src = make_nine_src(16, 16, 4);
+    Pixmap nine_1px = make_nine_src(9, 9, 4);
+
+    auto run_scene = [&](ICanvas& c) {
+        // 1.1 & 1.2 Clip query + save stack state parity assertions
+        assert(c.save_count() == 1);
+        auto d0 = c.get_device_clip_bounds();
+        assert(d0.has_value() && d0->width() == W && d0->height() == H);
+
+        const int s_root = c.save();
+        assert(s_root == 1 && c.save_count() == 2);
+        c.translate(10.0f, 10.0f);
+        c.scale(2.0f, 2.0f);
+        c.clip_rect(*Rect::from_xywh(5.0f, 5.0f, 30.0f, 20.0f));
+        auto d1 = c.get_device_clip_bounds();
+        assert(d1.has_value() && d1->x() == 20 && d1->y() == 20 && d1->width() == 60 && d1->height() == 40);
+        auto l1 = c.get_local_clip_bounds();
+        assert(l1.has_value() && std::abs(l1->left() - 5.0f) < 1e-2f && std::abs(l1->right() - 35.0f) < 1e-2f);
+        assert(!c.quick_reject(*Rect::from_xywh(10.0f, 10.0f, 10.0f, 10.0f)));
+        assert(c.quick_reject(*Rect::from_xywh(40.0f, 10.0f, 10.0f, 10.0f)));
+        assert(c.quick_reject(*PathBuilder::from_circle(60.0f, 60.0f, 5.0f)));
+        assert(!c.quick_reject(*PathBuilder::from_circle(20.0f, 15.0f, 5.0f)));
+
+        // Clip path narrows device bounds
+        c.save();
+        c.clip_path(*PathBuilder::from_circle(20.0f, 15.0f, 8.0f));
+        auto d_cp = c.get_device_clip_bounds();
+        assert(d_cp.has_value() && d_cp->width() <= 34 && d_cp->height() <= 34);
+        c.restore_to_count(s_root);
+        assert(c.save_count() == 1);
+
+        // 1.3 draw_color (including Clear) & rotated gradient draw_paint inside clip_rect & clip_path
+        c.save();
+        c.clip_rect(*Rect::from_xywh(12.0f, 12.0f, 80.0f, 56.0f));
+        c.draw_color(Color::from_rgba8(220, 95, 45, 255), BlendMode::SourceOver);
+        c.save();
+        c.clip_rect(*Rect::from_xywh(28.0f, 24.0f, 24.0f, 24.0f));
+        c.draw_color(Color::TRANSPARENT, BlendMode::Clear);
+        c.restore();
+        c.restore();
+
+        c.save();
+        c.clip_path(*PathBuilder::from_circle(145.0f, 45.0f, 32.0f));
+        c.translate(145.0f, 45.0f);
+        c.rotate(30.0f);
+        auto grad = LinearGradient::create(
+            Point::from_xy(-32.0f, 0.0f), Point::from_xy(32.0f, 0.0f),
+            {GradientStop::create(0.0f, Color::from_rgba8(255, 60, 80, 255)),
+             GradientStop::create(1.0f, Color::from_rgba8(50, 140, 255, 255))});
+        c.draw_paint(Paint(Shader(*grad)));
+        c.restore();
+
+        // 1.2 pivot rotate & save_layer_alpha(std::optional<Rect>, float) + restore_to_count
+        const int s_piv = c.save();
+        c.save_layer_alpha(std::optional<Rect>(Rect::from_xywh(195.0f, 10.0f, 75.0f, 75.0f)), 0.6f);
+        c.rotate(45.0f, 232.0f, 48.0f);
+        c.fill_rect(*Rect::from_xywh(212.0f, 36.0f, 40.0f, 24.0f), Paint(Color::from_rgba8(240, 220, 60, 255)));
+        c.save();
+        c.restore_to_count(s_piv);
+        assert(c.save_count() == 1);
+
+        // 1.4 9-Slice (expanded + 1px stretched + compressed) & Lattice (FixedColor + Transparent)
+        PixmapPaint pp;
+        pp.quality = FilterQuality::Bilinear;
+        c.draw_image_nine(nine_src.as_ref(), *IntRect::from_ltrb(4, 4, 12, 12),
+                          *Rect::from_xywh(12.0f, 95.0f, 84.0f, 64.0f), pp);
+        c.draw_image_nine(nine_1px.as_ref(), *IntRect::from_ltrb(4, 4, 5, 5),
+                          *Rect::from_xywh(108.0f, 95.0f, 64.0f, 36.0f), pp);
+        c.draw_image_nine(nine_src.as_ref(), *IntRect::from_ltrb(4, 4, 12, 12),
+                          *Rect::from_xywh(108.0f, 140.0f, 6.0f, 6.0f), pp);
+
+        std::array<int32_t, 2> xdivs{4, 12};
+        std::array<int32_t, 2> ydivs{4, 12};
+        std::array<Lattice::RectType, 9> rtypes{
+            Lattice::RectType::FixedColor, Lattice::RectType::Default,     Lattice::RectType::Default,
+            Lattice::RectType::Default,    Lattice::RectType::Transparent, Lattice::RectType::Default,
+            Lattice::RectType::Default,    Lattice::RectType::Default,     Lattice::RectType::FixedColor
+        };
+        std::array<Color, 9> rcolors{};
+        rcolors[0] = Color::from_rgba8(240, 50, 230, 255);
+        rcolors[8] = Color::from_rgba8(50, 235, 245, 255);
+        Lattice lat;
+        lat.x_divs = xdivs;
+        lat.y_divs = ydivs;
+        lat.rect_types = rtypes;
+        lat.colors = rcolors;
+        PixmapPaint lp;
+        lp.opacity = 0.85f;
+        c.draw_image_lattice(nine_src.as_ref(), lat, *Rect::from_xywh(186.0f, 95.0f, 80.0f, 64.0f), lp);
+    };
+
+    auto cpu_pm = Pixmap::create(W, H).value();
+    cpu_pm.fill(bg);
+    {
+        Canvas cpu(cpu_pm);
+        run_scene(cpu);
+    }
+
+    auto surf = gpu::GpuSurface::create(dev, W, H, 1);
+    assert(surf != nullptr);
+    gpu::GpuCanvas gpu(surf);
+    gpu.clear(bg);
+    run_scene(gpu);
+    gpu.flush();
+    auto gpu_pm = surf->to_pixmap();
+    assert(gpu_pm.has_value());
+
+    double sum_diff = 0.0;
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            auto cp = cpu_pm.as_ref().pixel(x, y);
+            auto gp = gpu_pm->as_ref().pixel(x, y);
+            sum_diff += (std::abs(int(cp->red()) - int(gp->red())) +
+                         std::abs(int(cp->green()) - int(gp->green())) +
+                         std::abs(int(cp->blue()) - int(gp->blue())) +
+                         std::abs(int(cp->alpha()) - int(gp->alpha()))) * 0.25;
+        }
+    }
+    const double mean_diff = sum_diff / double(W * H);
+    if (mean_diff >= 1.5) {
+        std::cerr << "  [FAIL] Canvas Phase 1 parity mean_diff=" << mean_diff << std::endl;
+    }
+    assert(mean_diff < 1.5);
+
+    // Spot-check zero bleed on 1px stretched center (114, 113) and Transparent lattice cell (226, 127)
+    auto p1px = gpu_pm->as_ref().pixel(114, 113);
+    assert(p1px && p1px->green() > 195 && p1px->red() < 55);
+    auto ptrans = gpu_pm->as_ref().pixel(226, 127);
+    assert(ptrans && ptrans->red() == 18 && ptrans->green() == 24 && ptrans->blue() == 38);
+
+    std::cout << "  -> Canvas Phase 1 CPU-vs-GPU (GL3) Parity OK (mean_diff=" << mean_diff << ")" << std::endl;
+}
+
+void test_gpu_canvas_phase2_parity() {
+    std::cout << "[Test] Canvas Phase 2 (Difference Clip, clip_shader, draw_atlas & Coons/GradientMesh) CPU-vs-GPU Parity..." << std::endl;
+
+    auto dev = gpu::GpuDevice::create();
+    assert(dev != nullptr);
+    constexpr uint32_t W = 300, H = 220;
+    const Color bg = Color::from_rgba8(16, 22, 34, 255);
+
+    auto atlas = Pixmap::create(32, 32).value();
+    for (uint32_t y = 0; y < 32; ++y) {
+        for (uint32_t x = 0; x < 32; ++x) {
+            Color c = Color::WHITE;
+            if (x < 16 && y < 16)       c = Color::from_rgba8(240, 60, 50, 255);
+            else if (x >= 16 && y < 16) c = Color::from_rgba8(50, 220, 90, 255);
+            else if (x < 16 && y >= 16) c = Color::from_rgba8(55, 130, 245, 255);
+            else                        c = Color::from_rgba8(245, 215, 50, 255);
+            atlas.set_pixel(x, y, c.premultiply().to_color_u8());
+        }
+    }
+
+    CoonsPatch patch;
+    patch.top[0] = {15, 115};    patch.top[1] = {55, 98};     patch.top[2] = {95, 132};    patch.top[3] = {135, 115};
+    patch.right[0] = {135, 115}; patch.right[1] = {150, 145}; patch.right[2] = {120, 175}; patch.right[3] = {135, 205};
+    patch.bottom[0] = {15, 205}; patch.bottom[1] = {55, 216}; patch.bottom[2] = {95, 192}; patch.bottom[3] = {135, 205};
+    patch.left[0] = {15, 115};   patch.left[1] = {4, 145};    patch.left[2] = {28, 175};   patch.left[3] = {15, 205};
+    patch.color_top_left = Color::from_rgba8(255, 55, 55, 255);
+    patch.color_top_right = Color::from_rgba8(50, 245, 95, 255);
+    patch.color_bottom_right = Color::from_rgba8(55, 110, 255, 255);
+    patch.color_bottom_left = Color::from_rgba8(255, 225, 45, 255);
+
+    GradientMesh mesh;
+    CoonsPatch p2 = patch;
+    for (int i = 0; i < 4; ++i) {
+        p2.top[i].x += 145.0f;
+        p2.right[i].x += 145.0f;
+        p2.bottom[i].x += 145.0f;
+        p2.left[i].x += 145.0f;
+    }
+    p2.color_top_left = Color::from_rgba8(230, 50, 240, 255);
+    p2.color_bottom_right = Color::from_rgba8(40, 240, 230, 255);
+    mesh.add_patch(p2);
+
+    auto run_scene = [&](ICanvas& c) {
+        // 2.1 Difference Clipping (oval cutout + nested rrect cutout + restore)
+        c.save();
+        c.clip_rect(*Rect::from_xywh(10.0f, 10.0f, 80.0f, 80.0f), ClipOp::Intersect);
+        c.clip_oval(*Rect::from_xywh(30.0f, 30.0f, 40.0f, 40.0f), ClipOp::Difference);
+        c.save();
+        c.clip_rrect(RRect::from_rect_and_radius(*Rect::from_xywh(14.0f, 14.0f, 20.0f, 20.0f), 4.0f), ClipOp::Difference);
+        c.fill_rect(*Rect::from_xywh(0.0f, 0.0f, 100.0f, 100.0f), Paint(Color::from_rgba8(230, 90, 50, 255)));
+        c.restore();
+        c.fill_rect(*Rect::from_xywh(14.0f, 14.0f, 20.0f, 20.0f), Paint(Color::from_rgba8(60, 210, 140, 255)));
+        c.restore();
+
+        // 2.2 clip_shader (Intersect linear fade + Difference radial vignette)
+        auto fade_grad = LinearGradient::create(
+            Point::from_xy(100.0f, 0.0f), Point::from_xy(185.0f, 0.0f),
+            {GradientStop::create(0.0f, Color::from_rgba8(255, 255, 255, 0)),
+             GradientStop::create(1.0f, Color::from_rgba8(255, 255, 255, 255))});
+        c.save();
+        c.clip_rect(*Rect::from_xywh(100.0f, 10.0f, 85.0f, 36.0f));
+        c.clip_shader(Shader(*fade_grad), ClipOp::Intersect);
+        c.fill_rect(*Rect::from_xywh(100.0f, 10.0f, 85.0f, 36.0f), Paint(Color::from_rgba8(245, 245, 245, 255)));
+        c.restore();
+
+        auto rad_grad = RadialGradient::create(
+            Point::from_xy(142.0f, 72.0f), 24.0f,
+            {GradientStop::create(0.0f, Color::from_rgba8(255, 255, 255, 255)),
+             GradientStop::create(1.0f, Color::from_rgba8(255, 255, 255, 0))});
+        c.save();
+        c.clip_rect(*Rect::from_xywh(100.0f, 52.0f, 85.0f, 38.0f));
+        c.clip_shader(Shader(*rad_grad), ClipOp::Difference);
+        c.fill_rect(*Rect::from_xywh(100.0f, 52.0f, 85.0f, 38.0f), Paint(Color::from_rgba8(70, 190, 255, 255)));
+        c.restore();
+
+        // 2.3 RSXform + draw_atlas (batched rotated/scaled sprites with Modulate & Source)
+        std::array<RSXform, 4> xforms{
+            RSXform::from_degrees(1.5f, 0.0f, 196.0f, 12.0f),
+            RSXform::from_degrees(1.4f, 35.0f, 258.0f, 26.0f, 8.0f, 8.0f),
+            RSXform::from_degrees(1.5f, 0.0f, 196.0f, 54.0f),
+            RSXform::from_degrees(1.5f, -20.0f, 258.0f, 68.0f, 8.0f, 8.0f)
+        };
+        std::array<Rect, 4> tex_rects{
+            *Rect::from_xywh(0.0f, 0.0f, 16.0f, 16.0f),
+            *Rect::from_xywh(16.0f, 0.0f, 16.0f, 16.0f),
+            *Rect::from_xywh(0.0f, 16.0f, 16.0f, 16.0f),
+            *Rect::from_xywh(16.0f, 16.0f, 16.0f, 16.0f)
+        };
+        std::array<Color, 4> cols{
+            Color::WHITE,
+            Color::from_rgba8(255, 255, 255, 200),
+            Color::from_rgba8(200, 255, 255, 255),
+            Color::from_rgba8(255, 140, 255, 255)
+        };
+        c.draw_atlas(atlas.as_ref(), xforms, tex_rects, cols, BlendMode::Modulate);
+
+        // 2.4 Adaptive CoonsPatch (clipped with Difference oval) & GradientMesh
+        c.save();
+        c.clip_oval(*Rect::from_xywh(58.0f, 145.0f, 34.0f, 34.0f), ClipOp::Difference);
+        c.draw_coons_patch(patch);
+        c.restore();
+
+        c.draw_gradient_mesh(mesh);
+    };
+
+    auto cpu_pm = Pixmap::create(W, H).value();
+    cpu_pm.fill(bg);
+    {
+        Canvas cpu(cpu_pm);
+        run_scene(cpu);
+    }
+
+    auto surf = gpu::GpuSurface::create(dev, W, H, 1);
+    assert(surf != nullptr);
+    gpu::GpuCanvas gpu(surf);
+    gpu.clear(bg);
+    run_scene(gpu);
+    gpu.flush();
+    auto gpu_pm = surf->to_pixmap();
+    assert(gpu_pm.has_value());
+
+    double sum_diff = 0.0;
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            auto cp = cpu_pm.as_ref().pixel(x, y);
+            auto gp = gpu_pm->as_ref().pixel(x, y);
+            sum_diff += (std::abs(int(cp->red()) - int(gp->red())) +
+                         std::abs(int(cp->green()) - int(gp->green())) +
+                         std::abs(int(cp->blue()) - int(gp->blue())) +
+                         std::abs(int(cp->alpha()) - int(gp->alpha()))) * 0.25;
+        }
+    }
+    const double mean_diff = sum_diff / double(W * H);
+    if (mean_diff >= 2.0) {
+        std::cerr << "  [FAIL] Canvas Phase 2 parity mean_diff=" << mean_diff << std::endl;
+    }
+    assert(mean_diff < 2.0);
+
+    // Spot checks: difference hole untouched, restored corner green, radial diff center bg, coons hole untouched
+    auto g_hole = gpu_pm->as_ref().pixel(50, 50);
+    assert(g_hole && g_hole->red() == 16 && g_hole->green() == 22 && g_hole->blue() == 34);
+    auto g_rest = gpu_pm->as_ref().pixel(22, 22);
+    assert(g_rest && g_rest->green() > 195);
+    auto g_rad_c = gpu_pm->as_ref().pixel(142, 72);
+    assert(g_rad_c && g_rad_c->blue() < 50);
+    auto g_coons_hole = gpu_pm->as_ref().pixel(75, 162);
+    assert(g_coons_hole && g_coons_hole->red() == 16 && g_coons_hole->green() == 22);
+
+    std::cout << "  -> Canvas Phase 2 CPU-vs-GPU (GL3) Parity OK (mean_diff=" << mean_diff << ")" << std::endl;
+}
+
+void test_gpu_canvas_phase3_parity() {
+    std::cout << "[Test] Canvas Phase 3 (Picture/Drawable, 4x4 Projective Stack & Region) CPU-vs-GPU Parity..." << std::endl;
+
+    auto dev = gpu::GpuDevice::create();
+    assert(dev != nullptr);
+    constexpr uint32_t W = 300, H = 220;
+    const Color bg = Color::from_rgba8(14, 20, 32, 255);
+
+    struct Phase3Badge final : public Drawable {
+        Color col{Color::from_rgba8(245, 190, 45, 255)};
+        Rect on_get_bounds() const override { return *Rect::from_xywh(0.0f, 0.0f, 22.0f, 22.0f); }
+        void on_draw(ICanvas& c) override {
+            c.fill_rrect(RRect::from_rect_and_radius(*Rect::from_xywh(0.0f, 0.0f, 22.0f, 22.0f), 6.0f), Paint(col));
+        }
+    };
+
+    auto badge = std::make_shared<Phase3Badge>();
+    std::shared_ptr<Picture> pic;
+    {
+        auto icon = Pixmap::create(16, 16).value();
+        for (uint32_t y = 0; y < 16; ++y) {
+            for (uint32_t x = 0; x < 16; ++x) {
+                Color ic = ((x ^ y) & 4) ? Color::from_rgba8(55, 230, 185, 255)
+                                         : Color::from_rgba8(30, 140, 220, 255);
+                icon.set_pixel(x, y, ic.premultiply().to_color_u8());
+            }
+        }
+        PictureRecorder rec;
+        ICanvas& rc = rec.begin_recording(*Rect::from_xywh(0.0f, 0.0f, 84.0f, 62.0f));
+        rc.fill_rrect(RRect::from_rect_and_radius(*Rect::from_xywh(0.0f, 0.0f, 84.0f, 62.0f), 8.0f),
+                      Paint(Color::from_rgba8(42, 88, 205, 255)));
+        rc.draw_pixmap(10, 10, icon.as_ref());
+        const Transform bt = Transform::from_translate(50.0f, 18.0f);
+        rc.draw_drawable(badge, &bt);
+        pic = rec.finish_recording();
+    }
+
+    auto tex_3d = Pixmap::create(24, 24).value();
+    for (uint32_t y = 0; y < 24; ++y) {
+        for (uint32_t x = 0; x < 24; ++x) {
+            Color tc = ((x / 6 + y / 6) % 2 == 0) ? Color::from_rgba8(245, 130, 50, 255)
+                                                  : Color::from_rgba8(45, 70, 115, 255);
+            tex_3d.set_pixel(x, y, tc.premultiply().to_color_u8());
+        }
+    }
+
+    Region clip_rgn(*IntRect::from_xywh(215, 12, 72, 72));
+    clip_rgn.difference_with(*IntRect::from_xywh(237, 34, 28, 28));
+
+    Region xor_rgn(*IntRect::from_xywh(120, 132, 72, 48));
+    xor_rgn.xor_with(*IntRect::from_xywh(156, 152, 72, 48));
+
+    auto run_scene = [&](ICanvas& c) {
+        // 3.1 Picture + Drawable replay (normal & semi-transparent layer)
+        badge->col = Color::from_rgba8(245, 190, 45, 255);
+        const Transform t1 = Transform::from_translate(10.0f, 12.0f);
+        c.draw_picture(pic, &t1);
+
+        badge->col = Color::from_rgba8(240, 65, 135, 255);
+        const Transform t2 = Transform::from_translate(10.0f, 86.0f);
+        Paint alpha_p(Color::from_rgba_unchecked(1.0f, 1.0f, 1.0f, 0.65f));
+        c.draw_picture(pic, &t2, &alpha_p);
+
+        // 3.2 Full 4x4 projective matrix stack (tilted gradient RRect + stroked frame + 3D pixmap_rect)
+        c.save();
+        c.concat(Transform4x4::from_camera_orbit(155.0f, 62.0f, 10.0f, 28.0f, 0.0f, 360.0f));
+        auto grad = LinearGradient::create(
+            Point::from_xy(115.0f, 22.0f), Point::from_xy(195.0f, 102.0f),
+            {GradientStop::create(0.0f, Color::from_rgba8(245, 80, 70, 255)),
+             GradientStop::create(1.0f, Color::from_rgba8(70, 145, 250, 255))});
+        c.fill_rrect(RRect::from_rect_and_radius(*Rect::from_xywh(115.0f, 22.0f, 80.0f, 80.0f), 10.0f),
+                     Paint(Shader(*grad)));
+        Stroke st; st.width = 3.5f;
+        c.stroke_rect(*Rect::from_xywh(115.0f, 22.0f, 80.0f, 80.0f), Paint(Color::WHITE), st);
+        c.draw_pixmap_rect(tex_3d.as_ref(), *Rect::from_xywh(135.0f, 42.0f, 40.0f, 40.0f));
+        c.restore();
+
+        // 3.3 Device-space clip_region (unaffected by translate) & batched draw_region
+        c.save();
+        c.translate(40.0f, 40.0f);
+        c.clip_region(clip_rgn, ClipOp::Intersect);
+        c.draw_color(Color::from_rgba8(55, 215, 145, 255));
+        c.restore();
+
+        c.draw_region(xor_rgn, Paint(Color::from_rgba8(175, 95, 245, 255)));
+    };
+
+    auto cpu_pm = Pixmap::create(W, H).value();
+    cpu_pm.fill(bg);
+    {
+        Canvas cpu(cpu_pm);
+        run_scene(cpu);
+    }
+
+    auto surf = gpu::GpuSurface::create(dev, W, H, 1);
+    assert(surf != nullptr);
+    gpu::GpuCanvas gpu(surf);
+    gpu.clear(bg);
+    run_scene(gpu);
+    gpu.flush();
+    auto gpu_pm = surf->to_pixmap();
+    assert(gpu_pm.has_value());
+
+    double sum_diff = 0.0;
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            auto cp = cpu_pm.as_ref().pixel(x, y);
+            auto gp = gpu_pm->as_ref().pixel(x, y);
+            sum_diff += (std::abs(int(cp->red()) - int(gp->red())) +
+                         std::abs(int(cp->green()) - int(gp->green())) +
+                         std::abs(int(cp->blue()) - int(gp->blue())) +
+                         std::abs(int(cp->alpha()) - int(gp->alpha()))) * 0.25;
+        }
+    }
+    const double mean_diff = sum_diff / double(W * H);
+    if (mean_diff >= 2.0) {
+        std::cerr << "  [FAIL] Canvas Phase 3 parity mean_diff=" << mean_diff << std::endl;
+    }
+    assert(mean_diff < 2.0);
+
+    // Spot checks
+    auto g_rgn_hole = gpu_pm->as_ref().pixel(250, 48);
+    auto g_rgn_in = gpu_pm->as_ref().pixel(222, 20);
+    auto g_xor_hole = gpu_pm->as_ref().pixel(170, 165);
+    assert(g_rgn_hole && g_rgn_hole->red() == 14 && g_rgn_hole->green() == 20);
+    assert(g_rgn_in && g_rgn_in->green() > 200);
+    assert(g_xor_hole && g_xor_hole->red() == 14 && g_xor_hole->blue() == 32);
+
+    std::cout << "  -> Canvas Phase 3 CPU-vs-GPU (GL3) Parity OK (mean_diff=" << mean_diff << ")" << std::endl;
+}
+
+static void test_gpu_canvas_phase4_parity() {
+    std::cout << "[Test 43/43] Canvas Parity Phase 4 (draw_glyphs pos/RSXform, TextBlob, discard)..." << std::endl;
+
+    auto font = text::TtfFont::from_file(resolve_test_font("NotoSans-Regular.ttf"));
+    assert(font && font->is_valid());
+
+    const uint32_t W = 320, H = 240;
+    const Color bg = Color::from_rgba8(14, 18, 28, 255);
+
+    std::vector<uint16_t> pos_gids;
+    std::vector<Point> pos_pts;
+    float px = 20.0f;
+    for (char ch : std::string_view("NISABA GPU")) {
+        uint16_t gid = font->glyph_index(static_cast<char32_t>(ch));
+        pos_gids.push_back(gid);
+        pos_pts.emplace_back(px, 46.0f);
+        px += font->glyph_advance(gid, 26.0f) + 1.5f;
+    }
+
+    const std::string_view arc_txt = "CURVE ARC";
+    std::vector<uint16_t> arc_gids;
+    std::vector<RSXform> arc_xforms;
+    const float cx = 160.0f, cy = 220.0f, rad = 82.0f;
+    for (size_t i = 0; i < arc_txt.size(); ++i) {
+        arc_gids.push_back(font->glyph_index(static_cast<char32_t>(arc_txt[i])));
+        const float ang = -2.25f + static_cast<float>(i) * 0.17f;
+        const float tangent = ang + 1.5707963f;
+        arc_xforms.push_back(RSXform::from_radians(
+            1.0f, tangent, cx + std::cos(ang) * rad, cy + std::sin(ang) * rad, 0.0f, 0.0f
+        ));
+    }
+
+    TextBlobBuilder builder;
+    std::vector<uint16_t> blob_gids;
+    std::vector<Point> blob_pts;
+    float bx = 0.0f;
+    for (char ch : std::string_view("TextBlob Replay")) {
+        uint16_t gid = font->glyph_index(static_cast<char32_t>(ch));
+        blob_gids.push_back(gid);
+        blob_pts.emplace_back(bx, 0.0f);
+        bx += font->glyph_advance(gid, 22.0f);
+    }
+    builder.add_run_pos(*font, 22.0f, blob_gids, blob_pts);
+    auto blob = builder.make();
+    assert(blob && !blob->is_empty());
+
+    PictureRecorder rec;
+    ICanvas& rc = rec.begin_recording(*Rect::from_xywh(0.0f, 0.0f, float(W), float(H)));
+    rc.draw_text_blob(blob, 22.0f, 126.0f, Paint(Color::from_rgba8(52, 211, 153, 255)));
+    auto pic = rec.finish_recording();
+
+    auto run_scene = [&](ICanvas& c) {
+        c.draw_glyphs(pos_gids, pos_pts, *font, 26.0f, Paint(Color::from_rgba8(248, 250, 252, 255)));
+
+        std::vector<GradientStop> stops = {
+            GradientStop::create(0.0f, Color::from_rgba8(250, 204, 21, 255)),
+            GradientStop::create(1.0f, Color::from_rgba8(244, 63, 94, 255))
+        };
+        auto lg = LinearGradient::create(Point(20.0f, 88.0f), Point(260.0f, 88.0f), stops, SpreadMode::Pad);
+        assert(lg.has_value());
+        Paint gp;
+        gp.shader = Shader(*lg);
+        c.draw_text_blob(blob, 22.0f, 88.0f, gp);
+        c.draw_picture(pic);
+        c.draw_glyphs(arc_gids, arc_xforms, *font, 20.0f, Paint(Color::from_rgba8(56, 189, 248, 255)));
+        c.draw_annotation(*Rect::from_xywh(20.0f, 20.0f, 140.0f, 30.0f), "URL", "https://nisaba.dev");
+    };
+
+    auto cpu_pm = Pixmap::create(W, H).value();
+    cpu_pm.fill(bg);
+    {
+        Canvas cpu(cpu_pm);
+        run_scene(cpu);
+    }
+
+    auto dev = GpuDevice::create();
+    assert(dev != nullptr);
+    auto surf = GpuSurface::create(dev, W, H, 4);
+    assert(surf != nullptr);
+    GpuCanvas gpu(surf);
+    gpu.clear(bg);
+    run_scene(gpu);
+    gpu.flush();
+    auto gpu_pm = surf->to_pixmap();
+    assert(gpu_pm.has_value());
+
+    double sum_diff = 0.0;
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            auto cp = cpu_pm.as_ref().pixel(x, y);
+            auto gp = gpu_pm->as_ref().pixel(x, y);
+            sum_diff += (std::abs(int(cp->red()) - int(gp->red())) +
+                         std::abs(int(cp->green()) - int(gp->green())) +
+                         std::abs(int(cp->blue()) - int(gp->blue())) +
+                         std::abs(int(cp->alpha()) - int(gp->alpha()))) * 0.25;
+        }
+    }
+    const double mean_diff = sum_diff / double(W * H);
+    if (mean_diff >= 2.0) {
+        std::cerr << "  [FAIL] Canvas Phase 4 parity mean_diff=" << mean_diff << std::endl;
+    }
+    assert(mean_diff < 2.0);
+
+    // Framebuffer discard() verification (pending cancel + glInvalidateFramebuffer + fresh draw)
+    gpu.clear(Color::from_rgba8(255, 0, 0, 255));
+    gpu.fill_rect(*Rect::from_xywh(10.0f, 10.0f, 100.0f, 100.0f), Paint(Color::from_rgba8(255, 255, 0, 255)));
+    gpu.discard();
+    gpu.fill_rect(*Rect::from_xywh(0.0f, 0.0f, float(W), float(H)), Paint(Color::from_rgba8(18, 42, 110, 255)));
+    gpu.fill_oval(*Rect::from_xywh(110.0f, 70.0f, 100.0f, 100.0f), Paint(Color::from_rgba8(34, 211, 153, 255)));
+    gpu.flush();
+
+    auto discarded_pm = surf->to_pixmap();
+    assert(discarded_pm.has_value());
+    auto bg_px = discarded_pm->as_ref().pixel(20, 20);
+    auto fg_px = discarded_pm->as_ref().pixel(160, 120);
+    assert(bg_px && bg_px->red() < 30 && bg_px->blue() > 95);
+    assert(fg_px && fg_px->green() > 195 && fg_px->red() < 50);
+
+    std::cout << "  -> Canvas Phase 4 CPU-vs-GPU (GL3) Parity & Discard OK (mean_diff=" << mean_diff << ")" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "Running Nisaba GPU Rendering Pipeline Test Suite" << std::endl;
@@ -4128,9 +4687,13 @@ int main() {
     test_gpu_lottie_phase2_precomp_and_color_effects_parity();
     test_gpu_lottie_phase3_distortion_wipe_and_blur_parity();
     test_gpu_lottie_phase4_expressions_and_text_on_path_parity();
+    test_gpu_canvas_phase1_parity();
+    test_gpu_canvas_phase2_parity();
+    test_gpu_canvas_phase3_parity();
+    test_gpu_canvas_phase4_parity();
 
     std::cout << "========================================" << std::endl;
-    std::cout << "All Nisaba GPU pipeline tests PASSED (39/39)!" << std::endl;
+    std::cout << "All Nisaba GPU pipeline tests PASSED (43/43)!" << std::endl;
     std::cout << "========================================" << std::endl;
 
     return 0;

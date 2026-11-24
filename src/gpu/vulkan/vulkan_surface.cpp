@@ -40,6 +40,10 @@ void VulkanSurface::cleanup() {
         vkDestroyRenderPass(dev, render_pass_load_, nullptr);
         render_pass_load_ = VK_NULL_HANDLE;
     }
+    if (render_pass_dont_care_ != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(dev, render_pass_dont_care_, nullptr);
+        render_pass_dont_care_ = VK_NULL_HANDLE;
+    }
 
     if (depth_stencil_view_ != VK_NULL_HANDLE) {
         vkDestroyImageView(dev, depth_stencil_view_, nullptr);
@@ -307,6 +311,27 @@ bool VulkanSurface::init_surface() {
         render_pass_load_ = VK_NULL_HANDLE;
     }
 
+    // Create Discard / DONT_CARE Render Pass for tile-based GPU framebuffer discard hints.
+    // Color/depth loadOp is DONT_CARE to skip tile memory readback; stencil still clears to 0
+    // so stencil-and-cover vector paths operate with a clean stencil plane.
+    std::vector<VkAttachmentDescription> attachments_dc = attachments;
+    if (sample_count != VK_SAMPLE_COUNT_1_BIT) {
+        attachments_dc[0].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments_dc[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments_dc[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachments_dc[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    } else {
+        attachments_dc[0].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments_dc[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments_dc[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    }
+
+    VkRenderPassCreateInfo rp_info_dc = rp_info;
+    rp_info_dc.pAttachments = attachments_dc.data();
+    if (vkCreateRenderPass(dev, &rp_info_dc, nullptr, &render_pass_dont_care_) != VK_SUCCESS) {
+        render_pass_dont_care_ = VK_NULL_HANDLE;
+    }
+
     // 5. Create Framebuffer
     VkFramebufferCreateInfo fb_info{};
     fb_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
@@ -398,11 +423,15 @@ std::shared_ptr<VulkanSurface> VulkanSurface::create(
     return surf;
 }
 
-void VulkanSurface::begin_render_pass(nisaba::Color clear_color, bool load_previous) {
+void VulkanSurface::begin_render_pass(nisaba::Color clear_color, bool load_previous, bool dont_care) {
     if (in_render_pass_) return;
 
-    bool use_load = load_previous || preserve_contents_;
-    VkRenderPass pass_to_use = (use_load && render_pass_load_ != VK_NULL_HANDLE) ? render_pass_load_ : render_pass_;
+    VkRenderPass pass_to_use = render_pass_;
+    if (dont_care && render_pass_dont_care_ != VK_NULL_HANDLE) {
+        pass_to_use = render_pass_dont_care_;
+    } else if ((load_previous || preserve_contents_) && render_pass_load_ != VK_NULL_HANDLE) {
+        pass_to_use = render_pass_load_;
+    }
 
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -446,7 +475,12 @@ void VulkanSurface::end_render_pass() {
 
 void VulkanSurface::bind() {
     if (!in_render_pass_) {
-        begin_render_pass(nisaba::Color::TRANSPARENT, preserve_contents_);
+        if (discarded_) {
+            discarded_ = false;
+            begin_render_pass(nisaba::Color::TRANSPARENT, false, true);
+        } else {
+            begin_render_pass(nisaba::Color::TRANSPARENT, preserve_contents_, false);
+        }
     }
 }
 
@@ -456,9 +490,20 @@ void VulkanSurface::resolve() {
     }
 }
 
+void VulkanSurface::discard() {
+    if (in_render_pass_) {
+        if (command_buffer_ != VK_NULL_HANDLE) {
+            vkResetCommandBuffer(command_buffer_, 0);
+        }
+        in_render_pass_ = false;
+    }
+    discarded_ = true;
+}
+
 void VulkanSurface::clear(nisaba::Color color) {
+    discarded_ = false;
     if (!in_render_pass_) {
-        begin_render_pass(color, false);
+        begin_render_pass(color, false, false);
         return;
     }
 

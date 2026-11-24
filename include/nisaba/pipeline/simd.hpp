@@ -1051,8 +1051,8 @@ inline void multiply_mask_spans(uint8_t* dst, const uint8_t* src, size_t count) 
         __m256i res_lo = _mm256_srli_epi16(_mm256_add_epi16(prod_lo, _mm256_srli_epi16(prod_lo, 8)), 8);
         __m256i res_hi = _mm256_srli_epi16(_mm256_add_epi16(prod_hi, _mm256_srli_epi16(prod_hi, 8)), 8);
 
+        // unpacklo/unpackhi + packus_epi16 already preserves exact [0..15 | 16..31] byte order in-lane.
         __m256i res = _mm256_packus_epi16(res_lo, res_hi);
-        res = _mm256_permute4x64_epi64(res, _MM_SHUFFLE(3, 1, 2, 0));
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), res);
     }
 #elif defined(NISABA_HAS_SSE2)
@@ -1123,8 +1123,8 @@ inline void multiply_mask_spans_2(
         __m256i res_lo = _mm256_srli_epi16(_mm256_add_epi16(prod_lo, _mm256_srli_epi16(prod_lo, 8)), 8);
         __m256i res_hi = _mm256_srli_epi16(_mm256_add_epi16(prod_hi, _mm256_srli_epi16(prod_hi, 8)), 8);
 
+        // unpacklo/unpackhi + packus_epi16 already preserves exact [0..15 | 16..31] byte order in-lane.
         __m256i res = _mm256_packus_epi16(res_lo, res_hi);
-        res = _mm256_permute4x64_epi64(res, _MM_SHUFFLE(3, 1, 2, 0));
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), res);
     }
 #elif defined(NISABA_HAS_SSE2)

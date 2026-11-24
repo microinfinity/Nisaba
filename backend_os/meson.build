@@ -187,3 +187,16 @@ nisaba_backend_os_dep = declare_dependency(
   dependencies : backend_os_deps,
   compile_args : backend_os_args,
 )
+
+# Headers installation
+install_subdir('include/nisaba/backend_os', install_dir : get_option('includedir') / 'nisaba')
+
+# Pkg-config generation
+pkg.generate(
+  nisaba_backend_os_lib,
+  name : 'nisaba_backend_os',
+  description : 'Nisaba Native OS Backend Subsystem',
+  version : meson.project_version(),
+  subdirs : 'nisaba',
+  extra_cflags : backend_os_args,
+)

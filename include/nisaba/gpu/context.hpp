@@ -8,6 +8,7 @@
 #include "nisaba/text/font_system.hpp"
 #include "nisaba/text/buffer.hpp"
 #include "nisaba/text/glyph_cache.hpp"
+#include "nisaba/text/text_blob.hpp"
 #include <unordered_map>
 #include <string>
 
@@ -89,7 +90,7 @@ public:
 	void resetScissor();
 
 	// Stencil Vector Clipping
-	void clipPath(const nisaba::Path& p, Winding winding = Winding::CounterClockwise);
+	void clipPath(const nisaba::Path& p, Winding winding = Winding::CounterClockwise, bool isDifference = false);
 	void restoreClip(int targetDepth);
 	void resetClip();
 	[[nodiscard]] int clipDepth() const noexcept;
@@ -162,6 +163,22 @@ public:
 
 	float text(float x, float y, const char* string, const char* end = nullptr);
 	float textWithFont(float x, float y, const text::TtfFont& font, float fontSize, const char* string, const char* end = nullptr);
+	/// Batches positioned glyph IDs in a single GPU glyph-atlas draw call.
+	void drawGlyphsPos(
+		std::span<const uint16_t> glyphIds,
+		std::span<const nisaba::Point> positions,
+		const text::TtfFont& font,
+		float fontSize
+	);
+	/// Batches RSXform-transformed glyph IDs (rotation + uniform scale + translation) in a single GPU glyph-atlas draw call.
+	void drawGlyphsRSXform(
+		std::span<const uint16_t> glyphIds,
+		std::span<const nisaba::RSXform> xforms,
+		const text::TtfFont& font,
+		float fontSize
+	);
+	/// Replays an immutable TextBlob via retained GPU quad cache when under pure translation, or batched atlas runs.
+	void drawTextBlob(const nisaba::TextBlob& blob, float x, float y);
 	/// Draws a text::Buffer on GPU. passMask bits: 0x01=solid backgrounds, 0x02=shadows, 0x04=solid glyphs, 0x08=decorations.
 	void drawTextBuffer(
 		const text::Buffer& buffer,
@@ -240,6 +257,15 @@ private:
 	mutable std::vector<RenderPath> m_renderPaths;
 	mutable std::vector<Vertex> m_textVertices;
 	mutable std::vector<MeasuredGlyph> m_measuredGlyphs;
+
+	struct CachedTextBlobGpu {
+		uint32_t blobId{0};
+		uint64_t atlasGen{0};
+		text::SubpixelBin oxBin{text::SubpixelBin::Zero};
+		text::SubpixelBin oyBin{text::SubpixelBin::Zero};
+		std::vector<Vertex> relVerts{};
+	};
+	mutable std::vector<CachedTextBlobGpu> m_textBlobCache;
 	bool m_singleCircle{false};
 	float m_circleCx{0.0f};
 	float m_circleCy{0.0f};

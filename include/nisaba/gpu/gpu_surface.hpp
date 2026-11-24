@@ -59,6 +59,8 @@ public:
     virtual void resolve(const ScreenIntRect& damage_rect);
     virtual void resolve(const std::vector<ScreenIntRect>& damage_rects);
     virtual void clear(nisaba::Color color);
+    /// Discards framebuffer attachment contents (glInvalidateFramebuffer / Vulkan DONT_CARE) to avoid tile load/store.
+    virtual void discard();
 
     /// Damage tracking and frame preservation
     virtual void set_preserve_contents(bool preserve) { preserve_contents_ = preserve; }

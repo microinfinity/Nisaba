@@ -46,7 +46,7 @@ public:
 	                     float fringe, int shaderType = 3) override;
 
 	void renderClip(const RenderPath* paths, int npaths, Winding winding, int targetDepth,
-	                const Scissor& scissor, const float* bounds) override;
+	                const Scissor& scissor, const float* bounds, bool isDifference = false) override;
 	void restoreClip(int targetDepth) override;
 	void resetClip() override;
 	void pushLayer(const LayerDesc& desc, const Scissor& parentScissor, int parentClipDepth) override;

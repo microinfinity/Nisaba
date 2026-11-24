@@ -8,6 +8,8 @@
 
 namespace nisaba {
 
+class Path;
+
 /// A 4x4 projective transformation matrix for 3D spatial orientation,
 /// perspective camera projection, and quad homographies.
 ///
@@ -149,6 +151,42 @@ struct Transform4x4 {
     /// Returns true if this matrix has non-identity perspective row [m12, m13, m14, m15 != (0,0,0,1)].
     bool has_perspective() const noexcept {
         return m[12] != 0.0f || m[13] != 0.0f || m[14] != 0.0f || m[15] != 1.0f;
+    }
+
+    /// Returns true if transforming 2D planar geometry (z = 0) involves non-affine perspective division.
+    [[nodiscard]] bool is_planar_perspective() const noexcept {
+        return std::abs(m[12]) > 1e-7f || std::abs(m[13]) > 1e-7f || std::abs(m[15] - 1.0f) > 1e-7f;
+    }
+
+    /// Returns true if this matrix is identically a 2D affine matrix (no Z or perspective terms).
+    [[nodiscard]] bool is_2d_affine() const noexcept {
+        return m[2] == 0.0f && m[6] == 0.0f &&
+               m[8] == 0.0f && m[9] == 0.0f && m[10] == 1.0f && m[11] == 0.0f &&
+               m[12] == 0.0f && m[13] == 0.0f && m[14] == 0.0f && m[15] == 1.0f;
+    }
+
+    /// Extracts the 2D planar affine transform (exact when !is_planar_perspective()).
+    [[nodiscard]] Transform to_transform_2d() const noexcept {
+        if (std::abs(m[12]) <= 1e-7f && std::abs(m[13]) <= 1e-7f && std::abs(m[15]) > 1e-7f && m[15] != 1.0f) {
+            const float inv_w = 1.0f / m[15];
+            return Transform::from_row(m[0] * inv_w, m[4] * inv_w, m[1] * inv_w, m[5] * inv_w, m[3] * inv_w, m[7] * inv_w);
+        }
+        return Transform::from_row(m[0], m[4], m[1], m[5], m[3], m[7]);
+    }
+
+    /// Maps a 2D axis-aligned rectangle through this 4x4 matrix with near-plane clipping (w > 0),
+    /// returning the enclosing projected 2D bounding box.
+    [[nodiscard]] std::optional<Rect> map_rect(const Rect& rect) const noexcept;
+
+    /// Projects a 2D vector Path through this 4x4 projective matrix with adaptive curve flattening
+    /// and near-plane clipping against w >= eps.
+    [[nodiscard]] Path project_path(const Path& path, float flatness_tol = 0.5f) const;
+
+    constexpr bool operator==(const Transform4x4& o) const noexcept {
+        return m == o.m;
+    }
+    constexpr bool operator!=(const Transform4x4& o) const noexcept {
+        return m != o.m;
     }
 };
 

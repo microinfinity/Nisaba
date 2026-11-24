@@ -89,7 +89,9 @@ enum class ShaderBucket : uint8_t {
 	EffectsFull,
 	ZeroUboSolid,
 	ZeroUboCircle,
-	ZeroUboRect
+	ZeroUboRect,
+	ZeroUboImg,
+	ZeroUboAlpha
 };
 
 struct Call {
@@ -111,6 +113,7 @@ struct Call {
 	int scissorRect[4]{-1, -1, -1, -1};
 	float callBounds[4]{0.0f, 0.0f, 0.0f, 0.0f};
 	int clipDepth{0};
+	bool isDifference{false};
 	Winding winding{Winding::CounterClockwise};
 	Transform2D paintXform{Transform2D::identity()};
 	std::shared_ptr<nisaba::gpu::Shader> customShader{nullptr};
@@ -283,6 +286,8 @@ struct GL3Renderer::Impl {
 	GLShader solidVertShader;
 	GLShader circleVertShader;
 	GLShader rectVertShader;
+	GLShader imgVertShader;
+	GLShader alphaVertShader;
 	GLuint activeProg{0};
 	float view[2]{0.0f, 0.0f};
 
@@ -869,7 +874,9 @@ struct GL3Renderer::Impl {
 	static constexpr bool bucketUsesZeroUbo(ShaderBucket b) noexcept {
 		return b == ShaderBucket::ZeroUboSolid ||
 		       b == ShaderBucket::ZeroUboCircle ||
-		       b == ShaderBucket::ZeroUboRect;
+		       b == ShaderBucket::ZeroUboRect ||
+		       b == ShaderBucket::ZeroUboImg ||
+		       b == ShaderBucket::ZeroUboAlpha;
 	}
 
 	static constexpr bool bucketNeedsFullUbo(ShaderBucket b) noexcept {
@@ -999,6 +1006,14 @@ struct GL3Renderer::Impl {
 				return;
 			case ShaderBucket::ZeroUboRect:
 				useProgramCached(rectVertShader.prog);
+				return;
+			case ShaderBucket::ZeroUboImg:
+				useProgramCached(imgVertShader.prog);
+				bindImageTexture(image);
+				return;
+			case ShaderBucket::ZeroUboAlpha:
+				useProgramCached(alphaVertShader.prog);
+				bindImageTexture(image);
 				return;
 			default:
 				break;
@@ -1553,27 +1568,60 @@ struct GL3Renderer::Impl {
 		glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
 		glDepthMask(GL_FALSE);
 
-		stencilMask(0x0f);
-		stencilFunc(GL_EQUAL, prevDepthVal, 0xf0);
-
 		if (simpleShader.prog != 0) useProgramCached(simpleShader.prog);
 		checkGLError(flags, "clip path");
 
-		if (call.winding == Winding::Clockwise) {
-			glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT);
+		if (call.isDifference) {
+			// Step 1: Mark all currently-visible pixels (upper == prevDepthVal) with lower = 0x01
+			stencilMask(0x0f);
+			stencilFunc(GL_EQUAL, prevDepthVal | 0x01, 0xf0);
+			glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+			glDrawArrays(GL_TRIANGLE_STRIP, baseVertOffset + call.triangleOffset, 4);
+
+			// Step 2: Promote marked pixels (lower != 0) to newDepthVal | 0x00
+			stencilMask(0xff);
+			stencilFunc(GL_NOTEQUAL, newDepthVal, 0x0f);
+			glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+			glDrawArrays(GL_TRIANGLE_STRIP, baseVertOffset + call.triangleOffset, 4);
+
+			// Step 3: Accumulate cutout path winding into 0x0f where upper == newDepthVal
+			stencilMask(0x0f);
+			stencilFunc(GL_EQUAL, newDepthVal, 0xf0);
+			if (call.winding == Winding::Clockwise) {
+				glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT);
+			} else {
+				glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
+				glStencilOpSeparate(GL_BACK, GL_KEEP, GL_KEEP, GL_DECR_WRAP);
+			}
+			for (int i = 0; i < npaths; i++) {
+				glDrawArrays(GL_TRIANGLE_FAN, baseVertOffset + callPaths[i].fillOffset, callPaths[i].fillCount);
+			}
+
+			// Step 4: Demote pixels inside cutout (lower != 0) back to prevDepthVal | 0x00
+			stencilMask(0xff);
+			stencilFunc(GL_NOTEQUAL, prevDepthVal, 0x0f);
+			glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+			glDrawArrays(GL_TRIANGLE_STRIP, baseVertOffset + call.triangleOffset + 4, 4);
 		} else {
-			glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
-			glStencilOpSeparate(GL_BACK, GL_KEEP, GL_KEEP, GL_DECR_WRAP);
-		}
+			stencilMask(0x0f);
+			stencilFunc(GL_EQUAL, prevDepthVal, 0xf0);
 
-		for (int i = 0; i < npaths; i++) {
-			glDrawArrays(GL_TRIANGLE_FAN, baseVertOffset + callPaths[i].fillOffset, callPaths[i].fillCount);
-		}
+			if (call.winding == Winding::Clockwise) {
+				glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT);
+			} else {
+				glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
+				glStencilOpSeparate(GL_BACK, GL_KEEP, GL_KEEP, GL_DECR_WRAP);
+			}
 
-		stencilMask(0xff);
-		stencilFunc(GL_NOTEQUAL, newDepthVal, 0x0f);
-		glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
-		glDrawArrays(GL_TRIANGLE_STRIP, baseVertOffset + call.triangleOffset, call.triangleCount);
+			for (int i = 0; i < npaths; i++) {
+				glDrawArrays(GL_TRIANGLE_FAN, baseVertOffset + callPaths[i].fillOffset, callPaths[i].fillCount);
+			}
+
+			stencilMask(0xff);
+			stencilFunc(GL_NOTEQUAL, newDepthVal, 0x0f);
+			glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+			glDrawArrays(GL_TRIANGLE_STRIP, baseVertOffset + call.triangleOffset, call.triangleCount);
+		}
 
 		activeClipDepth = call.clipDepth;
 		glEnable(GL_CULL_FACE);
@@ -3142,6 +3190,23 @@ bool GL3Renderer::init() {
 		"	float alpha = min(1.0, 1.0 - abs(ftcoord.x * 2.0 - 1.0)) * min(1.0, ftcoord.y);\n"
 		"	outColor = fcolor * alpha;\n"
 		"}\n";
+	static const char* imgVertFragShader =
+		"uniform sampler2D tex;\n"
+		"in vec2 ftcoord;\n"
+		"in vec4 fcolor;\n"
+		"out vec4 outColor;\n"
+		"void main(void) {\n"
+		"	if (ftcoord.x < -1024.0) { outColor = fcolor; return; }\n"
+		"	outColor = texture(tex, ftcoord) * fcolor;\n"
+		"}\n";
+	static const char* alphaVertFragShader =
+		"uniform sampler2D tex;\n"
+		"in vec2 ftcoord;\n"
+		"in vec4 fcolor;\n"
+		"out vec4 outColor;\n"
+		"void main(void) {\n"
+		"	outColor = fcolor * texture(tex, ftcoord).r;\n"
+		"}\n";
 	static const char* circleVertFragShader =
 		"in vec2 ftcoord;\n"
 		"in vec4 fcolor;\n"
@@ -4067,19 +4132,23 @@ bool GL3Renderer::init() {
 		"}\n";
 	const std::string imgFrag = fastUboBlock + varyingsTex + varyingsFull + sdfAndScissorGlsl +
 		"void main(void) {\n"
-		"	vec4 color = texture(tex, ftcoord);\n"
 		"	float fragCov = 1.0;\n"
 		"	vec4 fragCol;\n"
-		"	if (texType == 2) {\n"
-		"		fragCov = color.r;\n"
-		"		fragCol = innerCol * fcolor;\n"
-		"	} else if (texType == 3) {\n"
-		"		fragCol = color * innerCol.a;\n"
-		"	} else if (texType == 4) {\n"
-		"		fragCol = outerCol * (color.a * innerCol.a);\n"
+		"	if (ftcoord.x < -1024.0) {\n"
+		"		fragCol = fcolor;\n"
 		"	} else {\n"
-		"		if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
-		"		fragCol = color * innerCol * fcolor;\n"
+		"		vec4 color = texture(tex, ftcoord);\n"
+		"		if (texType == 2) {\n"
+		"			fragCov = color.r;\n"
+		"			fragCol = innerCol * fcolor;\n"
+		"		} else if (texType == 3) {\n"
+		"			fragCol = color * innerCol.a;\n"
+		"		} else if (texType == 4) {\n"
+		"			fragCol = outerCol * (color.a * innerCol.a);\n"
+		"		} else {\n"
+		"			if (texType == 1) color = vec4(color.rgb * color.a, color.a);\n"
+		"			fragCol = color * innerCol * fcolor;\n"
+		"		}\n"
 		"	}\n"
 		"	if (scissorExt.x >= 0.0) fragCov *= evaluate_scissor_clip(fpos);\n"
 		"	outColor = fragCol * fragCov;\n"
@@ -4354,6 +4423,12 @@ bool GL3Renderer::init() {
 	}
 	if (createShader(m_impl->rectVertShader, "rect_vert_shader", shaderHeader, nullptr, fillVertShader, rectVertFragShader)) {
 		finalizeShader(m_impl->rectVertShader, true);
+	}
+	if (createShader(m_impl->imgVertShader, "img_vert_shader", shaderHeader, nullptr, fillVertShader, imgVertFragShader)) {
+		finalizeShader(m_impl->imgVertShader, true);
+	}
+	if (createShader(m_impl->alphaVertShader, "alpha_vert_shader", shaderHeader, nullptr, fillVertShader, alphaVertFragShader)) {
+		finalizeShader(m_impl->alphaVertShader, true);
 	}
 	{
 		static const char* blurVertShader =
@@ -4848,6 +4923,8 @@ void GL3Renderer::shutdown() {
 	deleteShader(m_impl->solidVertShader);
 	deleteShader(m_impl->circleVertShader);
 	deleteShader(m_impl->rectVertShader);
+	deleteShader(m_impl->imgVertShader);
+	deleteShader(m_impl->alphaVertShader);
 	deleteShader(m_impl->blurShader);
 	deleteShader(m_impl->filterBlendShader);
 	deleteShader(m_impl->filterColorShader);
@@ -5131,6 +5208,8 @@ void GL3Renderer::viewport(float width, float height, float devicePixelRatio) {
 		setView(m_impl->solidVertShader);
 		setView(m_impl->circleVertShader);
 		setView(m_impl->rectVertShader);
+		setView(m_impl->imgVertShader);
+		setView(m_impl->alphaVertShader);
 		glUseProgram(0);
 		m_impl->activeProg = 0;
 	}
@@ -5148,7 +5227,7 @@ void GL3Renderer::flush() {
 	if (m_impl->calls.empty()) return;
 
 	// Hardware fast-clear promotion: if the first call is a full-viewport opaque solid quad,
-	// execute hardware glClear(GL_COLOR_BUFFER_BIT) (Intel CCS_E fast-clear metadata) just like Skia!
+	// execute hardware glClear(GL_COLOR_BUFFER_BIT) to trigger GPU fast-clear metadata.
 	size_t firstCallIdx = 0;
 	{
 		const Call& c0 = m_impl->calls[0];
@@ -5837,6 +5916,56 @@ void GL3Renderer::renderTriangles(const Paint& paint, const CompositeOperationSt
 	bool hasHwScissor = m_impl->getHardwareScissor(scissor, hwScissor);
 
 	const bool fastPrefixOnly = !paintUsesFullEffects(paint, blendModeId, shaderType);
+	if (fastPrefixOnly && !programmableBlend && shaderType == 3 && paint.radius > 0.5f &&
+	    paint.image != 0 && paint.customShader == nullptr &&
+	    (hasHwScissor || scissor.extent[0] < -0.5f || scissor.extent[1] < -0.5f)) {
+		if (Texture* tex = m_impl->findTexture(paint.image)) {
+			ShaderBucket zeroBucket = ShaderBucket::FastCore;
+			if (tex->type == TextureType::Alpha && m_impl->alphaVertShader.prog != 0) {
+				zeroBucket = ShaderBucket::ZeroUboAlpha;
+			} else if (tex->type == TextureType::RGBA &&
+			           (tex->flags & ImageFlags::ImagePremultiplied) != 0 &&
+			           m_impl->imgVertShader.prog != 0) {
+				zeroBucket = ShaderBucket::ZeroUboImg;
+			}
+			if (zeroBucket != ShaderBucket::FastCore) {
+				FragUniforms dummyFrag{};
+				if (Call* last = m_impl->findCoalescableTrianglesCall(zeroBucket, paint.image, paint.customShader, paint.xform,
+				                                                      blend, hasHwScissor, hwScissor, false, dummyFrag)) {
+					int offset = static_cast<int>(m_impl->verts.size());
+					m_impl->verts.resize(offset + nverts);
+					std::memcpy(&m_impl->verts[offset], verts, nverts * sizeof(Vertex));
+					last->triangleCount += nverts;
+					return;
+				}
+				Call call;
+				call.type = CallType::Triangles;
+				call.bucket = zeroBucket;
+				call.clipDepth = m_impl->currentClipDepth;
+				call.image = paint.image;
+				call.paintXform = paint.xform;
+				call.blendFunc = blend;
+				call.programmableBlend = false;
+				call.triangleOffset = static_cast<int>(m_impl->verts.size());
+				call.triangleCount = nverts;
+				call.uniformOffset = -1;
+				call.uniformStride = 0;
+				if (hasHwScissor) {
+					call.scissorRect[0] = hwScissor[0];
+					call.scissorRect[1] = hwScissor[1];
+					call.scissorRect[2] = hwScissor[2];
+					call.scissorRect[3] = hwScissor[3];
+				} else {
+					call.scissorRect[0] = -1;
+				}
+				m_impl->verts.resize(call.triangleOffset + nverts);
+				std::memcpy(&m_impl->verts[call.triangleOffset], verts, nverts * sizeof(Vertex));
+				m_impl->calls.push_back(call);
+				return;
+			}
+		}
+	}
+
 	FragUniforms tempFrag;
 	applyTriangleShaderUniforms(&tempFrag, paint, scissor, fringe, hasHwScissor, blendModeId,
 	                            shaderType, [this](int id) { return m_impl->lookupTextureInfo(id); },
@@ -5883,7 +6012,7 @@ void GL3Renderer::renderTriangles(const Paint& paint, const CompositeOperationSt
 }
 
 void GL3Renderer::renderClip(const RenderPath* paths, int npaths, Winding winding, int targetDepth,
-                             const Scissor& scissor, const float* bounds) {
+                             const Scissor& scissor, const float* bounds, bool isDifference) {
 	if (npaths <= 0 || paths == nullptr || m_impl->fragSize <= 0) return;
 
 	int hwScissor[4]{-1, -1, -1, -1};
@@ -5893,6 +6022,7 @@ void GL3Renderer::renderClip(const RenderPath* paths, int npaths, Winding windin
 	call.type = CallType::Clip;
 	call.bucket = ShaderBucket::SimpleColor;
 	call.clipDepth = targetDepth;
+	call.isDifference = isDifference;
 	call.winding = winding;
 	call.blendFunc = Blend{GL_ONE, GL_ZERO, GL_ONE, GL_ZERO};
 	if (hasHwScissor) {
@@ -5908,7 +6038,8 @@ void GL3Renderer::renderClip(const RenderPath* paths, int npaths, Winding windin
 	call.pathCount = npaths;
 	m_impl->paths.resize(call.pathOffset + npaths);
 
-	int maxverts = 4; // cover quad
+	const int quadVerts = isDifference ? 8 : 4;
+	int maxverts = quadVerts; // cover quad(s)
 	for (int i = 0; i < npaths; i++) {
 		maxverts += paths[i].fillCount;
 	}
@@ -5930,18 +6061,32 @@ void GL3Renderer::renderClip(const RenderPath* paths, int npaths, Winding windin
 	}
 
 	call.triangleOffset = curOffset;
-	call.triangleCount = 4;
+	call.triangleCount = quadVerts;
 	Vertex* quad = &m_impl->verts[curOffset];
 	float minX = bounds ? bounds[0] : 0.0f;
 	float minY = bounds ? bounds[1] : 0.0f;
 	float maxX = bounds ? bounds[2] : m_impl->view[0];
 	float maxY = bounds ? bounds[3] : m_impl->view[1];
 
-	quad[0] = Vertex(maxX, maxY, 0.5f, 1.0f);
-	quad[1] = Vertex(maxX, minY, 0.5f, 1.0f);
-	quad[2] = Vertex(minX, maxY, 0.5f, 1.0f);
-	quad[3] = Vertex(minX, minY, 0.5f, 1.0f);
-	curOffset += 4;
+	if (isDifference) {
+		// Quads [0..3]: full viewport cover for promote pass
+		quad[0] = Vertex(m_impl->view[0], m_impl->view[1], 0.5f, 1.0f);
+		quad[1] = Vertex(m_impl->view[0], 0.0f, 0.5f, 1.0f);
+		quad[2] = Vertex(0.0f, m_impl->view[1], 0.5f, 1.0f);
+		quad[3] = Vertex(0.0f, 0.0f, 0.5f, 1.0f);
+		// Quads [4..7]: path bounds cover for cutout demote pass
+		quad[4] = Vertex(maxX, maxY, 0.5f, 1.0f);
+		quad[5] = Vertex(maxX, minY, 0.5f, 1.0f);
+		quad[6] = Vertex(minX, maxY, 0.5f, 1.0f);
+		quad[7] = Vertex(minX, minY, 0.5f, 1.0f);
+		curOffset += 8;
+	} else {
+		quad[0] = Vertex(maxX, maxY, 0.5f, 1.0f);
+		quad[1] = Vertex(maxX, minY, 0.5f, 1.0f);
+		quad[2] = Vertex(minX, maxY, 0.5f, 1.0f);
+		quad[3] = Vertex(minX, minY, 0.5f, 1.0f);
+		curOffset += 4;
+	}
 
 	FragUniforms clipFrag{};
 	clipFrag.strokeThr = -1.0f;

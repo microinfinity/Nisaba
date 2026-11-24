@@ -1,6 +1,10 @@
 #include "nisaba/math/transform4x4.hpp"
+#include "nisaba/path/path.hpp"
+#include "nisaba/path/path_builder.hpp"
+#include <algorithm>
 #include <cmath>
 #include <numbers>
+#include <vector>
 
 namespace nisaba {
 
@@ -227,6 +231,259 @@ std::optional<Transform4x4> Transform4x4::from_rect_to_quad(
         0.0f, 0.0f, 1.0f, 0.0f,
         h20,  h21,  0.0f, h22
     );
+}
+
+namespace {
+
+struct HomogPt {
+    float x{0.0f};
+    float y{0.0f};
+    float w{1.0f};
+};
+
+inline HomogPt map_homog(const Transform4x4& t, Point p) noexcept {
+    return HomogPt{
+        t.m[0] * p.x + t.m[1] * p.y + t.m[3],
+        t.m[4] * p.x + t.m[5] * p.y + t.m[7],
+        t.m[12] * p.x + t.m[13] * p.y + t.m[15]
+    };
+}
+
+constexpr float kNearW = 1e-4f;
+
+// Sutherland-Hodgman clip of a homogeneous polygon against w >= kNearW
+void clip_homog_poly(const std::vector<HomogPt>& in, std::vector<Point>& out) {
+    out.clear();
+    if (in.empty()) return;
+    const size_t n = in.size();
+    for (size_t i = 0; i < n; ++i) {
+        const HomogPt& a = in[i];
+        const HomogPt& b = in[(i + 1) % n];
+        const bool a_in = (a.w >= kNearW);
+        const bool b_in = (b.w >= kNearW);
+        if (a_in && b_in) {
+            out.emplace_back(b.x / b.w, b.y / b.w);
+        } else if (a_in && !b_in) {
+            const float t = (kNearW - a.w) / (b.w - a.w);
+            const float x = a.x + t * (b.x - a.x);
+            const float y = a.y + t * (b.y - a.y);
+            out.emplace_back(x / kNearW, y / kNearW);
+        } else if (!a_in && b_in) {
+            const float t = (kNearW - a.w) / (b.w - a.w);
+            const float x = a.x + t * (b.x - a.x);
+            const float y = a.y + t * (b.y - a.y);
+            out.emplace_back(x / kNearW, y / kNearW);
+            out.emplace_back(b.x / b.w, b.y / b.w);
+        }
+    }
+}
+
+void flatten_quad_proj(
+    const Transform4x4& t,
+    Point p0, Point p1, Point p2,
+    float tol_sq,
+    int depth,
+    std::vector<HomogPt>& out
+) {
+    const HomogPt h0 = map_homog(t, p0);
+    const HomogPt h1 = map_homog(t, p1);
+    const HomogPt h2 = map_homog(t, p2);
+    if (depth < 8 && h0.w >= kNearW && h1.w >= kNearW && h2.w >= kNearW) {
+        const Point s0(h0.x / h0.w, h0.y / h0.w);
+        const Point s2(h2.x / h2.w, h2.y / h2.w);
+        const Point mid_local(0.25f * p0.x + 0.5f * p1.x + 0.25f * p2.x,
+                              0.25f * p0.y + 0.5f * p1.y + 0.25f * p2.y);
+        const HomogPt hm = map_homog(t, mid_local);
+        if (hm.w >= kNearW) {
+            const Point sm(hm.x / hm.w, hm.y / hm.w);
+            const float mx = 0.5f * (s0.x + s2.x);
+            const float my = 0.5f * (s0.y + s2.y);
+            const float dx = sm.x - mx;
+            const float dy = sm.y - my;
+            if (dx * dx + dy * dy > tol_sq) {
+                const Point q01(0.5f * (p0.x + p1.x), 0.5f * (p0.y + p1.y));
+                const Point q12(0.5f * (p1.x + p2.x), 0.5f * (p1.y + p2.y));
+                const Point m(0.5f * (q01.x + q12.x), 0.5f * (q01.y + q12.y));
+                flatten_quad_proj(t, p0, q01, m, tol_sq, depth + 1, out);
+                flatten_quad_proj(t, m, q12, p2, tol_sq, depth + 1, out);
+                return;
+            }
+        }
+    }
+    out.push_back(h2);
+}
+
+void flatten_cubic_proj(
+    const Transform4x4& t,
+    Point p0, Point p1, Point p2, Point p3,
+    float tol_sq,
+    int depth,
+    std::vector<HomogPt>& out
+) {
+    const HomogPt h0 = map_homog(t, p0);
+    const HomogPt h3 = map_homog(t, p3);
+    if (depth < 8 && h0.w >= kNearW && h3.w >= kNearW) {
+        const Point s0(h0.x / h0.w, h0.y / h0.w);
+        const Point s3(h3.x / h3.w, h3.y / h3.w);
+        const Point m01(0.5f * (p0.x + p1.x), 0.5f * (p0.y + p1.y));
+        const Point m12(0.5f * (p1.x + p2.x), 0.5f * (p1.y + p2.y));
+        const Point m23(0.5f * (p2.x + p3.x), 0.5f * (p2.y + p3.y));
+        const Point m012(0.5f * (m01.x + m12.x), 0.5f * (m01.y + m12.y));
+        const Point m123(0.5f * (m12.x + m23.x), 0.5f * (m12.y + m23.y));
+        const Point mid(0.5f * (m012.x + m123.x), 0.5f * (m012.y + m123.y));
+
+        const HomogPt hm = map_homog(t, mid);
+        const HomogPt h1 = map_homog(t, p1);
+        const HomogPt h2 = map_homog(t, p2);
+        bool need_subdiv = (hm.w < kNearW || h1.w < kNearW || h2.w < kNearW);
+        if (!need_subdiv) {
+            const float dx = s3.x - s0.x;
+            const float dy = s3.y - s0.y;
+            const float len_sq = dx * dx + dy * dy;
+            auto dist_to_seg_sq = [&](Point q) -> float {
+                if (len_sq < 1e-8f) {
+                    const float ex = q.x - s0.x;
+                    const float ey = q.y - s0.y;
+                    return ex * ex + ey * ey;
+                }
+                const float cross = (q.x - s0.x) * dy - (q.y - s0.y) * dx;
+                return (cross * cross) / len_sq;
+            };
+            const Point s1(h1.x / h1.w, h1.y / h1.w);
+            const Point s2(h2.x / h2.w, h2.y / h2.w);
+            const Point sm(hm.x / hm.w, hm.y / hm.w);
+            const float dmax = std::max({dist_to_seg_sq(s1), dist_to_seg_sq(s2), dist_to_seg_sq(sm)});
+            need_subdiv = (dmax > tol_sq);
+        }
+        if (need_subdiv) {
+            flatten_cubic_proj(t, p0, m01, m012, mid, tol_sq, depth + 1, out);
+            flatten_cubic_proj(t, mid, m123, m23, p3, tol_sq, depth + 1, out);
+            return;
+        }
+    }
+    out.push_back(h3);
+}
+
+} // namespace
+
+std::optional<Rect> Transform4x4::map_rect(const Rect& rect) const noexcept {
+    if (!is_planar_perspective()) {
+        return rect.transform(to_transform_2d());
+    }
+    const std::vector<HomogPt> quad = {
+        map_homog(*this, Point::from_xy(rect.left(), rect.top())),
+        map_homog(*this, Point::from_xy(rect.right(), rect.top())),
+        map_homog(*this, Point::from_xy(rect.right(), rect.bottom())),
+        map_homog(*this, Point::from_xy(rect.left(), rect.bottom()))
+    };
+    std::vector<Point> clipped;
+    clipped.reserve(6);
+    clip_homog_poly(quad, clipped);
+    if (clipped.empty()) return std::nullopt;
+    return Rect::from_points(clipped.data(), clipped.size());
+}
+
+Path Transform4x4::project_path(const Path& path, float flatness_tol) const {
+    if (path.is_empty()) return Path();
+    if (!is_planar_perspective()) {
+        auto tr = path.transform(to_transform_2d());
+        return tr ? std::move(*tr) : Path();
+    }
+
+    const float tol = std::max(0.1f, flatness_tol);
+    const float tol_sq = tol * tol;
+
+    PathBuilder pb;
+    std::vector<HomogPt> contour;
+    std::vector<Point> clipped;
+    bool contour_closed = false;
+
+    auto flush_contour = [&]() {
+        if (contour.empty()) return;
+        if (contour_closed && contour.size() >= 3) {
+            clip_homog_poly(contour, clipped);
+            if (clipped.size() >= 3) {
+                pb.move_to(clipped[0]);
+                for (size_t i = 1; i < clipped.size(); ++i) {
+                    pb.line_to(clipped[i]);
+                }
+                pb.close();
+            }
+        } else if (contour.size() >= 2) {
+            bool pen_down = false;
+            for (size_t i = 0; i + 1 < contour.size(); ++i) {
+                const HomogPt& a = contour[i];
+                const HomogPt& b = contour[i + 1];
+                const bool a_in = (a.w >= kNearW);
+                const bool b_in = (b.w >= kNearW);
+                if (!a_in && !b_in) {
+                    pen_down = false;
+                    continue;
+                }
+                Point pa, pb_pt;
+                if (a_in) {
+                    pa = Point(a.x / a.w, a.y / a.w);
+                } else {
+                    const float t = (kNearW - a.w) / (b.w - a.w);
+                    pa = Point((a.x + t * (b.x - a.x)) / kNearW, (a.y + t * (b.y - a.y)) / kNearW);
+                    pen_down = false;
+                }
+                if (b_in) {
+                    pb_pt = Point(b.x / b.w, b.y / b.w);
+                } else {
+                    const float t = (kNearW - a.w) / (b.w - a.w);
+                    pb_pt = Point((a.x + t * (b.x - a.x)) / kNearW, (a.y + t * (b.y - a.y)) / kNearW);
+                }
+                if (!pen_down) {
+                    pb.move_to(pa);
+                    pen_down = true;
+                }
+                pb.line_to(pb_pt);
+                if (!b_in) pen_down = false;
+            }
+        }
+        contour.clear();
+        contour_closed = false;
+    };
+
+    Point cur_pt(0.0f, 0.0f);
+    Point start_pt(0.0f, 0.0f);
+    auto iter = path.segments();
+    while (auto seg_opt = iter.next()) {
+        const auto& seg = *seg_opt;
+        switch (seg.type) {
+            case PathSegment::Type::MoveTo:
+                flush_contour();
+                cur_pt = seg.p0;
+                start_pt = seg.p0;
+                contour.push_back(map_homog(*this, seg.p0));
+                break;
+            case PathSegment::Type::LineTo:
+                if (contour.empty()) contour.push_back(map_homog(*this, cur_pt));
+                contour.push_back(map_homog(*this, seg.p0));
+                cur_pt = seg.p0;
+                break;
+            case PathSegment::Type::QuadTo:
+                if (contour.empty()) contour.push_back(map_homog(*this, cur_pt));
+                flatten_quad_proj(*this, cur_pt, seg.p0, seg.p1, tol_sq, 0, contour);
+                cur_pt = seg.p1;
+                break;
+            case PathSegment::Type::CubicTo:
+                if (contour.empty()) contour.push_back(map_homog(*this, cur_pt));
+                flatten_cubic_proj(*this, cur_pt, seg.p0, seg.p1, seg.p2, tol_sq, 0, contour);
+                cur_pt = seg.p2;
+                break;
+            case PathSegment::Type::Close:
+                contour_closed = true;
+                cur_pt = start_pt;
+                flush_contour();
+                break;
+        }
+    }
+    flush_contour();
+
+    auto finished = pb.finish();
+    return finished ? std::move(*finished) : Path();
 }
 
 } // namespace nisaba

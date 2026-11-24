@@ -43,6 +43,12 @@ showcase_effects_advanced_exe = executable('showcase_effects_advanced',
   dependencies : showcase_effects_adv_deps
 )
 
+showcase_canvas_parity_exe = executable('showcase_canvas_parity',
+  'showcase_canvas_parity.cpp',
+  cpp_args : showcase_effects_adv_args,
+  dependencies : showcase_effects_adv_deps
+)
+
 showcase_svg_exe = executable('showcase_svg',
   'showcase_svg.cpp',
   dependencies : nisaba_dep

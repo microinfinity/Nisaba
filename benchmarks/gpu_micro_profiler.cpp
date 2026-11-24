@@ -27,6 +27,12 @@
 #include "include/core/SkColorFilter.h"
 #include "include/core/SkVertices.h"
 #include "include/core/SkM44.h"
+#include "include/core/SkRSXform.h"
+#include "include/core/SkPicture.h"
+#include "include/core/SkPictureRecorder.h"
+#include "include/core/SkRegion.h"
+#include "include/core/SkDrawable.h"
+#include "include/core/SkTextBlob.h"
 #include "include/core/SkSamplingOptions.h"
 #include "include/effects/SkGradientShader.h"
 #include "include/effects/SkDashPathEffect.h"
@@ -51,6 +57,7 @@ namespace skottie { class PropertyObserver; }
 #include "nisaba/gpu/gpu_device.hpp"
 #include "nisaba/gpu/gpu_surface.hpp"
 #include "nisaba/gpu/gpu_canvas.hpp"
+#include "nisaba/canvas/picture.hpp"
 #include "nisaba/text/paragraph_cache.hpp"
 #include "nisaba/gpu/gpu_texture.hpp"
 #include "nisaba/lottie/animation.hpp"
@@ -5031,6 +5038,445 @@ int main(int argc, char** argv) {
 				}
 			}
 		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Category 11: Canvas Phase 1 Ergonomics, Culling, drawPaint & 9-Slice/Lattice (Suites 135–137)
+	// -------------------------------------------------------------------------
+	{
+		auto uiPm = nisaba::Pixmap::create(32, 32).value();
+		for (uint32_t y = 0; y < 32; ++y) {
+			for (uint32_t x = 0; x < 32; ++x) {
+				bool border = (x < 8 || x >= 24 || y < 8 || y >= 24);
+				nisaba::Color col = border ? nisaba::Color::from_rgba8(64, 156, 255, 255)
+				                           : nisaba::Color::from_rgba8(24, 34, 52, 235);
+				uiPm.set_pixel(x, y, col.premultiply().to_color_u8());
+			}
+		}
+		SkImageInfo uiInfo = SkImageInfo::Make(32, 32, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
+		SkPixmap skUiPm(uiInfo, uiPm.data(), 32 * 4);
+		sk_sp<SkImage> skUiImg = SkImage::MakeRasterCopy(skUiPm)->makeTextureImage(dContext.get());
+
+		auto nGrad = nisaba::LinearGradient::create(
+			nisaba::Point::from_xy(0.0f, 0.0f), nisaba::Point::from_xy(1080.0f, 720.0f),
+			{nisaba::GradientStop::create(0.0f, nisaba::Color::from_rgba8(30, 64, 175, 255)),
+			 nisaba::GradientStop::create(1.0f, nisaba::Color::from_rgba8(14, 165, 233, 255))}).value();
+		const SkPoint skGradPts[2] = {{0.0f, 0.0f}, {1080.0f, 720.0f}};
+		const SkColor skGradCols[2] = {SkColorSetARGB(255, 30, 64, 175), SkColorSetARGB(255, 14, 165, 233)};
+		auto skGradShader = SkGradientShader::MakeLinear(skGradPts, skGradCols, nullptr, 2, SkTileMode::kClamp);
+
+		benchmark_canvas_op("135. Clip Cull + drawPaint Grad (100x)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				const int base = c.save();
+				c.clip_rect(nisaba::Rect::from_xywh(60.0f, 40.0f, 960.0f, 640.0f).value());
+				c.draw_paint(nisaba::Paint(nisaba::Shader(nGrad)));
+				int visible = 0;
+				for (int i = 0; i < 100; ++i) {
+					float rx = -300.0f + i * 18.0f;
+					auto r = nisaba::Rect::from_xywh(rx, 80.0f, 40.0f, 40.0f).value();
+					if (!c.quick_reject(r)) ++visible;
+				}
+				(void)visible;
+				c.restore_to_count(base);
+			},
+			[&](SkCanvas* c) {
+				const int base = c->save();
+				c->clipRect(SkRect::MakeXYWH(60.0f, 40.0f, 960.0f, 640.0f));
+				SkPaint p; p.setShader(skGradShader);
+				c->drawPaint(p);
+				int visible = 0;
+				for (int i = 0; i < 100; ++i) {
+					float rx = -300.0f + i * 18.0f;
+					if (!c->quickReject(SkRect::MakeXYWH(rx, 80.0f, 40.0f, 40.0f))) ++visible;
+				}
+				(void)visible;
+				c->restoreToCount(base);
+			}
+		);
+
+		const nisaba::IntRect nCenter = nisaba::IntRect::from_ltrb(8, 8, 24, 24).value();
+		const SkIRect skCenter = SkIRect::MakeLTRB(8, 8, 24, 24);
+		benchmark_canvas_op("136. 9-Slice UI Panels (24x Nine)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisaba::PixmapPaint pp;
+				pp.quality = nisaba::FilterQuality::Bilinear;
+				for (int i = 0; i < 24; ++i) {
+					float x = 24.0f + (i % 6) * 172.0f;
+					float y = 24.0f + (i / 6) * 168.0f;
+					c.draw_image_nine(uiPm.as_ref(), nCenter, nisaba::Rect::from_xywh(x, y, 156.0f, 148.0f).value(), pp);
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p;
+				for (int i = 0; i < 24; ++i) {
+					float x = 24.0f + (i % 6) * 172.0f;
+					float y = 24.0f + (i / 6) * 168.0f;
+					c->drawImageNine(skUiImg.get(), skCenter, SkRect::MakeXYWH(x, y, 156.0f, 148.0f), SkFilterMode::kLinear, &p);
+				}
+			}
+		);
+
+		const std::array<int32_t, 2> xDivs{8, 24};
+		const std::array<int32_t, 2> yDivs{8, 24};
+		const std::array<nisaba::Lattice::RectType, 9> nTypes{
+			nisaba::Lattice::RectType::Default, nisaba::Lattice::RectType::Default,     nisaba::Lattice::RectType::Default,
+			nisaba::Lattice::RectType::Default, nisaba::Lattice::RectType::Transparent, nisaba::Lattice::RectType::Default,
+			nisaba::Lattice::RectType::Default, nisaba::Lattice::RectType::Default,     nisaba::Lattice::RectType::FixedColor
+		};
+		std::array<nisaba::Color, 9> nCols{};
+		nCols[8] = nisaba::Color::from_rgba8(56, 189, 248, 255);
+		nisaba::Lattice nLat;
+		nLat.x_divs = xDivs; nLat.y_divs = yDivs; nLat.rect_types = nTypes; nLat.colors = nCols;
+
+		const SkCanvas::Lattice::RectType skTypes[9] = {
+			SkCanvas::Lattice::kDefault, SkCanvas::Lattice::kDefault,     SkCanvas::Lattice::kDefault,
+			SkCanvas::Lattice::kDefault, SkCanvas::Lattice::kTransparent, SkCanvas::Lattice::kDefault,
+			SkCanvas::Lattice::kDefault, SkCanvas::Lattice::kDefault,     SkCanvas::Lattice::kFixedColor
+		};
+		SkColor skCols[9] = {};
+		skCols[8] = SkColorSetARGB(255, 56, 189, 248);
+		SkCanvas::Lattice skLat;
+		skLat.fXDivs = xDivs.data(); skLat.fXCount = 2;
+		skLat.fYDivs = yDivs.data(); skLat.fYCount = 2;
+		skLat.fRectTypes = skTypes; skLat.fColors = skCols; skLat.fBounds = nullptr;
+
+		benchmark_canvas_op("137. Lattice Grid Scaling (16x)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisaba::PixmapPaint pp;
+				pp.quality = nisaba::FilterQuality::Bilinear;
+				for (int i = 0; i < 16; ++i) {
+					float x = 40.0f + (i % 4) * 250.0f;
+					float y = 30.0f + (i / 4) * 168.0f;
+					c.draw_image_lattice(uiPm.as_ref(), nLat, nisaba::Rect::from_xywh(x, y, 220.0f, 145.0f).value(), pp);
+				}
+			},
+			[&](SkCanvas* c) {
+				SkPaint p;
+				for (int i = 0; i < 16; ++i) {
+					float x = 40.0f + (i % 4) * 250.0f;
+					float y = 30.0f + (i / 4) * 168.0f;
+					c->drawImageLattice(skUiImg.get(), skLat, SkRect::MakeXYWH(x, y, 220.0f, 145.0f), SkFilterMode::kLinear, &p);
+				}
+			}
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Category 12: Canvas Phase 2 Advanced Clipping, Atlas Batching & Coons Patches (Suites 138–141)
+	// -------------------------------------------------------------------------
+	{
+		benchmark_canvas_op("138. Difference Clipping (8x Cutouts)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				c.save();
+				c.clip_rect(nisaba::Rect::from_xywh(40.0f, 40.0f, 1000.0f, 640.0f).value());
+				for (int i = 0; i < 8; ++i) {
+					float cx = 120.0f + (i % 4) * 240.0f;
+					float cy = 180.0f + (i / 4) * 320.0f;
+					c.clip_oval(nisaba::Rect::from_xywh(cx - 55.0f, cy - 55.0f, 110.0f, 110.0f).value(), nisaba::ClipOp::Difference);
+				}
+				c.draw_color(nisaba::Color::from_rgba8(56, 189, 248, 220));
+				c.restore();
+			},
+			[&](SkCanvas* c) {
+				c->save();
+				c->clipRect(SkRect::MakeXYWH(40.0f, 40.0f, 1000.0f, 640.0f));
+				for (int i = 0; i < 8; ++i) {
+					float cx = 120.0f + (i % 4) * 240.0f;
+					float cy = 180.0f + (i / 4) * 320.0f;
+					SkPath oval;
+					oval.addOval(SkRect::MakeXYWH(cx - 55.0f, cy - 55.0f, 110.0f, 110.0f));
+					c->clipPath(oval, SkClipOp::kDifference, true);
+				}
+				c->drawColor(SkColorSetARGB(220, 56, 189, 248));
+				c->restore();
+			}
+		);
+
+		auto nVignette = nisaba::RadialGradient::create(
+			nisaba::Point::from_xy(540.0f, 360.0f), 320.0f,
+			{nisaba::GradientStop::create(0.0f, nisaba::Color::from_rgba8(255, 255, 255, 255)),
+			 nisaba::GradientStop::create(1.0f, nisaba::Color::from_rgba8(255, 255, 255, 0))}).value();
+		const SkColor skVigCols[2] = {SkColorSetARGB(255, 255, 255, 255), SkColorSetARGB(0, 255, 255, 255)};
+		auto skVignette = SkGradientShader::MakeRadial({540.0f, 360.0f}, 320.0f, skVigCols, nullptr, 2, SkTileMode::kClamp);
+
+		benchmark_canvas_op("139. Shader Clipping (clip_shader Fade)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				c.save();
+				c.clip_shader(nisaba::Shader(nVignette), nisaba::ClipOp::Intersect);
+				c.fill_rect(nisaba::Rect::from_xywh(120.0f, 60.0f, 840.0f, 600.0f).value(),
+				            nisaba::Paint(nisaba::Color::from_rgba8(99, 102, 241, 255)));
+				c.restore();
+			},
+			[&](SkCanvas* c) {
+				c->save();
+				c->clipShader(skVignette, SkClipOp::kIntersect);
+				SkPaint p; p.setColor(SkColorSetARGB(255, 99, 102, 241));
+				c->drawRect(SkRect::MakeXYWH(120.0f, 60.0f, 840.0f, 600.0f), p);
+				c->restore();
+			}
+		);
+
+		auto atlasPm = nisaba::Pixmap::create(64, 64).value();
+		for (uint32_t y = 0; y < 64; ++y) {
+			for (uint32_t x = 0; x < 64; ++x) {
+				uint8_t r = (x < 32) ? 240 : 60;
+				uint8_t g = (y < 32) ? 220 : 120;
+				uint8_t b = ((x ^ y) & 16) ? 240 : 80;
+				atlasPm.set_pixel(x, y, nisaba::Color::from_rgba8(r, g, b, 255).premultiply().to_color_u8());
+			}
+		}
+		SkImageInfo aInfo = SkImageInfo::Make(64, 64, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
+		SkPixmap skAPm(aInfo, atlasPm.data(), 64 * 4);
+		sk_sp<SkImage> skAtlasImg = SkImage::MakeRasterCopy(skAPm)->makeTextureImage(dContext.get());
+
+		std::vector<nisaba::RSXform> nXforms;
+		std::vector<nisaba::Rect> nTexRects;
+		std::vector<nisaba::Color> nColors;
+		std::vector<SkRSXform> sXforms;
+		std::vector<SkRect> sTexRects;
+		std::vector<SkColor> sColors;
+		nXforms.reserve(256); nTexRects.reserve(256); nColors.reserve(256);
+		sXforms.reserve(256); sTexRects.reserve(256); sColors.reserve(256);
+		for (int i = 0; i < 256; ++i) {
+			float tx = 40.0f + (i % 16) * 62.0f;
+			float ty = 30.0f + (i / 16) * 42.0f;
+			float rad = static_cast<float>(i) * 0.15f;
+			float sx = static_cast<float>((i & 1) * 32);
+			float sy = static_cast<float>(((i >> 1) & 1) * 32);
+			nXforms.push_back(nisaba::RSXform::from_radians(1.0f, rad, tx, ty, 16.0f, 16.0f));
+			nTexRects.push_back(nisaba::Rect::from_xywh(sx, sy, 32.0f, 32.0f).value());
+			nColors.push_back(nisaba::Color::from_rgba8(220, 200 + (i % 55), 255, 220));
+			sXforms.push_back(SkRSXform::MakeFromRadians(1.0f, rad, tx, ty, 16.0f, 16.0f));
+			sTexRects.push_back(SkRect::MakeXYWH(sx, sy, 32.0f, 32.0f));
+			sColors.push_back(SkColorSetARGB(220, 220, 200 + (i % 55), 255));
+		}
+
+		benchmark_canvas_op("140. Sprite Atlas Batch (256x RSXform)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				nisaba::PixmapPaint pp;
+				pp.quality = nisaba::FilterQuality::Bilinear;
+				c.draw_atlas(atlasPm.as_ref(), nXforms, nTexRects, nColors, nisaba::BlendMode::Modulate, pp);
+			},
+			[&](SkCanvas* c) {
+				SkPaint p;
+				c->drawAtlas(skAtlasImg.get(), sXforms.data(), sTexRects.data(), sColors.data(),
+				             256, SkBlendMode::kModulate, SkSamplingOptions(SkFilterMode::kLinear), nullptr, &p);
+			}
+		);
+
+		nisaba::GradientMesh nMesh;
+		std::array<std::array<SkPoint, 12>, 4> skCubics{};
+		const SkColor skPatchCols[4] = {
+			SkColorSetARGB(255, 255, 60, 80), SkColorSetARGB(255, 50, 235, 110),
+			SkColorSetARGB(255, 55, 120, 255), SkColorSetARGB(255, 250, 220, 50)
+		};
+		for (int i = 0; i < 4; ++i) {
+			float ox = 60.0f + (i % 2) * 480.0f;
+			float oy = 40.0f + (i / 2) * 320.0f;
+			nisaba::CoonsPatch cp;
+			cp.top[0] = {ox, oy};                 cp.top[1] = {ox + 140, oy - 35};
+			cp.top[2] = {ox + 280, oy + 35};      cp.top[3] = {ox + 420, oy};
+			cp.right[0] = {ox + 420, oy};         cp.right[1] = {ox + 455, oy + 90};
+			cp.right[2] = {ox + 385, oy + 190};   cp.right[3] = {ox + 420, oy + 280};
+			cp.bottom[0] = {ox, oy + 280};        cp.bottom[1] = {ox + 140, oy + 310};
+			cp.bottom[2] = {ox + 280, oy + 250};  cp.bottom[3] = {ox + 420, oy + 280};
+			cp.left[0] = {ox, oy};                cp.left[1] = {ox - 35, oy + 90};
+			cp.left[2] = {ox + 35, oy + 190};     cp.left[3] = {ox, oy + 280};
+			cp.color_top_left = nisaba::Color::from_rgba8(255, 60, 80, 255);
+			cp.color_top_right = nisaba::Color::from_rgba8(50, 235, 110, 255);
+			cp.color_bottom_right = nisaba::Color::from_rgba8(55, 120, 255, 255);
+			cp.color_bottom_left = nisaba::Color::from_rgba8(250, 220, 50, 255);
+			nMesh.add_patch(cp);
+
+			skCubics[i] = {{
+				{cp.top[0].x, cp.top[0].y}, {cp.top[1].x, cp.top[1].y}, {cp.top[2].x, cp.top[2].y},
+				{cp.right[0].x, cp.right[0].y}, {cp.right[1].x, cp.right[1].y}, {cp.right[2].x, cp.right[2].y},
+				{cp.bottom[3].x, cp.bottom[3].y}, {cp.bottom[2].x, cp.bottom[2].y}, {cp.bottom[1].x, cp.bottom[1].y},
+				{cp.left[3].x, cp.left[3].y}, {cp.left[2].x, cp.left[2].y}, {cp.left[1].x, cp.left[1].y}
+			}};
+		}
+
+		benchmark_canvas_op("141. Coons Patch Gradient Mesh (4x)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				c.draw_gradient_mesh(nMesh);
+			},
+			[&](SkCanvas* c) {
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 4; ++i) {
+					c->drawPatch(skCubics[i].data(), skPatchCols, nullptr, SkBlendMode::kDst, p);
+				}
+			}
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Category 13: Canvas Phase 3 Display Lists, 4x4 Matrix Stack & Regions (Suites 142–144)
+	// -------------------------------------------------------------------------
+	{
+		nisaba::PictureRecorder nRec;
+		nisaba::ICanvas& nrc = nRec.begin_recording(nisaba::Rect::from_xywh(0.0f, 0.0f, 240.0f, 160.0f).value());
+		for (int i = 0; i < 6; ++i) {
+			auto r = nisaba::Rect::from_xywh(12.0f + i * 36.0f, 16.0f, 28.0f, 128.0f).value();
+			nrc.fill_rrect(nisaba::RRect::from_rect_and_radius(r, 8.0f),
+			               nisaba::Paint(nisaba::Color::from_rgba8(60 + i * 28, 150, 240 - i * 20, 255)));
+		}
+		auto nPic = nRec.finish_recording();
+
+		SkPictureRecorder sRec;
+		SkCanvas* src = sRec.beginRecording(SkRect::MakeXYWH(0.0f, 0.0f, 240.0f, 160.0f));
+		for (int i = 0; i < 6; ++i) {
+			SkPaint p; p.setAntiAlias(true);
+			p.setColor(SkColorSetARGB(255, 60 + i * 28, 150, 240 - i * 20));
+			src->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(12.0f + i * 36.0f, 16.0f, 28.0f, 128.0f), 8.0f, 8.0f), p);
+		}
+		sk_sp<SkPicture> sPic = sRec.finishRecordingAsPicture();
+
+		benchmark_canvas_op("142. Retained Picture Replay (8x Cards)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				for (int i = 0; i < 8; ++i) {
+					const nisaba::Transform t = nisaba::Transform::from_translate(30.0f + (i % 4) * 260.0f, 40.0f + (i / 4) * 200.0f);
+					c.draw_picture(nPic, &t);
+				}
+			},
+			[&](SkCanvas* c) {
+				for (int i = 0; i < 8; ++i) {
+					SkMatrix m = SkMatrix::Translate(30.0f + (i % 4) * 260.0f, 40.0f + (i / 4) * 200.0f);
+					c->drawPicture(sPic, &m, nullptr);
+				}
+			}
+		);
+
+		const nisaba::Transform4x4 nOrbit = nisaba::Transform4x4::from_camera_orbit(540.0f, 360.0f, 12.0f, 28.0f, 0.0f, 600.0f);
+		const SkM44 sOrbit = SkM44::RowMajor(nOrbit.m.data());
+		benchmark_canvas_op("143. 4x4 Perspective Shapes (16x RRect)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				c.save();
+				c.concat(nOrbit);
+				for (int i = 0; i < 16; ++i) {
+					float x = 140.0f + (i % 4) * 210.0f;
+					float y = 80.0f + (i / 4) * 145.0f;
+					auto rr = nisaba::RRect::from_rect_and_radius(nisaba::Rect::from_xywh(x, y, 180.0f, 120.0f).value(), 14.0f);
+					c.fill_rrect(rr, nisaba::Paint(nisaba::Color::from_rgba8(80 + i * 10, 175, 240 - i * 8, 255)));
+				}
+				c.restore();
+			},
+			[&](SkCanvas* c) {
+				c->save();
+				c->concat(sOrbit);
+				SkPaint p; p.setAntiAlias(true);
+				for (int i = 0; i < 16; ++i) {
+					float x = 140.0f + (i % 4) * 210.0f;
+					float y = 80.0f + (i / 4) * 145.0f;
+					p.setColor(SkColorSetARGB(255, 80 + i * 10, 175, 240 - i * 8));
+					c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(x, y, 180.0f, 120.0f), 14.0f, 14.0f), p);
+				}
+				c->restore();
+			}
+		);
+
+		nisaba::Region nRgn(nisaba::IntRect::from_xywh(80, 60, 920, 600).value());
+		SkRegion sRgn(SkIRect::MakeXYWH(80, 60, 920, 600));
+		for (int i = 0; i < 8; ++i) {
+			int32_t hx = 140 + (i % 4) * 210;
+			int32_t hy = 120 + (i / 4) * 260;
+			nRgn.difference_with(nisaba::IntRect::from_xywh(hx, hy, 120, 140).value());
+			sRgn.op(SkIRect::MakeXYWH(hx, hy, 120, 140), SkRegion::kDifference_Op);
+		}
+
+		benchmark_canvas_op("144. Complex Pixel Region (draw+clip)",
+			[&](nisaba::gpu::GpuCanvas& c) {
+				c.save();
+				c.clip_region(nRgn, nisaba::ClipOp::Intersect);
+				c.draw_region(nRgn, nisaba::Paint(nisaba::Color::from_rgba8(139, 92, 246, 230)));
+				c.restore();
+			},
+			[&](SkCanvas* c) {
+				c->save();
+				c->clipRegion(sRgn, SkClipOp::kIntersect);
+				SkPaint p; p.setColor(SkColorSetARGB(230, 139, 92, 246));
+				c->drawRegion(sRgn, p);
+				c->restore();
+			}
+		);
+	}
+
+	// =========================================================================
+	// CATEGORY 14: Canvas Parity Phase 4 (TextBlob & RSXform Curved Glyphs)
+	// =========================================================================
+	{
+		auto nFont = nisaba::text::TtfFont::from_file(resolveFont("Inter-Regular.ttf"));
+		if (nFont && nFont->is_valid() && skiaTypeface) {
+			static const char* kBlobLines[4] = {
+				"Nisaba Immutable TextBlob Positioned Run — Frame Zero-Cost Replay",
+				"Sovereign GPU Glyph Atlas Batching • Subpixel Antialiasing & Kerning",
+				"Vector Path Fallback For Gradients, Strokes & Projective Transforms",
+				"Tile-GPU Discard Hints, ISO 32000-1 Annotations & Full Engine Parity"
+			};
+
+			std::vector<std::shared_ptr<nisaba::TextBlob>> nBlobs;
+			std::vector<sk_sp<SkTextBlob>> sBlobs;
+			SkFont sFont22(skiaTypeface, 22.0f);
+			sFont22.setEdging(SkFont::Edging::kSubpixelAntiAlias);
+			for (int i = 0; i < 4; ++i) {
+				nBlobs.push_back(nisaba::TextBlob::from_text(kBlobLines[i], *nFont, 22.0f));
+				sBlobs.push_back(SkTextBlob::MakeFromString(kBlobLines[i], sFont22));
+			}
+
+			benchmark_canvas_op("145. TextBlob Positioned Runs (4x)",
+				[&](nisaba::gpu::GpuCanvas& c) {
+					nisaba::Paint p(nisaba::Color::from_rgba8(240, 246, 255, 255));
+					for (int i = 0; i < 4; ++i) {
+						c.draw_text_blob(nBlobs[i], 60.0f, 120.0f + i * 95.0f, p);
+					}
+				},
+				[&](SkCanvas* c) {
+					SkPaint p; p.setAntiAlias(true);
+					p.setColor(SkColorSetARGB(255, 240, 246, 255));
+					for (int i = 0; i < 4; ++i) {
+						c->drawTextBlob(sBlobs[i], 60.0f, 120.0f + i * 95.0f, p);
+					}
+				}
+			);
+
+			// Suite 146: 64 RSXform curved-arc glyphs
+			static const char* kCurveStr = "NISABA SOVEREIGN GRAPHICS ENGINE CURVED RSXFORM GLYPH ATLAS BATCH";
+			const size_t nCurve = 64;
+			std::vector<uint16_t> nCurveGlyphs;
+			std::vector<nisaba::RSXform> nCurveXforms;
+			std::vector<SkRSXform> sCurveXforms;
+			nCurveGlyphs.reserve(nCurve);
+			nCurveXforms.reserve(nCurve);
+			sCurveXforms.reserve(nCurve);
+
+			const float cx = W * 0.5f;
+			const float cy = H * 0.5f;
+			const float radius = 240.0f;
+			for (size_t i = 0; i < nCurve; ++i) {
+				const char ch = kCurveStr[i];
+				nCurveGlyphs.push_back(nFont->glyph_index(static_cast<char32_t>(ch)));
+				const float ang = static_cast<float>(i) * (6.2831853f / static_cast<float>(nCurve));
+				const float tangent = ang + 1.5707963f;
+				const float px = cx + std::cos(ang) * radius;
+				const float py = cy + std::sin(ang) * radius;
+				nCurveXforms.push_back(nisaba::RSXform::from_radians(1.0f, tangent, px, py, 0.0f, 0.0f));
+				sCurveXforms.push_back(SkRSXform::MakeFromRadians(1.0f, tangent, px, py, 0.0f, 0.0f));
+			}
+			SkFont sFont20(skiaTypeface, 20.0f);
+			sFont20.setEdging(SkFont::Edging::kSubpixelAntiAlias);
+			auto sCurveBlob = SkTextBlob::MakeFromRSXform(kCurveStr, nCurve, sCurveXforms.data(), sFont20);
+
+			benchmark_canvas_op("146. RSXform Curved Glyphs (64x)",
+				[&](nisaba::gpu::GpuCanvas& c) {
+					nisaba::Paint p(nisaba::Color::from_rgba8(56, 189, 248, 255));
+					c.draw_glyphs(nCurveGlyphs, nCurveXforms, *nFont, 20.0f, p);
+				},
+				[&](SkCanvas* c) {
+					SkPaint p; p.setAntiAlias(true);
+					p.setColor(SkColorSetARGB(255, 56, 189, 248));
+					c->drawTextBlob(sCurveBlob, 0.0f, 0.0f, p);
+				}
+			);
+		}
 	}
 
 	// Detailed Statistical Reporting & Speedup Analysis

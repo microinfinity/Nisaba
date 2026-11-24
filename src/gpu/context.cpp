@@ -432,7 +432,7 @@ void Context::resetScissor() {
 // -------------------------------------------------------------
 // Stencil Vector Clipping
 // -------------------------------------------------------------
-void Context::clipPath(const nisaba::Path& p, Winding winding) {
+void Context::clipPath(const nisaba::Path& p, Winding winding, bool isDifference) {
 	State& s = currentState();
 	if (s.clipDepth >= 15) return;
 
@@ -467,7 +467,7 @@ void Context::clipPath(const nisaba::Path& p, Winding winding) {
 	s.clipDepth++;
 	if (m_renderer) {
 		m_renderer->renderClip(m_renderPaths.data(), static_cast<int>(m_renderPaths.size()),
-		                       winding, s.clipDepth, s.scissor, m_tessellator->bounds());
+		                       winding, s.clipDepth, s.scissor, m_tessellator->bounds(), isDifference);
 	}
 	m_commands.clear();
 	m_tessellator->clear();
@@ -1612,6 +1612,8 @@ void Context::fill() {
 			localToScreen.inverse(screenToLocal);
 			fillPaint.xform = fillPaint.xform.multiply(screenToLocal);
 			if (isLinearGrad) {
+				const float gradLen = (fillPaint.feather > 1e-4f) ? fillPaint.feather : 1.0f;
+				fillPaint.xform = Transform2D::scale(1.0f, gradLen).multiply(fillPaint.xform);
 				fillPaint.extent[0] = hw;
 				fillPaint.radius = hh;
 				fillPaint.feather = m_rrectR;
@@ -2009,7 +2011,7 @@ void Context::drawTriangles(const Paint& paint, const Vertex* verts, int nverts,
 
 	const State& s = currentState();
 	Paint p = paint;
-	const bool usesVertexColorOnly = (shaderType == 4 || shaderType == -2 || shaderType == 7 || shaderType == 8 || shaderType == 9 || shaderType == 18);
+	const bool usesVertexColorOnly = (shaderType == 4 || shaderType == -2 || shaderType == 7 || shaderType == 8 || shaderType == 9 || shaderType == 18 || (shaderType == 3 && paint.radius > 0.5f));
 	if (!usesVertexColorOnly) {
 		p.innerColor.a *= s.alpha;
 		p.outerColor.a *= s.alpha;
@@ -2719,6 +2721,442 @@ float Context::textWithFont(float x, float y, const text::TtfFont& font, float f
 	}
 
 	return x + totalWidth * invscale;
+}
+
+void Context::drawGlyphsPos(
+	std::span<const uint16_t> glyphIds,
+	std::span<const nisaba::Point> positions,
+	const text::TtfFont& font,
+	float fontSize
+) {
+	const size_t n = std::min(glyphIds.size(), positions.size());
+	if (n == 0 || !font.is_valid() || fontSize <= 0.0f) return;
+
+	State& s = currentState();
+	float scale = getFontScale(s) * m_devicePixelRatio;
+	if (!std::isfinite(scale) || scale <= 1e-4f) return;
+	float invscale = 1.0f / scale;
+	float scaledSize = fontSize * scale;
+
+	uint32_t fontId = (static_cast<uint32_t>(std::hash<const text::TtfFont*>{}(&font)) & 0x7FFFFFFFu) | 0x80000000u;
+	bool isFlipped = isTransformFlipped(s.xform);
+
+	Color textCol = s.fill.innerColor;
+	textCol.a *= s.alpha;
+	uint32_t vcol = textCol.premultiplied().toRGBA8();
+
+	m_textVertices.clear();
+	m_textVertices.reserve(n * 6);
+
+	uint32_t sizeBits = 0;
+	std::memcpy(&sizeBits, &scaledSize, sizeof(float));
+
+	for (size_t i = 0; i < n; ++i) {
+		const uint16_t gid = glyphIds[i];
+		if (gid == 0) continue;
+
+		const float targetX = positions[i].x * scale;
+		const float targetY = positions[i].y * scale;
+
+		auto [intX, xBin] = text::compute_subpixel_bin(targetX);
+		auto [intY, yBin] = text::compute_subpixel_bin(targetY);
+
+		text::CacheKey key{fontId, gid, sizeBits, xBin, yBin};
+		const AtlasGlyphEntry* entry = m_atlas->find(key);
+
+		if (!entry) {
+			const text::CachedGlyph* cg = m_glyphCache.get_or_render(
+				font, fontId, gid, scaledSize, targetX, targetY);
+
+			auto inserted = m_atlas->insert(key, cg);
+			if (!inserted) {
+				if (!m_textVertices.empty()) {
+					m_atlas->flushToGpu(m_renderer.get(), m_fontTextureId);
+					Paint p = s.fill;
+					p.image = m_fontTextureId;
+					p.radius = 1.0f;
+					m_renderer->renderTriangles(p, s.compositeOperation, s.scissor,
+					                           m_textVertices.data(), static_cast<int>(m_textVertices.size()), m_fringeWidth, 3);
+					m_textVertices.clear();
+				}
+				if (m_renderer) {
+					m_renderer->flush();
+				}
+				if (m_atlas->width() < 2048 || m_atlas->height() < 2048) {
+					if (m_fontTextureId != 0 && m_renderer) {
+						m_renderer->deleteTexture(m_fontTextureId);
+						m_fontTextureId = 0;
+					}
+					m_atlas->resize(2048, 2048);
+					m_glyphCache.clear();
+					m_fontTextureId = m_renderer->createTexture(TextureType::Alpha, m_atlas->width(), m_atlas->height(), 0, m_atlas->data());
+					m_atlas->markClean();
+					inserted = m_atlas->insert(key, cg);
+				} else {
+					m_atlas->reset();
+					m_glyphCache.clear();
+					inserted = m_atlas->insert(key, cg);
+				}
+			}
+			entry = inserted ? &(*inserted) : nullptr;
+		}
+
+		if (!entry || entry->width == 0 || entry->height == 0) continue;
+
+		float qx0 = static_cast<float>(intX + entry->offsetX) * invscale;
+		float qy0 = static_cast<float>(intY + entry->offsetY) * invscale;
+		float qx1 = qx0 + static_cast<float>(entry->width) * invscale;
+		float qy1 = qy0 + static_cast<float>(entry->height) * invscale;
+
+		float u0 = entry->u0;
+		float v0 = entry->v0;
+		float u1 = entry->u1;
+		float v1 = entry->v1;
+
+		if (isFlipped) {
+			std::swap(qy0, qy1);
+			std::swap(v0, v1);
+		}
+
+		Point c0 = s.xform.transformPoint(qx0, qy0);
+		Point c1 = s.xform.transformPoint(qx1, qy0);
+		Point c2 = s.xform.transformPoint(qx1, qy1);
+		Point c3 = s.xform.transformPoint(qx0, qy1);
+
+		m_textVertices.emplace_back(c0.x, c0.y, u0, v0, vcol);
+		m_textVertices.emplace_back(c2.x, c2.y, u1, v1, vcol);
+		m_textVertices.emplace_back(c1.x, c1.y, u1, v0, vcol);
+
+		m_textVertices.emplace_back(c0.x, c0.y, u0, v0, vcol);
+		m_textVertices.emplace_back(c3.x, c3.y, u0, v1, vcol);
+		m_textVertices.emplace_back(c2.x, c2.y, u1, v1, vcol);
+	}
+
+	if (m_atlas->isDirty()) {
+		m_atlas->flushToGpu(m_renderer.get(), m_fontTextureId);
+	}
+
+	if (!m_textVertices.empty()) {
+		Paint p = s.fill;
+		p.image = m_fontTextureId;
+		p.radius = 1.0f;
+		m_renderer->renderTriangles(p, s.compositeOperation, s.scissor,
+		                           m_textVertices.data(), static_cast<int>(m_textVertices.size()), m_fringeWidth, 3);
+	}
+}
+
+void Context::drawGlyphsRSXform(
+	std::span<const uint16_t> glyphIds,
+	std::span<const nisaba::RSXform> xforms,
+	const text::TtfFont& font,
+	float fontSize
+) {
+	const size_t n = std::min(glyphIds.size(), xforms.size());
+	if (n == 0 || !font.is_valid() || fontSize <= 0.0f) return;
+
+	State& s = currentState();
+	float ctmScale = getFontScale(s) * m_devicePixelRatio;
+	if (!std::isfinite(ctmScale) || ctmScale <= 1e-4f) return;
+
+	uint32_t fontId = (static_cast<uint32_t>(std::hash<const text::TtfFont*>{}(&font)) & 0x7FFFFFFFu) | 0x80000000u;
+	bool isFlipped = isTransformFlipped(s.xform);
+
+	Color textCol = s.fill.innerColor;
+	textCol.a *= s.alpha;
+	uint32_t vcol = textCol.premultiplied().toRGBA8();
+
+	m_textVertices.clear();
+	m_textVertices.reserve(n * 6);
+
+	for (size_t i = 0; i < n; ++i) {
+		const uint16_t gid = glyphIds[i];
+		if (gid == 0) continue;
+
+		const nisaba::RSXform& xf = xforms[i];
+		const float xfScale = std::hypot(xf.scos, xf.ssin);
+		if (!std::isfinite(xfScale) || xfScale <= 1e-4f) continue;
+
+		const float effScale = ctmScale * xfScale;
+		const float rasterSize = std::max(1.0f, std::round(fontSize * effScale * 4.0f) * 0.25f);
+		const float invRasterScale = fontSize / rasterSize;
+
+		uint32_t sizeBits = 0;
+		std::memcpy(&sizeBits, &rasterSize, sizeof(float));
+
+		text::CacheKey key{fontId, gid, sizeBits, text::SubpixelBin::Zero, text::SubpixelBin::Zero};
+		const AtlasGlyphEntry* entry = m_atlas->find(key);
+
+		if (!entry) {
+			const text::CachedGlyph* cg = m_glyphCache.get_or_render(
+				font, fontId, gid, rasterSize, 0.0f, 0.0f);
+
+			auto inserted = m_atlas->insert(key, cg);
+			if (!inserted) {
+				if (!m_textVertices.empty()) {
+					m_atlas->flushToGpu(m_renderer.get(), m_fontTextureId);
+					Paint p = s.fill;
+					p.image = m_fontTextureId;
+					p.radius = 1.0f;
+					m_renderer->renderTriangles(p, s.compositeOperation, s.scissor,
+					                           m_textVertices.data(), static_cast<int>(m_textVertices.size()), m_fringeWidth, 3);
+					m_textVertices.clear();
+				}
+				if (m_renderer) {
+					m_renderer->flush();
+				}
+				if (m_atlas->width() < 2048 || m_atlas->height() < 2048) {
+					if (m_fontTextureId != 0 && m_renderer) {
+						m_renderer->deleteTexture(m_fontTextureId);
+						m_fontTextureId = 0;
+					}
+					m_atlas->resize(2048, 2048);
+					m_glyphCache.clear();
+					m_fontTextureId = m_renderer->createTexture(TextureType::Alpha, m_atlas->width(), m_atlas->height(), 0, m_atlas->data());
+					m_atlas->markClean();
+					inserted = m_atlas->insert(key, cg);
+				} else {
+					m_atlas->reset();
+					m_glyphCache.clear();
+					inserted = m_atlas->insert(key, cg);
+				}
+			}
+			entry = inserted ? &(*inserted) : nullptr;
+		}
+
+		if (!entry || entry->width == 0 || entry->height == 0) continue;
+
+		float lx0 = static_cast<float>(entry->offsetX) * invRasterScale;
+		float ly0 = static_cast<float>(entry->offsetY) * invRasterScale;
+		float lx1 = static_cast<float>(entry->offsetX + static_cast<int>(entry->width)) * invRasterScale;
+		float ly1 = static_cast<float>(entry->offsetY + static_cast<int>(entry->height)) * invRasterScale;
+
+		float u0 = entry->u0;
+		float v0 = entry->v0;
+		float u1 = entry->u1;
+		float v1 = entry->v1;
+
+		if (isFlipped) {
+			std::swap(ly0, ly1);
+			std::swap(v0, v1);
+		}
+
+		auto mapRS = [&](float lx, float ly) -> Point {
+			const float ux = xf.scos * lx - xf.ssin * ly + xf.tx;
+			const float uy = xf.ssin * lx + xf.scos * ly + xf.ty;
+			return s.xform.transformPoint(ux, uy);
+		};
+
+		Point c0 = mapRS(lx0, ly0);
+		Point c1 = mapRS(lx1, ly0);
+		Point c2 = mapRS(lx1, ly1);
+		Point c3 = mapRS(lx0, ly1);
+
+		m_textVertices.emplace_back(c0.x, c0.y, u0, v0, vcol);
+		m_textVertices.emplace_back(c2.x, c2.y, u1, v1, vcol);
+		m_textVertices.emplace_back(c1.x, c1.y, u1, v0, vcol);
+
+		m_textVertices.emplace_back(c0.x, c0.y, u0, v0, vcol);
+		m_textVertices.emplace_back(c3.x, c3.y, u0, v1, vcol);
+		m_textVertices.emplace_back(c2.x, c2.y, u1, v1, vcol);
+	}
+
+	if (m_atlas->isDirty()) {
+		m_atlas->flushToGpu(m_renderer.get(), m_fontTextureId);
+	}
+
+	if (!m_textVertices.empty()) {
+		Paint p = s.fill;
+		p.image = m_fontTextureId;
+		p.radius = 1.0f;
+		m_renderer->renderTriangles(p, s.compositeOperation, s.scissor,
+		                           m_textVertices.data(), static_cast<int>(m_textVertices.size()), m_fringeWidth, 3);
+	}
+}
+
+void Context::drawTextBlob(const nisaba::TextBlob& blob, float x, float y) {
+	if (blob.is_empty() || !m_renderer || !m_atlas) return;
+	State& s = currentState();
+
+	const bool pureTranslate =
+		(m_devicePixelRatio == 1.0f) &&
+		(std::abs(s.xform[0] - 1.0f) < 1e-5f) &&
+		(std::abs(s.xform[1]) < 1e-5f) &&
+		(std::abs(s.xform[2]) < 1e-5f) &&
+		(std::abs(s.xform[3] - 1.0f) < 1e-5f);
+
+	if (pureTranslate && blob.unique_id() != 0) {
+		const float ox = x + s.xform[4];
+		const float oy = y + s.xform[5];
+		auto [intOx, oxBin] = text::compute_subpixel_bin(ox);
+		auto [intOy, oyBin] = text::compute_subpixel_bin(oy);
+
+		Color textCol = s.fill.innerColor;
+		textCol.a *= s.alpha;
+		const uint32_t vcol = textCol.premultiplied().toRGBA8();
+
+		const uint32_t bid = blob.unique_id();
+		const uint64_t curGen = m_atlas->generation();
+
+		auto emitCached = [&](const std::vector<Vertex>& rel) {
+			if (m_atlas->isDirty()) {
+				m_atlas->flushToGpu(m_renderer.get(), m_fontTextureId);
+			}
+			if (rel.empty()) return;
+			const size_t nv = rel.size();
+			m_textVertices.resize(nv);
+			const float dx = static_cast<float>(intOx);
+			const float dy = static_cast<float>(intOy);
+			const Vertex* src = rel.data();
+			Vertex* dst = m_textVertices.data();
+			for (size_t k = 0; k < nv; ++k) {
+				dst[k] = Vertex(src[k].x + dx, src[k].y + dy, src[k].u, src[k].v, vcol);
+			}
+			Paint p = s.fill;
+			p.image = m_fontTextureId;
+			p.radius = 1.0f;
+			m_renderer->renderTriangles(p, s.compositeOperation, s.scissor,
+			                           dst, static_cast<int>(nv), m_fringeWidth, 3);
+		};
+
+		for (size_t ci = 0; ci < m_textBlobCache.size(); ++ci) {
+			auto& ce = m_textBlobCache[ci];
+			if (ce.blobId == bid && ce.atlasGen == curGen && ce.oxBin == oxBin && ce.oyBin == oyBin) {
+				if (ci != 0) {
+					std::swap(m_textBlobCache[0], m_textBlobCache[ci]);
+				}
+				emitCached(m_textBlobCache[0].relVerts);
+				return;
+			}
+		}
+
+		// Cache miss: build relative quad vertices once for (bid, curGen, oxBin, oyBin)
+		const float subOx = text::bin_to_float(oxBin);
+		const float subOy = text::bin_to_float(oyBin);
+		std::vector<Vertex> built;
+		built.reserve(blob.glyph_count() * 6);
+		bool genStable = true;
+
+		auto ensureAtlasEntry = [&](const text::TtfFont& font, uint32_t fontId, uint16_t gid,
+		                            float rasterSize, float tx, float ty, const text::CacheKey& key) -> const AtlasGlyphEntry* {
+			if (const AtlasGlyphEntry* found = m_atlas->find(key)) return found;
+			const text::CachedGlyph* cg = m_glyphCache.get_or_render(font, fontId, gid, rasterSize, tx, ty);
+			auto inserted = m_atlas->insert(key, cg);
+			if (!inserted) {
+				genStable = false;
+				return nullptr;
+			}
+			return &(*inserted);
+		};
+
+		for (const auto& run : blob.runs()) {
+			if (!run.font || !run.font->is_valid() || run.glyph_ids.empty() || run.font_size <= 0.0f) continue;
+			const uint32_t fontId = (static_cast<uint32_t>(std::hash<const text::TtfFont*>{}(run.font)) & 0x7FFFFFFFu) | 0x80000000u;
+
+			if (run.positioning == nisaba::TextBlob::RunPositioning::Positioned) {
+				const size_t n = std::min(run.glyph_ids.size(), run.positions.size());
+				uint32_t sizeBits = 0;
+				std::memcpy(&sizeBits, &run.font_size, sizeof(float));
+				for (size_t i = 0; i < n; ++i) {
+					const uint16_t gid = run.glyph_ids[i];
+					if (gid == 0) continue;
+					const float relX = run.positions[i].x + subOx;
+					const float relY = run.positions[i].y + subOy;
+					auto [rIntX, xBin] = text::compute_subpixel_bin(relX);
+					auto [rIntY, yBin] = text::compute_subpixel_bin(relY);
+					text::CacheKey key{fontId, gid, sizeBits, xBin, yBin};
+					const AtlasGlyphEntry* entry = ensureAtlasEntry(*run.font, fontId, gid, run.font_size, relX, relY, key);
+					if (!genStable) break;
+					if (!entry || entry->width == 0 || entry->height == 0) continue;
+
+					const float qx0 = static_cast<float>(rIntX + entry->offsetX);
+					const float qy0 = static_cast<float>(rIntY + entry->offsetY);
+					const float qx1 = qx0 + static_cast<float>(entry->width);
+					const float qy1 = qy0 + static_cast<float>(entry->height);
+
+					built.emplace_back(qx0, qy0, entry->u0, entry->v0, 0xffffffffu);
+					built.emplace_back(qx1, qy1, entry->u1, entry->v1, 0xffffffffu);
+					built.emplace_back(qx1, qy0, entry->u1, entry->v0, 0xffffffffu);
+					built.emplace_back(qx0, qy0, entry->u0, entry->v0, 0xffffffffu);
+					built.emplace_back(qx0, qy1, entry->u0, entry->v1, 0xffffffffu);
+					built.emplace_back(qx1, qy1, entry->u1, entry->v1, 0xffffffffu);
+				}
+			} else {
+				const size_t n = std::min(run.glyph_ids.size(), run.xforms.size());
+				for (size_t i = 0; i < n; ++i) {
+					const uint16_t gid = run.glyph_ids[i];
+					if (gid == 0) continue;
+					const nisaba::RSXform& xf = run.xforms[i];
+					const float xfScale = std::hypot(xf.scos, xf.ssin);
+					if (!std::isfinite(xfScale) || xfScale <= 1e-4f) continue;
+					const float rasterSize = std::max(1.0f, std::round(run.font_size * xfScale * 4.0f) * 0.25f);
+					const float invRasterScale = run.font_size / rasterSize;
+					uint32_t sizeBits = 0;
+					std::memcpy(&sizeBits, &rasterSize, sizeof(float));
+					text::CacheKey key{fontId, gid, sizeBits, text::SubpixelBin::Zero, text::SubpixelBin::Zero};
+					const AtlasGlyphEntry* entry = ensureAtlasEntry(*run.font, fontId, gid, rasterSize, 0.0f, 0.0f, key);
+					if (!genStable) break;
+					if (!entry || entry->width == 0 || entry->height == 0) continue;
+
+					const float lx0 = static_cast<float>(entry->offsetX) * invRasterScale;
+					const float ly0 = static_cast<float>(entry->offsetY) * invRasterScale;
+					const float lx1 = static_cast<float>(entry->offsetX + static_cast<int>(entry->width)) * invRasterScale;
+					const float ly1 = static_cast<float>(entry->offsetY + static_cast<int>(entry->height)) * invRasterScale;
+
+					auto mapRel = [&](float lx, float ly) -> Point {
+						return Point(
+							xf.scos * lx - xf.ssin * ly + xf.tx + subOx,
+							xf.ssin * lx + xf.scos * ly + xf.ty + subOy
+						);
+					};
+					const Point c0 = mapRel(lx0, ly0);
+					const Point c1 = mapRel(lx1, ly0);
+					const Point c2 = mapRel(lx1, ly1);
+					const Point c3 = mapRel(lx0, ly1);
+
+					built.emplace_back(c0.x, c0.y, entry->u0, entry->v0, 0xffffffffu);
+					built.emplace_back(c2.x, c2.y, entry->u1, entry->v1, 0xffffffffu);
+					built.emplace_back(c1.x, c1.y, entry->u1, entry->v0, 0xffffffffu);
+					built.emplace_back(c0.x, c0.y, entry->u0, entry->v0, 0xffffffffu);
+					built.emplace_back(c3.x, c3.y, entry->u0, entry->v1, 0xffffffffu);
+					built.emplace_back(c2.x, c2.y, entry->u1, entry->v1, 0xffffffffu);
+				}
+			}
+			if (!genStable) break;
+		}
+
+		if (genStable && m_atlas->generation() == curGen) {
+			constexpr size_t kMaxBlobCache = 64;
+			if (m_textBlobCache.size() >= kMaxBlobCache) {
+				m_textBlobCache.pop_back();
+			}
+			m_textBlobCache.insert(m_textBlobCache.begin(), CachedTextBlobGpu{
+				.blobId = bid,
+				.atlasGen = curGen,
+				.oxBin = oxBin,
+				.oyBin = oyBin,
+				.relVerts = std::move(built)
+			});
+			emitCached(m_textBlobCache[0].relVerts);
+			return;
+		}
+	}
+
+	// General CTM fallback (without GpuCanvas state-stack allocation)
+	const Transform2D savedXform = s.xform;
+	if (x != 0.0f || y != 0.0f) {
+		Transform2D t = Transform2D::translate(x, y);
+		t.multiply(s.xform);
+		s.xform = t;
+	}
+	for (const auto& run : blob.runs()) {
+		if (!run.font || run.glyph_ids.empty()) continue;
+		if (run.positioning == nisaba::TextBlob::RunPositioning::Positioned) {
+			drawGlyphsPos(run.glyph_ids, run.positions, *run.font, run.font_size);
+		} else {
+			drawGlyphsRSXform(run.glyph_ids, run.xforms, *run.font, run.font_size);
+		}
+	}
+	s.xform = savedXform;
 }
 
 void Context::drawTextBuffer(const text::Buffer& buffer, text::FontSystem& fontSystem, Point pos, Color defaultColor, uint32_t passMask) {

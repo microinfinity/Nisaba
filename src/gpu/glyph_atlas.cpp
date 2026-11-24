@@ -9,6 +9,7 @@ SovereignGlyphAtlas::SovereignGlyphAtlas(int width, int height)
 }
 
 void SovereignGlyphAtlas::reset() {
+    ++m_generation;
     std::fill(m_data.begin(), m_data.end(), 0);
     m_entries.clear();
     m_fastTable.assign(kFastTableSize, FastEntry{});

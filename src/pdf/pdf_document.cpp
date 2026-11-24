@@ -167,6 +167,60 @@ std::vector<uint8_t> PdfDocument::save_to_bytes() {
         page_obj["Contents"] = PdfRef(content_id, 0);
         page_obj["Resources"] = std::move(res_dict);
 
+        // 3b. ISO 32000-1 Page Annotations (/Annots)
+        const auto& page_annots = p->canvas().annotations();
+        if (!page_annots.empty()) {
+            PdfArray annots_array;
+            annots_array.reserve(page_annots.size());
+            const double page_h = static_cast<double>(p->height());
+
+            for (const auto& annot : page_annots) {
+                uint32_t annot_id = writer.allocate_id();
+                PdfDict annot_dict;
+                annot_dict["Type"] = PdfName("Annot");
+
+                // Convert top-down Nisaba coordinates to bottom-up PDF page coordinates.
+                const double x0 = static_cast<double>(annot.rect.left());
+                const double x1 = static_cast<double>(annot.rect.right());
+                const double pdf_y0 = page_h - static_cast<double>(annot.rect.bottom());
+                const double pdf_y1 = page_h - static_cast<double>(annot.rect.top());
+                annot_dict["Rect"] = PdfArray{x0, pdf_y0, x1, pdf_y1};
+
+                std::string value_str;
+                if (!annot.data.empty()) {
+                    size_t len = annot.data.size();
+                    while (len > 0 && annot.data[len - 1] == 0) {
+                        --len;
+                    }
+                    value_str.assign(reinterpret_cast<const char*>(annot.data.data()), len);
+                }
+
+                if (annot.key == "URL" || annot.key == "URI" || annot.key == "Link" || annot.key == "Rect_With_URL") {
+                    annot_dict["Subtype"] = PdfName("Link");
+                    annot_dict["Border"] = PdfArray{0, 0, 0};
+                    PdfDict action;
+                    action["Type"] = PdfName("Action");
+                    action["S"] = PdfName("URI");
+                    action["URI"] = value_str;
+                    annot_dict["A"] = std::move(action);
+                } else if (annot.key == "NamedDest" || annot.key == "LinkToDest" ||
+                           annot.key == "Link_To_Name" || annot.key == "Define_Named_Dest") {
+                    annot_dict["Subtype"] = PdfName("Link");
+                    annot_dict["Border"] = PdfArray{0, 0, 0};
+                    annot_dict["Dest"] = value_str;
+                } else {
+                    annot_dict["Subtype"] = PdfName("Text");
+                    annot_dict["T"] = annot.key;
+                    annot_dict["Contents"] = value_str;
+                    annot_dict["F"] = static_cast<int64_t>(2); // Hidden metadata flag
+                }
+
+                writer.add_object(annot_id, std::move(annot_dict));
+                annots_array.push_back(PdfRef(annot_id, 0));
+            }
+            page_obj["Annots"] = std::move(annots_array);
+        }
+
         writer.add_object(page_id, std::move(page_obj));
     }
 

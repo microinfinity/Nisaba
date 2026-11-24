@@ -140,12 +140,12 @@ void BasicEdgeBuilder::push_quad(const Point* points) {
     float ux = points[0].x - 2.0f * points[1].x + points[2].x;
     float uy = points[0].y - 2.0f * points[1].y + points[2].y;
     float max_d = std::max(std::abs(ux), std::abs(uy));
-    if (max_d < 0.25f) {
+    if (max_d < 0.125f) {
         push_line(points[0], points[2]);
         return;
     }
     int32_t n = static_cast<int32_t>(std::ceil(std::sqrt(2.0f * max_d)));
-    n = std::clamp(n, 2, 16);
+    n = std::clamp(n, 2, 64);
 
     path_geometry::QuadCoeff coeff = path_geometry::QuadCoeff::from_points(points);
     float dt = 1.0f / static_cast<float>(n);
@@ -166,12 +166,12 @@ void BasicEdgeBuilder::push_cubic(const Point* points) {
     float u2x = points[1].x - 2.0f * points[2].x + points[3].x;
     float u2y = points[1].y - 2.0f * points[2].y + points[3].y;
     float max_d = std::max({std::abs(u1x), std::abs(u1y), std::abs(u2x), std::abs(u2y)});
-    if (max_d < 0.25f) {
+    if (max_d < 0.125f) {
         push_line(points[0], points[3]);
         return;
     }
-    int32_t n = static_cast<int32_t>(std::ceil(std::sqrt(1.5f * max_d)));
-    n = std::clamp(n, 2, 16);
+    int32_t n = static_cast<int32_t>(std::ceil(std::sqrt(6.0f * max_d)));
+    n = std::clamp(n, 2, 64);
 
     path_geometry::CubicCoeff coeff = path_geometry::CubicCoeff::from_points(points);
     float dt = 1.0f / static_cast<float>(n);

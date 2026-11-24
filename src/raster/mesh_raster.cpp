@@ -59,19 +59,31 @@ void rasterize_triangle_internal(
     const Point* uv0, const Point* uv1, const Point* uv2,
     const PixmapRef* texture,
     float opacity,
-    BlendMode blend_mode
+    BlendMode blend_mode,
+    const Mask* mask = nullptr,
+    std::optional<ScreenIntRect> clip = std::nullopt
 ) {
     if (opacity <= 0.0f || dst.width() == 0 || dst.height() == 0) return;
 
-    float dst_w = static_cast<float>(dst.width());
-    float dst_h = static_cast<float>(dst.height());
+    int32_t clip_x0 = 0;
+    int32_t clip_y0 = 0;
+    int32_t clip_x1 = static_cast<int32_t>(dst.width());
+    int32_t clip_y1 = static_cast<int32_t>(dst.height());
+    if (clip.has_value()) {
+        clip_x0 = std::max(clip_x0, static_cast<int32_t>(clip->left()));
+        clip_y0 = std::max(clip_y0, static_cast<int32_t>(clip->top()));
+        clip_x1 = std::min(clip_x1, static_cast<int32_t>(clip->right()));
+        clip_y1 = std::min(clip_y1, static_cast<int32_t>(clip->bottom()));
+        if (clip_x0 >= clip_x1 || clip_y0 >= clip_y1) return;
+    }
 
     float min_x = std::min({p0.x, p1.x, p2.x});
     float max_x = std::max({p0.x, p1.x, p2.x});
     float min_y = std::min({p0.y, p1.y, p2.y});
     float max_y = std::max({p0.y, p1.y, p2.y});
 
-    if (max_x < 0.0f || min_x >= dst_w || max_y < 0.0f || min_y >= dst_h) {
+    if (max_x < static_cast<float>(clip_x0) || min_x >= static_cast<float>(clip_x1) ||
+        max_y < static_cast<float>(clip_y0) || min_y >= static_cast<float>(clip_y1)) {
         return;
     }
 
@@ -131,8 +143,8 @@ void rasterize_triangle_internal(
         dv_dx = dL0_dx * v0 + dL1_dx * v1 + dL2_dx * v2;
     }
 
-    int32_t y_start = std::max(0, static_cast<int32_t>(std::floor(min_y)));
-    int32_t y_end = std::min(static_cast<int32_t>(dst.height()) - 1, static_cast<int32_t>(std::ceil(max_y)));
+    int32_t y_start = std::max(clip_y0, static_cast<int32_t>(std::floor(min_y)));
+    int32_t y_end = std::min(clip_y1 - 1, static_cast<int32_t>(std::ceil(max_y)));
 
     const std::array<std::pair<Point, Point>, 3> edges = {{
         {p0, p1},
@@ -165,13 +177,13 @@ void rasterize_triangle_internal(
             row_max_x = std::max(row_max_x, x_hits[i]);
         }
 
-        float clamped_min_x = std::clamp(row_min_x, 0.0f, dst_w);
-        float clamped_max_x = std::clamp(row_max_x, 0.0f, dst_w);
+        float clamped_min_x = std::clamp(row_min_x, static_cast<float>(clip_x0), static_cast<float>(clip_x1));
+        float clamped_max_x = std::clamp(row_max_x, static_cast<float>(clip_x0), static_cast<float>(clip_x1));
 
         if (clamped_min_x >= clamped_max_x) continue;
 
-        int32_t ix_start = std::max(0, static_cast<int32_t>(std::floor(clamped_min_x)));
-        int32_t ix_end = std::min(static_cast<int32_t>(dst.width()) - 1, static_cast<int32_t>(std::ceil(clamped_max_x) - 1));
+        int32_t ix_start = std::max(clip_x0, static_cast<int32_t>(std::floor(clamped_min_x)));
+        int32_t ix_end = std::min(clip_x1 - 1, static_cast<int32_t>(std::ceil(clamped_max_x) - 1));
 
         PremultipliedColorU8* dst_row = dst.row(static_cast<size_t>(y));
 
@@ -199,7 +211,24 @@ void rasterize_triangle_internal(
             float cov_x = std::clamp(std::min(px_right, row_max_x) - std::max(px_left, row_min_x), 0.0f, 1.0f);
 
             if (cov_x > 0.0f) {
-                float final_alpha = opacity * cov_x;
+                float mask_cov = 1.0f;
+                if (mask) {
+                    if (static_cast<uint32_t>(ix) >= mask->width() || static_cast<uint32_t>(y) >= mask->height()) {
+                        mask_cov = 0.0f;
+                    } else {
+                        mask_cov = static_cast<float>(mask->data()[static_cast<size_t>(y) * mask->width() + static_cast<size_t>(ix)]) / 255.0f;
+                    }
+                }
+                float final_alpha = opacity * cov_x * mask_cov;
+                if (final_alpha <= 0.0f) {
+                    cur_r += dr_dx;
+                    cur_g += dg_dx;
+                    cur_b += db_dx;
+                    cur_a += da_dx;
+                    cur_u += du_dx;
+                    cur_v += dv_dx;
+                    continue;
+                }
 
                 PremultipliedColorU8 final_color;
 
@@ -286,7 +315,9 @@ void draw_vertices(
     const PixmapRef* texture,
     float opacity,
     BlendMode blend_mode,
-    Transform transform
+    Transform transform,
+    const Mask* mask,
+    std::optional<ScreenIntRect> clip
 ) {
     if (!vertices.is_valid() || opacity <= 0.0f) return;
 
@@ -322,7 +353,9 @@ void draw_vertices(
             uv0, uv1, uv2,
             texture,
             opacity,
-            blend_mode
+            blend_mode,
+            mask,
+            clip
         );
     }
 }

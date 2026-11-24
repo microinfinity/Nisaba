@@ -38,6 +38,8 @@ namespace nisaba {
 /// State saved/restored on the canvas stack.
 struct CanvasState {
     Transform transform{};
+    Transform4x4 transform_4x4{};
+    bool has_perspective_4x4{false};
     std::shared_ptr<Mask> clip_mask{};
     std::optional<ScreenIntRect> scissor_clip{};
     const Mask* external_mask{nullptr};
@@ -72,36 +74,59 @@ public:
     [[nodiscard]] IntSize size() const noexcept { return pixmap_.size(); }
     [[nodiscard]] PixmapMut& pixmap() noexcept { return pixmap_; }
 
-    void save() override {
+    int save() override {
+        const int prev = save_count();
         state_stack_.push_back(CanvasState{
             .transform = current_transform_,
+            .transform_4x4 = current_transform_4x4_,
+            .has_perspective_4x4 = has_perspective_4x4_,
             .clip_mask = active_clip_mask_,
             .scissor_clip = scissor_clip_,
             .external_mask = external_mask_ptr_,
             .is_layer = false
         });
+        return prev;
     }
 
-    void save_layer(const Paint& paint = Paint(Color::WHITE)) override {
+    [[nodiscard]] int save_count() const noexcept override {
+        return static_cast<int>(state_stack_.size()) + 1;
+    }
+
+    void restore_to_count(int count) override {
+        const int target = std::max(1, count);
+        while (save_count() > target) {
+            restore();
+        }
+    }
+
+    int save_layer(const Paint& paint = Paint(Color::WHITE)) override {
+        const int prev = save_count();
         push_layer_internal(std::nullopt, paint, false, 0.0f);
+        return prev;
     }
 
-    void save_layer_bounds(const Rect& bounds, const Paint& paint = Paint(Color::WHITE)) override {
+    int save_layer_bounds(const Rect& bounds, const Paint& paint = Paint(Color::WHITE)) override {
+        const int prev = save_count();
         push_layer_internal(bounds, paint, false, 0.0f);
+        return prev;
     }
 
-    void save_layer_backdrop(
+    int save_layer_backdrop(
         std::optional<Rect> bounds = std::nullopt,
         const Paint& paint = Paint(Color::WHITE),
         float blur_sigma = 0.0f
     ) override {
+        const int prev = save_count();
         push_layer_internal(bounds, paint, true, blur_sigma);
+        return prev;
     }
 
     void restore() override {
         if (state_stack_.empty()) return;
         const bool was_layer = state_stack_.back().is_layer;
         current_transform_ = state_stack_.back().transform;
+        current_transform_4x4_ = state_stack_.back().transform_4x4;
+        has_perspective_4x4_ = state_stack_.back().has_perspective_4x4;
         if (active_clip_mask_ && active_clip_mask_.use_count() == 1) {
             recycled_mask_ = std::move(active_clip_mask_);
         }
@@ -227,10 +252,20 @@ public:
 
     void reset_transform() noexcept {
         current_transform_ = Transform();
+        current_transform_4x4_ = Transform4x4::identity();
+        has_perspective_4x4_ = false;
     }
 
     void set_transform(const Transform& ts) noexcept {
         current_transform_ = ts;
+        current_transform_4x4_ = Transform4x4(ts);
+        has_perspective_4x4_ = false;
+    }
+
+    void set_transform_4x4(const Transform4x4& ts) noexcept override {
+        current_transform_4x4_ = ts;
+        has_perspective_4x4_ = ts.is_planar_perspective();
+        current_transform_ = ts.to_transform_2d();
     }
 
     [[nodiscard]] const Transform& transform() const noexcept {
@@ -241,38 +276,136 @@ public:
         return current_transform_;
     }
 
+    [[nodiscard]] Transform4x4 current_transform_4x4() const noexcept override {
+        return current_transform_4x4_;
+    }
+
     void translate(float dx, float dy) noexcept override {
-        current_transform_ = current_transform_.pre_translate(dx, dy);
+        current_transform_4x4_ = current_transform_4x4_.pre_translate(dx, dy);
+        if (!has_perspective_4x4_) {
+            current_transform_ = current_transform_.pre_translate(dx, dy);
+        } else {
+            has_perspective_4x4_ = current_transform_4x4_.is_planar_perspective();
+            current_transform_ = current_transform_4x4_.to_transform_2d();
+        }
     }
 
     void scale(float sx, float sy) noexcept override {
-        current_transform_ = current_transform_.pre_scale(sx, sy);
+        current_transform_4x4_ = current_transform_4x4_.pre_scale(sx, sy);
+        if (!has_perspective_4x4_) {
+            current_transform_ = current_transform_.pre_scale(sx, sy);
+        } else {
+            has_perspective_4x4_ = current_transform_4x4_.is_planar_perspective();
+            current_transform_ = current_transform_4x4_.to_transform_2d();
+        }
     }
 
     void rotate(float degrees) noexcept override {
-        current_transform_ = current_transform_.pre_rotate(degrees);
+        current_transform_4x4_ = current_transform_4x4_.pre_rotate_z(degrees);
+        if (!has_perspective_4x4_) {
+            current_transform_ = current_transform_.pre_rotate(degrees);
+        } else {
+            has_perspective_4x4_ = current_transform_4x4_.is_planar_perspective();
+            current_transform_ = current_transform_4x4_.to_transform_2d();
+        }
     }
+    using ICanvas::rotate;
 
     void skew(float kx, float ky) noexcept override {
-        current_transform_ = current_transform_.pre_skew(kx, ky);
+        concat(Transform::from_skew(kx, ky));
     }
 
     void concat(const Transform& ts) noexcept override {
-        current_transform_ = current_transform_.pre_concat(ts);
+        current_transform_4x4_ = current_transform_4x4_ * Transform4x4(ts);
+        if (!has_perspective_4x4_) {
+            current_transform_ = current_transform_.pre_concat(ts);
+        } else {
+            has_perspective_4x4_ = current_transform_4x4_.is_planar_perspective();
+            current_transform_ = current_transform_4x4_.to_transform_2d();
+        }
+    }
+
+    void concat(const Transform4x4& ts) noexcept override {
+        set_transform_4x4(current_transform_4x4_ * ts);
+    }
+
+    // --- Clip Queries & Frustum Culling ---
+
+    [[nodiscard]] std::optional<ScreenIntRect> get_device_clip_bounds() const noexcept override {
+        return scissor_clip_;
+    }
+
+    [[nodiscard]] std::optional<Rect> get_local_clip_bounds() const noexcept override {
+        if (!scissor_clip_.has_value()) return std::nullopt;
+        if (has_perspective_4x4_) {
+            const auto inv = current_transform_4x4_.invert();
+            if (!inv.has_value()) return std::nullopt;
+            return inv->map_rect(scissor_clip_->to_rect());
+        }
+        const auto inv = current_transform_.invert();
+        if (!inv.has_value()) return std::nullopt;
+        return scissor_clip_->to_rect().transform(*inv);
+    }
+
+    [[nodiscard]] bool quick_reject(const Rect& rect) const noexcept override {
+        if (!scissor_clip_.has_value()) return true;
+        std::optional<Rect> dev_rect;
+        if (has_perspective_4x4_) {
+            dev_rect = current_transform_4x4_.map_rect(rect);
+        } else {
+            if (!current_transform_.is_valid()) return true;
+            dev_rect = rect.transform(current_transform_);
+        }
+        if (!dev_rect.has_value()) return true;
+        const Rect dev_clip = scissor_clip_->to_rect();
+        return dev_rect->right() <= dev_clip.left() ||
+               dev_rect->left() >= dev_clip.right() ||
+               dev_rect->bottom() <= dev_clip.top() ||
+               dev_rect->top() >= dev_clip.bottom();
+    }
+
+    [[nodiscard]] bool quick_reject(const Path& path) const noexcept override {
+        if (path.is_empty()) return true;
+        return quick_reject(path.bounds());
     }
 
     // --- Vector Clipping ---
 
-    void clip_path(const Path& path, FillRule fill_rule = FillRule::Winding) override {
-        clip_path(path, fill_rule, true);
+    void clip_path(
+        const Path& path,
+        FillRule fill_rule = FillRule::Winding,
+        ClipOp op = ClipOp::Intersect
+    ) override {
+        clip_path(path, fill_rule, true, op);
     }
 
-    /// Intersects the active clip region with the specified path.
-    void clip_path(const Path& path, FillRule fill_rule, bool anti_alias) {
+    /// Combines the active clip region with the specified path using Intersect or Difference.
+    void clip_path(const Path& path, FillRule fill_rule, bool anti_alias, ClipOp op = ClipOp::Intersect) {
+        if (has_perspective_4x4_) {
+            const Path projected = current_transform_4x4_.project_path(path);
+            const Transform4x4 saved_m = current_transform_4x4_;
+            set_transform_4x4(Transform4x4::identity());
+            clip_path(projected, fill_rule, anti_alias, op);
+            set_transform_4x4(saved_m);
+            return;
+        }
+        if (op == ClipOp::Difference) {
+            if (!scissor_clip_.has_value() || path.is_empty()) return;
+            ensure_clip_mask_initialized();
+            if (active_clip_mask_) {
+                active_clip_mask_->difference_path(path, fill_rule, anti_alias, current_transform_, scissor_clip_);
+            }
+            return;
+        }
+
+        if (path.is_empty()) {
+            scissor_clip_ = std::nullopt;
+            return;
+        }
         Rect rect_box;
         if (std::abs(current_transform_.kx) < 1e-5f && std::abs(current_transform_.ky) < 1e-5f &&
             path.is_rect(&rect_box)) {
-            clip_rect(rect_box, anti_alias);
+            clip_rect(rect_box, anti_alias, ClipOp::Intersect);
             return;
         }
 
@@ -281,7 +414,11 @@ public:
             auto tr = path.transform(current_transform_);
             if (tr) path_b = tr->bounds();
         }
-        if (path_b.width() > 0.0f && path_b.height() > 0.0f && scissor_clip_.has_value()) {
+        if (path_b.width() <= 0.0f || path_b.height() <= 0.0f) {
+            scissor_clip_ = std::nullopt;
+            return;
+        }
+        if (scissor_clip_.has_value()) {
             int32_t bx0 = std::max(0, static_cast<int32_t>(std::floor(path_b.left())));
             int32_t by0 = std::max(0, static_cast<int32_t>(std::floor(path_b.top())));
             int32_t bx1 = std::min(static_cast<int32_t>(width()), static_cast<int32_t>(std::ceil(path_b.right())));
@@ -330,12 +467,38 @@ public:
         }
     }
 
-    void clip_rect(const Rect& rect) override {
-        clip_rect(rect, true);
+    void clip_rect(const Rect& rect, ClipOp op = ClipOp::Intersect) override {
+        clip_rect(rect, true, op);
     }
 
-    /// Intersects the active clip region with an axis-aligned rectangle.
-    void clip_rect(const Rect& rect, bool anti_alias) {
+    /// Combines the active clip region with an axis-aligned or transformed rectangle.
+    void clip_rect(const Rect& rect, bool anti_alias, ClipOp op = ClipOp::Intersect) {
+        if (has_perspective_4x4_) {
+            clip_path(PathBuilder::from_rect(rect), FillRule::Winding, anti_alias, op);
+            return;
+        }
+        if (op == ClipOp::Difference) {
+            if (!scissor_clip_.has_value() || rect.is_empty()) return;
+            if (std::abs(current_transform_.kx) < 1e-5f && std::abs(current_transform_.ky) < 1e-5f) {
+                float x0 = rect.left() * current_transform_.sx + current_transform_.tx;
+                float x1 = rect.right() * current_transform_.sx + current_transform_.tx;
+                float y0 = rect.top() * current_transform_.sy + current_transform_.ty;
+                float y1 = rect.bottom() * current_transform_.sy + current_transform_.ty;
+                if (x0 > x1) std::swap(x0, x1);
+                if (y0 > y1) std::swap(y0, y1);
+                if (x0 <= static_cast<float>(scissor_clip_->left()) &&
+                    y0 <= static_cast<float>(scissor_clip_->top()) &&
+                    x1 >= static_cast<float>(scissor_clip_->right()) &&
+                    y1 >= static_cast<float>(scissor_clip_->bottom())) {
+                    scissor_clip_ = std::nullopt;
+                    return;
+                }
+            }
+            auto p = PathBuilder::from_rect(rect);
+            clip_path(p, FillRule::Winding, anti_alias, ClipOp::Difference);
+            return;
+        }
+
         if (std::abs(current_transform_.kx) < 1e-5f && std::abs(current_transform_.ky) < 1e-5f) {
             if (!scissor_clip_.has_value()) return;
 
@@ -371,7 +534,76 @@ public:
         }
 
         auto p = PathBuilder::from_rect(rect);
-        clip_path(p, FillRule::Winding, anti_alias);
+        clip_path(p, FillRule::Winding, anti_alias, ClipOp::Intersect);
+    }
+
+    void clip_shader(const Shader& shader, ClipOp op = ClipOp::Intersect) override {
+        if (!scissor_clip_.has_value()) return;
+        ensure_clip_mask_initialized();
+        if (active_clip_mask_) {
+            active_clip_mask_->apply_shader(shader, current_transform_, op == ClipOp::Difference, scissor_clip_);
+        }
+    }
+
+    void clip_region(const Region& region, ClipOp op = ClipOp::Intersect) override {
+        if (region.is_empty()) {
+            if (op == ClipOp::Intersect) scissor_clip_ = std::nullopt;
+            return;
+        }
+        if (!scissor_clip_.has_value()) return;
+
+        auto clamp_to_canvas = [&](const IntRect& r) -> std::optional<ScreenIntRect> {
+            const int32_t x0 = std::clamp(r.left(), 0, static_cast<int32_t>(width()));
+            const int32_t y0 = std::clamp(r.top(), 0, static_cast<int32_t>(height()));
+            const int32_t x1 = std::clamp(r.right(), 0, static_cast<int32_t>(width()));
+            const int32_t y1 = std::clamp(r.bottom(), 0, static_cast<int32_t>(height()));
+            if (x1 <= x0 || y1 <= y0) return std::nullopt;
+            return ScreenIntRect::from_xywh(
+                static_cast<uint32_t>(x0), static_cast<uint32_t>(y0),
+                static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)
+            );
+        };
+
+        if (op == ClipOp::Intersect) {
+            if (region.is_rect()) {
+                auto sr = clamp_to_canvas(*region.bounds());
+                scissor_clip_ = sr ? scissor_clip_->intersect(*sr) : std::nullopt;
+                return;
+            }
+            auto bsr = clamp_to_canvas(*region.bounds());
+            scissor_clip_ = bsr ? scissor_clip_->intersect(*bsr) : std::nullopt;
+            if (!scissor_clip_.has_value()) return;
+            auto tmp = Mask::allocate(width(), height());
+            if (!tmp) return;
+            for (const auto& r : region.rects()) {
+                if (auto sr = clamp_to_canvas(r)) {
+                    if (auto inter = scissor_clip_->intersect(*sr)) {
+                        tmp->fill_rect_value(*inter, 255);
+                    }
+                }
+            }
+            clip_mask(*tmp);
+            return;
+        }
+
+        // ClipOp::Difference in device pixel coordinates
+        if (region.is_rect()) {
+            if (auto sr = clamp_to_canvas(*region.bounds())) {
+                if (sr->contains(*scissor_clip_)) {
+                    scissor_clip_ = std::nullopt;
+                    return;
+                }
+            }
+        }
+        ensure_clip_mask_initialized();
+        if (!active_clip_mask_) return;
+        for (const auto& r : region.rects()) {
+            if (auto sr = clamp_to_canvas(r)) {
+                if (auto inter = scissor_clip_->intersect(*sr)) {
+                    active_clip_mask_->fill_rect_value(*inter, 0);
+                }
+            }
+        }
     }
 
     /// Clears the active clip mask.
@@ -442,8 +674,41 @@ public:
         pixmap_.fill(color);
     }
 
+    void draw_paint(const Paint& paint) override {
+        if (!scissor_clip_.has_value()) return;
+        Paint p = paint;
+        p.clear_path_effect();
+        if (p.is_solid_color() && !p.has_layer_filter()) {
+            Paint resolved = resolve_paint(p);
+            painter::fill_rect(
+                pixmap_, scissor_clip_->to_rect(), resolved,
+                Transform::identity(), current_mask(), scissor_clip_
+            );
+            return;
+        }
+        const auto inv = current_transform_.invert();
+        if (!inv.has_value()) return;
+        const Rect dev_r = scissor_clip_->to_rect();
+        auto outset = Rect::from_ltrb(dev_r.left() - 1.0f, dev_r.top() - 1.0f,
+                                      dev_r.right() + 1.0f, dev_r.bottom() + 1.0f);
+        if (!outset.has_value()) return;
+        auto local = outset->transform(*inv);
+        if (!local.has_value()) return;
+        fill_rect(*local, p);
+    }
+
+    void draw_color(Color color, BlendMode mode = BlendMode::SourceOver) override {
+        Paint p(color);
+        p.blend_mode = mode;
+        draw_paint(p);
+    }
+
     void fill_rect(const Rect& rect, const Paint& paint) override {
         if (!scissor_clip_.has_value()) return;
+        if (has_perspective_4x4_) {
+            fill_path(PathBuilder::from_rect(rect), paint, FillRule::Winding);
+            return;
+        }
         if (paint.has_path_effect()) {
             fill_path(PathBuilder::from_rect(rect), paint, FillRule::Winding);
             return;
@@ -460,6 +725,31 @@ public:
 
     void fill_path(const Path& path, const Paint& paint, FillRule fill_rule = FillRule::Winding) override {
         if (!scissor_clip_.has_value()) return;
+        if (has_perspective_4x4_) {
+            if (paint.has_path_effect()) {
+                const auto& pe = *paint.path_effect;
+                Path mod = pe.apply(path);
+                Paint p2 = paint;
+                p2.clear_path_effect();
+                if (pe.needs_source_clip()) {
+                    save();
+                    clip_path(path, fill_rule);
+                    fill_path(mod, p2, fill_rule);
+                    restore();
+                } else {
+                    fill_path(mod, p2, fill_rule);
+                }
+                return;
+            }
+            const Path projected = current_transform_4x4_.project_path(path);
+            if (projected.is_empty()) return;
+            const Paint pp = detail::project_paint_4x4(paint, current_transform_4x4_);
+            const Transform4x4 saved_m = current_transform_4x4_;
+            set_transform_4x4(Transform4x4::identity());
+            fill_path(projected, pp, fill_rule);
+            set_transform_4x4(saved_m);
+            return;
+        }
         if (paint.has_path_effect()) {
             const auto& pe = *paint.path_effect;
             Path mod = pe.apply(path);
@@ -487,6 +777,24 @@ public:
 
     void stroke_path(const Path& path, const Paint& paint, const Stroke& stroke) override {
         if (!scissor_clip_.has_value()) return;
+        if (has_perspective_4x4_) {
+            Path src_path = path;
+            Paint p2 = paint;
+            if (paint.has_path_effect()) {
+                const auto& pe = *paint.path_effect;
+                src_path = pe.apply(path);
+                p2.clear_path_effect();
+                if (pe.produces_fill_geometry()) {
+                    fill_path(src_path, p2, FillRule::Winding);
+                    return;
+                }
+            }
+            PathStroker stroker;
+            auto outlined = stroker.stroke(src_path, stroke, 1.0f);
+            if (!outlined || outlined->is_empty()) return;
+            fill_path(*outlined, p2, FillRule::Winding);
+            return;
+        }
         if (paint.has_path_effect()) {
             const auto& pe = *paint.path_effect;
             Path mod = pe.apply(path);
@@ -541,6 +849,10 @@ public:
 
     void stroke_rect(const Rect& rect, const Paint& paint, const Stroke& stroke) override {
         if (!scissor_clip_.has_value()) return;
+        if (has_perspective_4x4_) {
+            stroke_path(PathBuilder::from_rect(rect), paint, stroke);
+            return;
+        }
         if (paint.has_path_effect()) {
             stroke_path(PathBuilder::from_rect(rect), paint, stroke);
             return;
@@ -581,6 +893,10 @@ public:
 
     void fill_round_rect(const Rect& rect, float rx, float ry, const Paint& paint) override {
         if (!scissor_clip_.has_value()) return;
+        if (has_perspective_4x4_) {
+            if (auto p = PathBuilder::from_rounded_rect(rect, rx, ry)) fill_path(*p, paint);
+            return;
+        }
         if (paint.has_layer_filter()) {
             draw_with_image_filter(rect, paint, 0.0f, [&](const Paint& inner) {
                 painter::fill_round_rect(pixmap_, rect, rx, ry, inner, current_transform_, current_mask(), scissor_clip_);
@@ -593,6 +909,10 @@ public:
 
     void stroke_round_rect(const Rect& rect, float rx, float ry, const Paint& paint, const Stroke& stroke) override {
         if (!scissor_clip_.has_value()) return;
+        if (has_perspective_4x4_) {
+            if (auto p = PathBuilder::from_rounded_rect(rect, rx, ry)) stroke_path(*p, paint, stroke);
+            return;
+        }
         if (paint.has_layer_filter()) {
             const float margin = stroke_filter_margin(stroke);
             draw_with_image_filter(rect, paint, margin, [&](const Paint& inner) {
@@ -681,6 +1001,10 @@ public:
 
     void fill_circle(float cx, float cy, float radius, const Paint& paint) {
         if (!scissor_clip_.has_value()) return;
+        if (has_perspective_4x4_) {
+            if (auto p = PathBuilder::from_circle(cx, cy, radius)) fill_path(*p, paint);
+            return;
+        }
         if (paint.has_layer_filter()) {
             auto lb = Rect::from_xywh(cx - radius, cy - radius, radius * 2.0f, radius * 2.0f);
             draw_with_image_filter(lb, paint, 0.0f, [&](const Paint& inner) {
@@ -694,6 +1018,14 @@ public:
 
     void draw_pixmap(int32_t x, int32_t y, const PixmapRef& src, const PixmapPaint& paint = PixmapPaint()) override {
         if (!scissor_clip_.has_value()) return;
+        if (has_perspective_4x4_) {
+            if (auto sr = Rect::from_xywh(0.0f, 0.0f, static_cast<float>(src.width()), static_cast<float>(src.height()))) {
+                if (auto dr = Rect::from_xywh(static_cast<float>(x), static_cast<float>(y), sr->width(), sr->height())) {
+                    draw_pixmap_rect(src, *sr, *dr, paint);
+                }
+            }
+            return;
+        }
         painter::draw_pixmap(pixmap_, x, y, src, paint, current_transform_, current_mask(), scissor_clip_);
     }
 
@@ -704,6 +1036,16 @@ public:
         const PixmapPaint& paint = PixmapPaint()
     ) override {
         if (!scissor_clip_.has_value()) return;
+        if (has_perspective_4x4_) {
+            if (src_rect.is_empty() || dst_rect.is_empty()) return;
+            const float sx = dst_rect.width() / src_rect.width();
+            const float sy = dst_rect.height() / src_rect.height();
+            const float tx = dst_rect.left() - src_rect.left() * sx;
+            const float ty = dst_rect.top() - src_rect.top() * sy;
+            const Transform4x4 full_t = current_transform_4x4_ * Transform4x4(Transform::from_row(sx, 0.0f, 0.0f, sy, tx, ty));
+            raster::draw_pixmap_3d(pixmap_, src, src_rect, full_t, paint.opacity, paint.blend_mode);
+            return;
+        }
         painter::draw_pixmap_rect(pixmap_, src, src_rect, dst_rect, paint, current_transform_, current_mask(), scissor_clip_);
     }
     using ICanvas::draw_pixmap_rect;
@@ -716,7 +1058,12 @@ public:
         float opacity = 1.0f,
         BlendMode blend_mode = BlendMode::SourceOver
     ) {
-        if (!current_transform_.is_identity()) {
+        if (has_perspective_4x4_) {
+            p0 = current_transform_4x4_.map_point(p0);
+            p1 = current_transform_4x4_.map_point(p1);
+            p2 = current_transform_4x4_.map_point(p2);
+            p3 = current_transform_4x4_.map_point(p3);
+        } else if (!current_transform_.is_identity()) {
             current_transform_.map_point(p0);
             current_transform_.map_point(p1);
             current_transform_.map_point(p2);
@@ -733,10 +1080,7 @@ public:
         float opacity = 1.0f,
         BlendMode blend_mode = BlendMode::SourceOver
     ) {
-        Transform4x4 final_t = transform3d;
-        if (!current_transform_.is_identity()) {
-            final_t = Transform4x4(current_transform_) * transform3d;
-        }
+        const Transform4x4 final_t = current_transform_4x4_ * transform3d;
         raster::draw_pixmap_3d(pixmap_, src, src_rect, final_t, opacity, blend_mode);
     }
 
@@ -753,6 +1097,63 @@ public:
         }
     }
 
+    void draw_atlas(
+        const PixmapRef& src,
+        std::span<const RSXform> xforms,
+        std::span<const Rect> tex_rects,
+        std::span<const Color> colors = {},
+        BlendMode mode = BlendMode::Modulate,
+        const PixmapPaint& paint = PixmapPaint()
+    ) override {
+        if (!scissor_clip_.has_value() || src.width() == 0 || src.height() == 0 || !src.data()) return;
+        const size_t count = std::min(xforms.size(), tex_rects.size());
+        if (count == 0) return;
+
+        const bool has_colors = colors.size() >= count;
+        const Mask* active_mask = current_mask();
+
+        for (size_t i = 0; i < count; ++i) {
+            const Rect& sr = tex_rects[i];
+            if (sr.is_empty()) continue;
+            auto dr_opt = Rect::from_xywh(0.0f, 0.0f, sr.width(), sr.height());
+            if (!dr_opt) continue;
+
+            const Transform sprite_ts = current_transform_.pre_concat(xforms[i].to_transform());
+            if (!has_colors || mode == BlendMode::Destination || mode == BlendMode::Modulate) {
+                PixmapPaint sp = paint;
+                if (has_colors && mode == BlendMode::Modulate) {
+                    sp.tint = Color::from_rgba_unchecked(
+                        paint.tint.red() * colors[i].red(),
+                        paint.tint.green() * colors[i].green(),
+                        paint.tint.blue() * colors[i].blue(),
+                        paint.tint.alpha() * colors[i].alpha()
+                    );
+                }
+                painter::draw_pixmap_rect(pixmap_, src, sr, *dr_opt, sp, sprite_ts, active_mask, scissor_clip_);
+            } else if (mode == BlendMode::Source) {
+                const float a = std::clamp(colors[i].alpha() * paint.opacity, 0.0f, 1.0f);
+                Paint sp(Color::from_rgba_unchecked(colors[i].red(), colors[i].green(), colors[i].blue(), a));
+                sp.blend_mode = paint.blend_mode;
+                painter::fill_rect(pixmap_, *dr_opt, resolve_paint(sp), sprite_ts, active_mask, scissor_clip_);
+            } else {
+                save();
+                concat(xforms[i].to_transform());
+                Paint layer_p(Color::from_rgba_unchecked(1.0f, 1.0f, 1.0f, std::clamp(paint.opacity, 0.0f, 1.0f)));
+                layer_p.blend_mode = paint.blend_mode;
+                save_layer_bounds(*dr_opt, layer_p);
+                PixmapPaint base_pp = paint;
+                base_pp.opacity = 1.0f;
+                base_pp.blend_mode = BlendMode::SourceOver;
+                draw_pixmap_rect(src, sr, *dr_opt, base_pp);
+                Paint blend_p(colors[i]);
+                blend_p.blend_mode = mode;
+                fill_rect(*dr_opt, blend_p);
+                restore();
+                restore();
+            }
+        }
+    }
+
     // --- 2D Vertex Meshes & Freeform Gradient Meshes ---
 
     /// Renders a 2D mesh of colored and/or textured vertices.
@@ -760,8 +1161,15 @@ public:
         const Vertices& vertices,
         BlendMode blend_mode = BlendMode::SourceOver,
         float opacity = 1.0f
-    ) {
-        raster::draw_vertices(pixmap_, vertices, nullptr, opacity, blend_mode, current_transform_);
+    ) override {
+        if (!scissor_clip_.has_value()) return;
+        if (has_perspective_4x4_) {
+            Vertices proj = vertices;
+            for (auto& pt : proj.positions) pt = current_transform_4x4_.map_point(pt);
+            raster::draw_vertices(pixmap_, proj, nullptr, opacity, blend_mode, Transform::identity(), current_mask(), scissor_clip_);
+            return;
+        }
+        raster::draw_vertices(pixmap_, vertices, nullptr, opacity, blend_mode, current_transform_, current_mask(), scissor_clip_);
     }
 
     /// Renders a 2D mesh of textured vertices with bilinear filtering and optional vertex color modulation.
@@ -770,8 +1178,15 @@ public:
         const PixmapRef& texture,
         BlendMode blend_mode = BlendMode::SourceOver,
         float opacity = 1.0f
-    ) {
-        raster::draw_vertices(pixmap_, vertices, &texture, opacity, blend_mode, current_transform_);
+    ) override {
+        if (!scissor_clip_.has_value()) return;
+        if (has_perspective_4x4_) {
+            Vertices proj = vertices;
+            for (auto& pt : proj.positions) pt = current_transform_4x4_.map_point(pt);
+            raster::draw_vertices(pixmap_, proj, &texture, opacity, blend_mode, Transform::identity(), current_mask(), scissor_clip_);
+            return;
+        }
+        raster::draw_vertices(pixmap_, vertices, &texture, opacity, blend_mode, current_transform_, current_mask(), scissor_clip_);
     }
 
     /// Renders a bicubic Coons Patch Freeform Gradient Mesh.
@@ -779,9 +1194,12 @@ public:
         const GradientMesh& mesh,
         BlendMode blend_mode = BlendMode::SourceOver,
         float opacity = 1.0f,
-        uint32_t subdivision = 8
-    ) {
-        Vertices v = mesh.to_vertices(subdivision);
+        uint32_t subdivision = 0
+    ) override {
+        if (!scissor_clip_.has_value()) return;
+        Vertices v = (subdivision == 0)
+            ? mesh.to_vertices_adaptive(current_transform_)
+            : mesh.to_vertices(subdivision);
         draw_vertices(v, blend_mode, opacity);
     }
 
@@ -790,9 +1208,15 @@ public:
         const CoonsPatch& patch,
         BlendMode blend_mode = BlendMode::SourceOver,
         float opacity = 1.0f,
-        uint32_t subdiv_u = 8,
-        uint32_t subdiv_v = 8
-    ) {
+        uint32_t subdiv_u = 0,
+        uint32_t subdiv_v = 0
+    ) override {
+        if (!scissor_clip_.has_value()) return;
+        if (subdiv_u == 0 || subdiv_v == 0) {
+            const auto [au, av] = patch.compute_adaptive_subdivision(current_transform_);
+            if (subdiv_u == 0) subdiv_u = au;
+            if (subdiv_v == 0) subdiv_v = av;
+        }
         Vertices v = patch.to_vertices(subdiv_u, subdiv_v);
         draw_vertices(v, blend_mode, opacity);
     }
@@ -974,11 +1398,14 @@ public:
     }
 
     /// Batch draws multiple positioned glyph runs.
+    using ICanvas::draw_glyphs;
     void draw_glyphs(std::span<const GlyphRun> glyphs, const Paint& paint) {
         for (const auto& g : glyphs) {
             draw_glyph(g.position, g.mask, paint);
         }
     }
+
+    void discard() override {}
 
     /// Draws a pre-rasterized BakedText surface onto Canvas with direct SIMD row blitting.
     /// This bypasses font shaping, glyph lookups, and per-pixel shader loops for O(1) text rendering.
@@ -1083,6 +1510,26 @@ public:
     }
 
 private:
+    void ensure_clip_mask_initialized() {
+        if (!scissor_clip_.has_value()) return;
+        if (!active_clip_mask_) {
+            if (recycled_mask_ && recycled_mask_->width() == width() && recycled_mask_->height() == height()) {
+                active_clip_mask_ = std::move(recycled_mask_);
+                active_clip_mask_->clear();
+            } else {
+                auto m = Mask::allocate(width(), height());
+                if (m) {
+                    active_clip_mask_ = std::make_shared<Mask>(std::move(*m));
+                }
+            }
+            if (active_clip_mask_) {
+                active_clip_mask_->fill_rect_value(*scissor_clip_, 255);
+            }
+        } else if (active_clip_mask_.use_count() > 1) {
+            active_clip_mask_ = std::make_shared<Mask>(*active_clip_mask_);
+        }
+    }
+
     static inline float stroke_filter_margin(const Stroke& stroke) noexcept {
         return std::max(stroke.width, stroke.width * std::max(1.0f, stroke.miter_limit) * 0.5f) + 2.0f;
     }
@@ -1281,6 +1728,8 @@ private:
 
         state_stack_.push_back(CanvasState{
             .transform = current_transform_,
+            .transform_4x4 = current_transform_4x4_,
+            .has_perspective_4x4 = has_perspective_4x4_,
             .clip_mask = active_clip_mask_,
             .scissor_clip = scissor_clip_,
             .external_mask = external_mask_ptr_,
@@ -1391,6 +1840,8 @@ private:
     PixmapMut pixmap_;
     std::optional<ScreenIntRect> scissor_clip_;
     Transform current_transform_{};
+    Transform4x4 current_transform_4x4_{};
+    bool has_perspective_4x4_{false};
     std::vector<CanvasState> state_stack_{};
     std::vector<CanvasLayerState> layer_stack_{};
     std::vector<Pixmap> recycled_layers_{};

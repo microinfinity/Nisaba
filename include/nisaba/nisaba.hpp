@@ -22,6 +22,7 @@
 #include "nisaba/path/path_ops.hpp"
 #include "nisaba/path/path_measure.hpp"
 #include "nisaba/math/screen_int_rect.hpp"
+#include "nisaba/math/region.hpp"
 #include "nisaba/raster/fixed_point.hpp"
 #include "nisaba/color/color.hpp"
 #include "nisaba/color/blend_mode.hpp"
@@ -51,6 +52,7 @@
 #include "nisaba/text/baked_text.hpp"
 #include "nisaba/text/text_cache.hpp"
 #include "nisaba/text/paragraph_cache.hpp"
+#include "nisaba/text/text_blob.hpp"
 #include "nisaba/canvas/painter.hpp"
 #include "nisaba/effects/effects.hpp"
 #include "nisaba/svg/svg.hpp"
@@ -59,6 +61,7 @@
 #include "nisaba/mesh/mesh.hpp"
 #include "nisaba/raster/mesh_raster.hpp"
 #include "nisaba/canvas/canvas.hpp"
+#include "nisaba/canvas/picture.hpp"
 #include "nisaba/vspr/vspr.hpp"
 #include "nisaba/gpu/gpu.hpp"
 

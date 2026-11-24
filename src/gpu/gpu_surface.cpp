@@ -223,6 +223,43 @@ void GpuSurface::clear(nisaba::Color color) {
     }
 }
 
+void GpuSurface::discard() {
+    if (!device_) return;
+    device_->make_current();
+    device_->bind_framebuffer(fbo_id_);
+    needs_resolve_ = false;
+
+#if defined(NISABA_TARGET_GLES)
+    if (fbo_id_ == 0) {
+        const GLenum attachments[3] = {GL_COLOR, GL_DEPTH, GL_STENCIL};
+        glInvalidateFramebuffer(GL_FRAMEBUFFER, 3, attachments);
+    } else {
+        const GLenum attachments[2] = {GL_COLOR_ATTACHMENT0, GL_DEPTH_STENCIL_ATTACHMENT};
+        glInvalidateFramebuffer(GL_FRAMEBUFFER, 2, attachments);
+        if (resolve_fbo_ != 0 && resolve_fbo_ != fbo_id_) {
+            device_->bind_framebuffer(resolve_fbo_);
+            glInvalidateFramebuffer(GL_FRAMEBUFFER, 2, attachments);
+            device_->bind_framebuffer(fbo_id_);
+        }
+    }
+#elif defined(GL_VERSION_4_3) || defined(GL_ARB_invalidate_subdata)
+    if (glInvalidateFramebuffer != nullptr) {
+        if (fbo_id_ == 0) {
+            const GLenum attachments[3] = {GL_COLOR, GL_DEPTH, GL_STENCIL};
+            glInvalidateFramebuffer(GL_FRAMEBUFFER, 3, attachments);
+        } else {
+            const GLenum attachments[2] = {GL_COLOR_ATTACHMENT0, GL_DEPTH_STENCIL_ATTACHMENT};
+            glInvalidateFramebuffer(GL_FRAMEBUFFER, 2, attachments);
+            if (resolve_fbo_ != 0 && resolve_fbo_ != fbo_id_) {
+                device_->bind_framebuffer(resolve_fbo_);
+                glInvalidateFramebuffer(GL_FRAMEBUFFER, 2, attachments);
+                device_->bind_framebuffer(fbo_id_);
+            }
+        }
+    }
+#endif
+}
+
 std::shared_ptr<GpuTexture> GpuSurface::texture() {
     resolve();
     return texture_;

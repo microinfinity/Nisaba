@@ -34,6 +34,7 @@ public:
 
     int width() const noexcept { return m_width; }
     int height() const noexcept { return m_height; }
+    uint64_t generation() const noexcept { return m_generation; }
     const uint8_t* data() const noexcept { return m_data.data(); }
 
     /// Clears the atlas allocations and reset the skyline.
@@ -105,6 +106,7 @@ private:
     int m_dirtyMinY{0};
     int m_dirtyMaxX{0};
     int m_dirtyMaxY{0};
+    uint64_t m_generation{1};
 };
 
 /// Alias matching ENKI specification naming.

@@ -1,9 +1,12 @@
 #pragma once
 
 #include "nisaba/canvas/pixmap.hpp"
+#include "nisaba/canvas/mask.hpp"
 #include "nisaba/mesh/mesh.hpp"
 #include "nisaba/color/blend_mode.hpp"
 #include "nisaba/math/transform.hpp"
+#include "nisaba/math/screen_int_rect.hpp"
+#include <optional>
 
 namespace nisaba::raster {
 
@@ -15,7 +18,9 @@ void draw_vertices(
     const PixmapRef* texture = nullptr,
     float opacity = 1.0f,
     BlendMode blend_mode = BlendMode::SourceOver,
-    Transform transform = Transform()
+    Transform transform = Transform(),
+    const Mask* mask = nullptr,
+    std::optional<ScreenIntRect> clip = std::nullopt
 );
 
 /// Renders a single triangle with per-vertex colors (Gouraud interpolation).

@@ -18,6 +18,8 @@
 
 namespace nisaba {
 
+class Shader;
+
 enum class MaskType {
     Alpha,
     Luminance,
@@ -179,9 +181,45 @@ public:
         std::optional<ScreenIntRect> conservative_clip = std::nullopt
     );
 
+    void difference_path(
+        const Path& path,
+        FillRule fill_rule = FillRule::Winding,
+        bool anti_alias = true,
+        Transform transform = Transform(),
+        std::optional<ScreenIntRect> conservative_clip = std::nullopt
+    );
+
+    void apply_shader(
+        const Shader& shader,
+        Transform transform = Transform(),
+        bool is_difference = false,
+        std::optional<ScreenIntRect> conservative_clip = std::nullopt
+    );
+
+    void fill_rect_value(const ScreenIntRect& rect, uint8_t value) noexcept {
+        if (width() == 0 || height() == 0) return;
+        const uint32_t x0 = std::min(rect.x(), width());
+        const uint32_t y0 = std::min(rect.y(), height());
+        const uint32_t x1 = std::min(rect.right(), width());
+        const uint32_t y1 = std::min(rect.bottom(), height());
+        if (x1 <= x0 || y1 <= y0) return;
+        const size_t span_len = static_cast<size_t>(x1 - x0);
+        for (uint32_t y = y0; y < y1; ++y) {
+            std::memset(data_.data() + static_cast<size_t>(y) * width() + x0, value, span_len);
+        }
+    }
+
     void intersect_mask(const Mask& other) noexcept {
         size_t count = std::min(data_.size(), other.data_.size());
         simd::multiply_mask_spans(data_.data(), other.data_.data(), count);
+    }
+
+    void difference_mask(const Mask& other) noexcept {
+        const size_t count = std::min(data_.size(), other.data_.size());
+        for (size_t i = 0; i < count; ++i) {
+            const uint32_t inv_s = 255u - static_cast<uint32_t>(other.data_[i]);
+            data_[i] = static_cast<uint8_t>((static_cast<uint32_t>(data_[i]) * inv_s + 127u) / 255u);
+        }
     }
 
     void invert() noexcept {
